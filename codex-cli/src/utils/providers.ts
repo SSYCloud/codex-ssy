@@ -52,4 +52,9 @@ export const providers: Record<
     baseURL: "https://conductor.arcee.ai/v1",
     envKey: "ARCEEAI_API_KEY",
   },
+  shengsuanyun: {
+    name: "ShengSuanYun",
+    baseURL: "https://router.shengsuanyun.com/api/v1",
+    envKey: "SSY_API_KEY",
+  },
 };

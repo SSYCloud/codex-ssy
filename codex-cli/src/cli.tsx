@@ -23,6 +23,7 @@ import {
   loadConfig,
   PRETTY_PRINT,
   INSTRUCTIONS_FILEPATH,
+  CONFIG_FILEPATH,
 } from "./utils/config";
 import { createInputItem } from "./utils/input-utils";
 import { initLogger } from "./utils/logger/log";
@@ -64,6 +65,7 @@ const cli = meow(
     -c, --config                    Open the instructions file in your editor
     -w, --writable-root <path>      Writable folder for sandbox in full-auto mode (can be specified multiple times)
     -a, --approval-mode <mode>      Override the approval policy: 'suggest', 'auto-edit', or 'full-auto'
+    -e, --econfig                   Open the Models proder config file in your editor
 
     --auto-edit                Automatically approve file edits; still prompt for commands
     --full-auto                Automatically approve edits and commands when executed in the sandbox
@@ -121,6 +123,11 @@ const cli = meow(
         type: "boolean",
         description:
           "Automatically approve all commands without prompting. This is EXTREMELY DANGEROUS and should only be used in trusted environments.",
+      },
+      econfig: {
+        type: "boolean",
+        aliases: ["e"],
+        description: "Open the Models proder config file in your editor",
       },
       autoEdit: {
         type: "boolean",
@@ -248,7 +255,19 @@ if (cli.flags.config) {
   spawnSync(editor, [filePath], { stdio: "inherit" });
   process.exit(0);
 }
+if (cli.flags.econfig) {
+  try {
+    loadConfig(); // Ensures the file is created if it doesn't already exit.
+  } catch {
+    // ignore errors
+  }
 
+  const filePath = CONFIG_FILEPATH;
+  const editor =
+    process.env["EDITOR"] || (process.platform === "win32" ? "notepad" : "vi");
+  spawnSync(editor, [filePath], { stdio: "inherit" });
+  process.exit(0);
+}
 // ---------------------------------------------------------------------------
 // API key handling
 // ---------------------------------------------------------------------------

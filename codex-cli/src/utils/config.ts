@@ -522,7 +522,6 @@ export const loadConfig = (
 
   // Merge default providers with user configured providers in the config.
   config.providers = { ...providers, ...storedConfig.providers };
-
   return config;
 };
 
