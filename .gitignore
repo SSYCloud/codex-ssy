@@ -30,6 +30,7 @@ result
 # cli tools
 CLAUDE.md
 .claude/
+AGENTS.override.md
 
 # caches
 .cache/
@@ -63,6 +64,9 @@ apply_patch/
 # coverage
 coverage/
 
+# personal files
+personal/
+
 # os
 .DS_Store
 Thumbs.db
@@ -81,3 +85,8 @@ CHANGELOG.ignore.md
 # nix related
 .direnv
 .envrc
+
+# Python bytecode files
+__pycache__/
+*.pyc
+

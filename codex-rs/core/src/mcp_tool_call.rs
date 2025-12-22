@@ -1,25 +1,25 @@
-use std::time::Duration;
+use std::time::Instant;
 
 use tracing::error;
 
 use crate::codex::Session;
-use crate::models::FunctionCallOutputPayload;
-use crate::models::ResponseInputItem;
-use crate::protocol::Event;
+use crate::codex::TurnContext;
 use crate::protocol::EventMsg;
+use crate::protocol::McpInvocation;
 use crate::protocol::McpToolCallBeginEvent;
 use crate::protocol::McpToolCallEndEvent;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
 
 /// Handles the specified tool call dispatches the appropriate
 /// `McpToolCallBegin` and `McpToolCallEnd` events to the `Session`.
 pub(crate) async fn handle_mcp_tool_call(
     sess: &Session,
-    sub_id: &str,
+    turn_context: &TurnContext,
     call_id: String,
     server: String,
     tool_name: String,
     arguments: String,
-    timeout: Option<Duration>,
 ) -> ResponseInputItem {
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
@@ -35,72 +35,46 @@ pub(crate) async fn handle_mcp_tool_call(
                     output: FunctionCallOutputPayload {
                         content: format!("err: {e}"),
                         success: Some(false),
+                        ..Default::default()
                     },
                 };
             }
         }
     };
 
-    let tool_call_begin_event = EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
-        call_id: call_id.clone(),
+    let invocation = McpInvocation {
         server: server.clone(),
         tool: tool_name.clone(),
         arguments: arguments_value.clone(),
+    };
+
+    let tool_call_begin_event = EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+        call_id: call_id.clone(),
+        invocation: invocation.clone(),
     });
-    notify_mcp_tool_call_event(sess, sub_id, tool_call_begin_event).await;
+    notify_mcp_tool_call_event(sess, turn_context, tool_call_begin_event).await;
 
+    let start = Instant::now();
     // Perform the tool call.
-    let (tool_call_end_event, tool_call_err) = match sess
-        .call_tool(&server, &tool_name, arguments_value, timeout)
+    let result = sess
+        .call_tool(&server, &tool_name, arguments_value.clone())
         .await
-    {
-        Ok(result) => (
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-                call_id,
-                success: !result.is_error.unwrap_or(false),
-                result: Some(result),
-            }),
-            None,
-        ),
-        Err(e) => (
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-                call_id,
-                success: false,
-                result: None,
-            }),
-            Some(e),
-        ),
-    };
-
-    notify_mcp_tool_call_event(sess, sub_id, tool_call_end_event.clone()).await;
-    let EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-        call_id,
-        success,
-        result,
-    }) = tool_call_end_event
-    else {
-        unimplemented!("unexpected event type");
-    };
-
-    ResponseInputItem::FunctionCallOutput {
-        call_id,
-        output: FunctionCallOutputPayload {
-            content: result.map_or_else(
-                || format!("err: {tool_call_err:?}"),
-                |result| {
-                    serde_json::to_string(&result)
-                        .unwrap_or_else(|e| format!("JSON serialization error: {e}"))
-                },
-            ),
-            success: Some(success),
-        },
+        .map_err(|e| format!("tool call error: {e:?}"));
+    if let Err(e) = &result {
+        tracing::warn!("MCP tool call error: {e:?}");
     }
+    let tool_call_end_event = EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+        call_id: call_id.clone(),
+        invocation,
+        duration: start.elapsed(),
+        result: result.clone(),
+    });
+
+    notify_mcp_tool_call_event(sess, turn_context, tool_call_end_event.clone()).await;
+
+    ResponseInputItem::McpToolCallOutput { call_id, result }
 }
 
-async fn notify_mcp_tool_call_event(sess: &Session, sub_id: &str, event: EventMsg) {
-    sess.send_event(Event {
-        id: sub_id.to_string(),
-        msg: event,
-    })
-    .await;
+async fn notify_mcp_tool_call_event(sess: &Session, turn_context: &TurnContext, event: EventMsg) {
+    sess.send_event(turn_context, event).await;
 }

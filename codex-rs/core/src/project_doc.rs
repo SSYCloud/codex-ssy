@@ -1,23 +1,30 @@
 //! Project-level documentation discovery.
 //!
-//! Project-level documentation can be stored in a file named `AGENTS.md`.
-//! Currently, we include only the contents of the first file found as follows:
+//! Project-level documentation is primarily stored in files named `AGENTS.md`.
+//! Additional fallback filenames can be configured via `project_doc_fallback_filenames`.
+//! We include the concatenation of all files found along the path from the
+//! repository root to the current working directory as follows:
 //!
-//! 1.  Look for the doc file in the current working directory (as determined
-//!     by the `Config`).
-//! 2.  If not found, walk *upwards* until the Git repository root is reached
-//!     (detected by the presence of a `.git` directory/file), or failing that,
-//!     the filesystem root.
-//! 3.  If the Git root is encountered, look for the doc file there. If it
-//!     exists, the search stops – we do **not** walk past the Git root.
+//! 1.  Determine the Git repository root by walking upwards from the current
+//!     working directory until a `.git` directory or file is found. If no Git
+//!     root is found, only the current working directory is considered.
+//! 2.  Collect every `AGENTS.md` found from the repository root down to the
+//!     current working directory (inclusive) and concatenate their contents in
+//!     that order.
+//! 3.  We do **not** walk past the Git root.
 
 use crate::config::Config;
-use std::path::Path;
+use crate::skills::SkillMetadata;
+use crate::skills::render_skills_section;
+use dunce::canonicalize as normalize_path;
+use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
 
-/// Currently, we only match the filename `AGENTS.md` exactly.
-const CANDIDATE_FILENAMES: &[&str] = &["AGENTS.md"];
+/// Default filename scanned for project-level docs.
+pub const DEFAULT_PROJECT_DOC_FILENAME: &str = "AGENTS.md";
+/// Preferred local override for project-level docs.
+pub const LOCAL_PROJECT_DOC_FILENAME: &str = "AGENTS.override.md";
 
 /// When both `Config::instructions` and the project doc are present, they will
 /// be concatenated with the following separator.
@@ -25,120 +32,210 @@ const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
 /// Combines `Config::instructions` and `AGENTS.md` (if present) into a single
 /// string of instructions.
-pub(crate) async fn create_full_instructions(config: &Config) -> Option<String> {
-    match find_project_doc(config).await {
-        Ok(Some(project_doc)) => match &config.instructions {
-            Some(original_instructions) => Some(format!(
-                "{original_instructions}{PROJECT_DOC_SEPARATOR}{project_doc}"
-            )),
-            None => Some(project_doc),
-        },
-        Ok(None) => config.instructions.clone(),
+pub(crate) async fn get_user_instructions(
+    config: &Config,
+    skills: Option<&[SkillMetadata]>,
+) -> Option<String> {
+    let skills_section = skills.and_then(render_skills_section);
+
+    let project_docs = match read_project_docs(config).await {
+        Ok(docs) => docs,
         Err(e) => {
             error!("error trying to find project doc: {e:#}");
-            config.instructions.clone()
+            return config.user_instructions.clone();
         }
+    };
+
+    let combined_project_docs = merge_project_docs_with_skills(project_docs, skills_section);
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(instructions) = config.user_instructions.clone() {
+        parts.push(instructions);
+    }
+
+    if let Some(project_doc) = combined_project_docs {
+        if !parts.is_empty() {
+            parts.push(PROJECT_DOC_SEPARATOR.to_string());
+        }
+        parts.push(project_doc);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.concat())
     }
 }
 
-/// Attempt to locate and load the project documentation. Currently, the search
-/// starts from `Config::cwd`, but if we may want to consider other directories
-/// in the future, e.g., additional writable directories in the `SandboxPolicy`.
+/// Attempt to locate and load the project documentation.
 ///
-/// On success returns `Ok(Some(contents))`. If no documentation file is found
-/// the function returns `Ok(None)`. Unexpected I/O failures bubble up as
-/// `Err` so callers can decide how to handle them.
-async fn find_project_doc(config: &Config) -> std::io::Result<Option<String>> {
-    let max_bytes = config.project_doc_max_bytes;
+/// On success returns `Ok(Some(contents))` where `contents` is the
+/// concatenation of all discovered docs. If no documentation file is found the
+/// function returns `Ok(None)`. Unexpected I/O failures bubble up as `Err` so
+/// callers can decide how to handle them.
+pub async fn read_project_docs(config: &Config) -> std::io::Result<Option<String>> {
+    let max_total = config.project_doc_max_bytes;
 
-    // Attempt to load from the working directory first.
-    if let Some(doc) = load_first_candidate(&config.cwd, CANDIDATE_FILENAMES, max_bytes).await? {
-        return Ok(Some(doc));
+    if max_total == 0 {
+        return Ok(None);
     }
 
-    // Walk up towards the filesystem root, stopping once we encounter the Git
-    // repository root. The presence of **either** a `.git` *file* or
-    // *directory* counts.
-    let mut dir = config.cwd.clone();
+    let paths = discover_project_doc_paths(config)?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
 
-    // Canonicalize the path so that we do not end up in an infinite loop when
-    // `cwd` contains `..` components.
-    if let Ok(canon) = dir.canonicalize() {
+    let mut remaining: u64 = max_total as u64;
+    let mut parts: Vec<String> = Vec::new();
+
+    for p in paths {
+        if remaining == 0 {
+            break;
+        }
+
+        let file = match tokio::fs::File::open(&p).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+
+        let size = file.metadata().await?.len();
+        let mut reader = tokio::io::BufReader::new(file).take(remaining);
+        let mut data: Vec<u8> = Vec::new();
+        reader.read_to_end(&mut data).await?;
+
+        if size > remaining {
+            tracing::warn!(
+                "Project doc `{}` exceeds remaining budget ({} bytes) - truncating.",
+                p.display(),
+                remaining,
+            );
+        }
+
+        let text = String::from_utf8_lossy(&data).to_string();
+        if !text.trim().is_empty() {
+            parts.push(text);
+            remaining = remaining.saturating_sub(data.len() as u64);
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parts.join("\n\n")))
+    }
+}
+
+/// Discover the list of AGENTS.md files using the same search rules as
+/// `read_project_docs`, but return the file paths instead of concatenated
+/// contents. The list is ordered from repository root to the current working
+/// directory (inclusive). Symlinks are allowed. When `project_doc_max_bytes`
+/// is zero, returns an empty list.
+pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBuf>> {
+    let mut dir = config.cwd.clone();
+    if let Ok(canon) = normalize_path(&dir) {
         dir = canon;
     }
 
-    while let Some(parent) = dir.parent() {
-        // `.git` can be a *file* (for worktrees or submodules) or a *dir*.
-        let git_marker = dir.join(".git");
-        let git_exists = match tokio::fs::metadata(&git_marker).await {
+    // Build chain from cwd upwards and detect git root.
+    let mut chain: Vec<PathBuf> = vec![dir.clone()];
+    let mut git_root: Option<PathBuf> = None;
+    let mut cursor = dir;
+    while let Some(parent) = cursor.parent() {
+        let git_marker = cursor.join(".git");
+        let git_exists = match std::fs::metadata(&git_marker) {
             Ok(_) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
 
         if git_exists {
-            // We are at the repo root – attempt one final load.
-            if let Some(doc) = load_first_candidate(&dir, CANDIDATE_FILENAMES, max_bytes).await? {
-                return Ok(Some(doc));
-            }
+            git_root = Some(cursor.clone());
             break;
         }
 
-        dir = parent.to_path_buf();
+        chain.push(parent.to_path_buf());
+        cursor = parent.to_path_buf();
     }
 
-    Ok(None)
+    let search_dirs: Vec<PathBuf> = if let Some(root) = git_root {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut saw_root = false;
+        for p in chain.iter().rev() {
+            if !saw_root {
+                if p == &root {
+                    saw_root = true;
+                } else {
+                    continue;
+                }
+            }
+            dirs.push(p.clone());
+        }
+        dirs
+    } else {
+        vec![config.cwd.clone()]
+    };
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let candidate_filenames = candidate_filenames(config);
+    for d in search_dirs {
+        for name in &candidate_filenames {
+            let candidate = d.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(md) => {
+                    let ft = md.file_type();
+                    // Allow regular files and symlinks; opening will later fail for dangling links.
+                    if ft.is_file() || ft.is_symlink() {
+                        found.push(candidate);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(found)
 }
 
-/// Attempt to load the first candidate file found in `dir`. Returns the file
-/// contents (truncated if it exceeds `max_bytes`) when successful.
-async fn load_first_candidate(
-    dir: &Path,
-    names: &[&str],
-    max_bytes: usize,
-) -> std::io::Result<Option<String>> {
-    for name in names {
-        let candidate = dir.join(name);
-
-        let file = match tokio::fs::File::open(&candidate).await {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-            Ok(f) => f,
-        };
-
-        let size = file.metadata().await?.len();
-
-        let reader = tokio::io::BufReader::new(file);
-        let mut data = Vec::with_capacity(std::cmp::min(size as usize, max_bytes));
-        let mut limited = reader.take(max_bytes as u64);
-        limited.read_to_end(&mut data).await?;
-
-        if size as usize > max_bytes {
-            tracing::warn!(
-                "Project doc `{}` exceeds {max_bytes} bytes - truncating.",
-                candidate.display(),
-            );
-        }
-
-        let contents = String::from_utf8_lossy(&data).to_string();
-        if contents.trim().is_empty() {
-            // Empty file – treat as not found.
+fn candidate_filenames<'a>(config: &'a Config) -> Vec<&'a str> {
+    let mut names: Vec<&'a str> =
+        Vec::with_capacity(2 + config.project_doc_fallback_filenames.len());
+    names.push(LOCAL_PROJECT_DOC_FILENAME);
+    names.push(DEFAULT_PROJECT_DOC_FILENAME);
+    for candidate in &config.project_doc_fallback_filenames {
+        let candidate = candidate.as_str();
+        if candidate.is_empty() {
             continue;
         }
-
-        return Ok(Some(contents));
+        if !names.contains(&candidate) {
+            names.push(candidate);
+        }
     }
+    names
+}
 
-    Ok(None)
+fn merge_project_docs_with_skills(
+    project_doc: Option<String>,
+    skills_section: Option<String>,
+) -> Option<String> {
+    match (project_doc, skills_section) {
+        (Some(doc), Some(skills)) => Some(format!("{doc}\n\n{skills}")),
+        (Some(doc), None) => Some(doc),
+        (None, Some(skills)) => Some(skills),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
     use super::*;
-    use crate::config::Config;
+    use crate::config::ConfigBuilder;
+    use crate::skills::load_skills;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper that returns a `Config` pointing at `root` and using `limit` as
@@ -146,13 +243,33 @@ mod tests {
     /// optionally specify a custom `instructions` string – when `None` the
     /// value is cleared to mimic a scenario where no system instructions have
     /// been configured.
-    fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -> Config {
-        let mut cfg = Config::load_default_config_for_test();
-        cfg.cwd = root.path().to_path_buf();
-        cfg.project_doc_max_bytes = limit;
+    async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -> Config {
+        let codex_home = TempDir::new().unwrap();
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("defaults for test should always succeed");
 
-        cfg.instructions = instructions.map(ToOwned::to_owned);
-        cfg
+        config.cwd = root.path().to_path_buf();
+        config.project_doc_max_bytes = limit;
+
+        config.user_instructions = instructions.map(ToOwned::to_owned);
+        config
+    }
+
+    async fn make_config_with_fallback(
+        root: &TempDir,
+        limit: usize,
+        instructions: Option<&str>,
+        fallbacks: &[&str],
+    ) -> Config {
+        let mut config = make_config(root, limit, instructions).await;
+        config.project_doc_fallback_filenames = fallbacks
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        config
     }
 
     /// AGENTS.md missing – should yield `None`.
@@ -160,7 +277,7 @@ mod tests {
     async fn no_doc_file_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
-        let res = create_full_instructions(&make_config(&tmp, 4096, None)).await;
+        let res = get_user_instructions(&make_config(&tmp, 4096, None).await, None).await;
         assert!(
             res.is_none(),
             "Expected None when AGENTS.md is absent and no system instructions provided"
@@ -174,7 +291,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::write(tmp.path().join("AGENTS.md"), "hello world").unwrap();
 
-        let res = create_full_instructions(&make_config(&tmp, 4096, None))
+        let res = get_user_instructions(&make_config(&tmp, 4096, None).await, None)
             .await
             .expect("doc expected");
 
@@ -193,7 +310,7 @@ mod tests {
         let huge = "A".repeat(LIMIT * 2); // 2 KiB
         fs::write(tmp.path().join("AGENTS.md"), &huge).unwrap();
 
-        let res = create_full_instructions(&make_config(&tmp, LIMIT, None))
+        let res = get_user_instructions(&make_config(&tmp, LIMIT, None).await, None)
             .await
             .expect("doc expected");
 
@@ -222,10 +339,12 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         // Build config pointing at the nested dir.
-        let mut cfg = make_config(&repo, 4096, None);
+        let mut cfg = make_config(&repo, 4096, None).await;
         cfg.cwd = nested;
 
-        let res = create_full_instructions(&cfg).await.expect("doc expected");
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("doc expected");
         assert_eq!(res, "root level doc");
     }
 
@@ -235,7 +354,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::write(tmp.path().join("AGENTS.md"), "something").unwrap();
 
-        let res = create_full_instructions(&make_config(&tmp, 0, None)).await;
+        let res = get_user_instructions(&make_config(&tmp, 0, None).await, None).await;
         assert!(
             res.is_none(),
             "With limit 0 the function should return None"
@@ -251,7 +370,7 @@ mod tests {
 
         const INSTRUCTIONS: &str = "base instructions";
 
-        let res = create_full_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)))
+        let res = get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)).await, None)
             .await
             .expect("should produce a combined instruction string");
 
@@ -268,8 +387,167 @@ mod tests {
 
         const INSTRUCTIONS: &str = "some instructions";
 
-        let res = create_full_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS))).await;
+        let res =
+            get_user_instructions(&make_config(&tmp, 4096, Some(INSTRUCTIONS)).await, None).await;
 
         assert_eq!(res, Some(INSTRUCTIONS.to_string()));
+    }
+
+    /// When both the repository root and the working directory contain
+    /// AGENTS.md files, their contents are concatenated from root to cwd.
+    #[tokio::test]
+    async fn concatenates_root_and_cwd_docs() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Simulate a git repository.
+        std::fs::write(
+            repo.path().join(".git"),
+            "gitdir: /path/to/actual/git/dir\n",
+        )
+        .unwrap();
+
+        // Repo root doc.
+        fs::write(repo.path().join("AGENTS.md"), "root doc").unwrap();
+
+        // Nested working directory with its own doc.
+        let nested = repo.path().join("workspace/crate_a");
+        std::fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("AGENTS.md"), "crate doc").unwrap();
+
+        let mut cfg = make_config(&repo, 4096, None).await;
+        cfg.cwd = nested;
+
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("doc expected");
+        assert_eq!(res, "root doc\n\ncrate doc");
+    }
+
+    /// AGENTS.override.md is preferred over AGENTS.md when both are present.
+    #[tokio::test]
+    async fn agents_local_md_preferred() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join(DEFAULT_PROJECT_DOC_FILENAME), "versioned").unwrap();
+        fs::write(tmp.path().join(LOCAL_PROJECT_DOC_FILENAME), "local").unwrap();
+
+        let cfg = make_config(&tmp, 4096, None).await;
+
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("local doc expected");
+
+        assert_eq!(res, "local");
+
+        let discovery = discover_project_doc_paths(&cfg).expect("discover paths");
+        assert_eq!(discovery.len(), 1);
+        assert_eq!(
+            discovery[0].file_name().unwrap().to_string_lossy(),
+            LOCAL_PROJECT_DOC_FILENAME
+        );
+    }
+
+    /// When AGENTS.md is absent but a configured fallback exists, the fallback is used.
+    #[tokio::test]
+    async fn uses_configured_fallback_when_agents_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join("EXAMPLE.md"), "example instructions").unwrap();
+
+        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md"]).await;
+
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("fallback doc expected");
+
+        assert_eq!(res, "example instructions");
+    }
+
+    /// AGENTS.md remains preferred when both AGENTS.md and fallbacks are present.
+    #[tokio::test]
+    async fn agents_md_preferred_over_fallbacks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join("AGENTS.md"), "primary").unwrap();
+        fs::write(tmp.path().join("EXAMPLE.md"), "secondary").unwrap();
+
+        let cfg = make_config_with_fallback(&tmp, 4096, None, &["EXAMPLE.md", ".example.md"]).await;
+
+        let res = get_user_instructions(&cfg, None)
+            .await
+            .expect("AGENTS.md should win");
+
+        assert_eq!(res, "primary");
+
+        let discovery = discover_project_doc_paths(&cfg).expect("discover paths");
+        assert_eq!(discovery.len(), 1);
+        assert!(
+            discovery[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .eq(DEFAULT_PROJECT_DOC_FILENAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_are_appended_to_project_doc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join("AGENTS.md"), "base doc").unwrap();
+
+        let cfg = make_config(&tmp, 4096, None).await;
+        create_skill(
+            cfg.codex_home.clone(),
+            "pdf-processing",
+            "extract from pdfs",
+        );
+
+        let skills = load_skills(&cfg);
+        let res = get_user_instructions(
+            &cfg,
+            skills.errors.is_empty().then_some(skills.skills.as_slice()),
+        )
+        .await
+        .expect("instructions expected");
+        let expected_path = dunce::canonicalize(
+            cfg.codex_home
+                .join("skills/pdf-processing/SKILL.md")
+                .as_path(),
+        )
+        .unwrap_or_else(|_| cfg.codex_home.join("skills/pdf-processing/SKILL.md"));
+        let expected_path_str = expected_path.to_string_lossy().replace('\\', "/");
+        let usage_rules = "- Discovery: Available skills are listed in project docs and may also appear in a runtime \"## Skills\" section (name + description + file path). These are the sources of truth; skill bodies live on disk at the listed paths.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1) After deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow.\n  2) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n  3) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n  4) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n- Description as trigger: The YAML `description` in `SKILL.md` is the primary trigger signal; rely on it to decide applicability. If unsure, ask a brief clarification before proceeding.\n- Coordination and sequencing:\n  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.\n  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.\n- Context hygiene:\n  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n  - Avoid deeply nested references; prefer one-hop files explicitly linked from `SKILL.md`.\n  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.";
+        let expected = format!(
+            "base doc\n\n## Skills\nThese skills are discovered at startup from multiple local sources. Each entry includes a name, description, and file path so you can open the source for full instructions.\n- pdf-processing: extract from pdfs (file: {expected_path_str})\n{usage_rules}"
+        );
+        assert_eq!(res, expected);
+    }
+
+    #[tokio::test]
+    async fn skills_render_without_project_doc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = make_config(&tmp, 4096, None).await;
+        create_skill(cfg.codex_home.clone(), "linting", "run clippy");
+
+        let skills = load_skills(&cfg);
+        let res = get_user_instructions(
+            &cfg,
+            skills.errors.is_empty().then_some(skills.skills.as_slice()),
+        )
+        .await
+        .expect("instructions expected");
+        let expected_path =
+            dunce::canonicalize(cfg.codex_home.join("skills/linting/SKILL.md").as_path())
+                .unwrap_or_else(|_| cfg.codex_home.join("skills/linting/SKILL.md"));
+        let expected_path_str = expected_path.to_string_lossy().replace('\\', "/");
+        let usage_rules = "- Discovery: Available skills are listed in project docs and may also appear in a runtime \"## Skills\" section (name + description + file path). These are the sources of truth; skill bodies live on disk at the listed paths.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1) After deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow.\n  2) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n  3) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n  4) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n- Description as trigger: The YAML `description` in `SKILL.md` is the primary trigger signal; rely on it to decide applicability. If unsure, ask a brief clarification before proceeding.\n- Coordination and sequencing:\n  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.\n  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.\n- Context hygiene:\n  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n  - Avoid deeply nested references; prefer one-hop files explicitly linked from `SKILL.md`.\n  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.";
+        let expected = format!(
+            "## Skills\nThese skills are discovered at startup from multiple local sources. Each entry includes a name, description, and file path so you can open the source for full instructions.\n- linting: run clippy (file: {expected_path_str})\n{usage_rules}"
+        );
+        assert_eq!(res, expected);
+    }
+
+    fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
+        let skill_dir = codex_home.join(format!("skills/{name}"));
+        fs::create_dir_all(&skill_dir).unwrap();
+        let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
+        fs::write(skill_dir.join("SKILL.md"), content).unwrap();
     }
 }

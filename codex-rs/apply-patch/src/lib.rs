@@ -1,12 +1,13 @@
+mod invocation;
 mod parser;
 mod seek_sequence;
+mod standalone_executable;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use anyhow::Error;
 use anyhow::Result;
 pub use parser::Hunk;
 pub use parser::ParseError;
@@ -15,10 +16,16 @@ use parser::UpdateFileChunk;
 pub use parser::parse_patch;
 use similar::TextDiff;
 use thiserror::Error;
-use tree_sitter::Parser;
-use tree_sitter_bash::LANGUAGE as BASH;
 
-#[derive(Debug, Error)]
+pub use invocation::maybe_parse_apply_patch_verified;
+pub use standalone_executable::main;
+
+use crate::invocation::ExtractHeredocError;
+
+/// Detailed instructions for gpt-4.1 on how to use the `apply_patch` tool.
+pub const APPLY_PATCH_TOOL_INSTRUCTIONS: &str = include_str!("../apply_patch_tool_instructions.md");
+
+#[derive(Debug, Error, PartialEq)]
 pub enum ApplyPatchError {
     #[error(transparent)]
     ParseError(#[from] ParseError),
@@ -27,6 +34,11 @@ pub enum ApplyPatchError {
     /// Error that occurs while computing replacements when applying patch chunks
     #[error("{0}")]
     ComputeReplacements(String),
+    /// A raw patch body was provided without an explicit `apply_patch` invocation.
+    #[error(
+        "patch detected without explicit call to apply_patch. Rerun as [\"apply_patch\", \"<patch>\"]"
+    )]
+    ImplicitInvocation,
 }
 
 impl From<std::io::Error> for ApplyPatchError {
@@ -34,6 +46,15 @@ impl From<std::io::Error> for ApplyPatchError {
         ApplyPatchError::IoError(IoError {
             context: "I/O error".to_string(),
             source: err,
+        })
+    }
+}
+
+impl From<&std::io::Error> for ApplyPatchError {
+    fn from(err: &std::io::Error) -> Self {
+        ApplyPatchError::IoError(IoError {
+            context: "I/O error".to_string(),
+            source: std::io::Error::new(err.kind(), err.to_string()),
         })
     }
 }
@@ -46,43 +67,29 @@ pub struct IoError {
     source: std::io::Error,
 }
 
-#[derive(Debug)]
-pub enum MaybeApplyPatch {
-    Body(Vec<Hunk>),
-    ShellParseError(Error),
-    PatchParseError(ParseError),
-    NotApplyPatch,
-}
-
-pub fn maybe_parse_apply_patch(argv: &[String]) -> MaybeApplyPatch {
-    match argv {
-        [cmd, body] if cmd == "apply_patch" => match parse_patch(body) {
-            Ok(hunks) => MaybeApplyPatch::Body(hunks),
-            Err(e) => MaybeApplyPatch::PatchParseError(e),
-        },
-        [bash, flag, script]
-            if bash == "bash"
-                && flag == "-lc"
-                && script.trim_start().starts_with("apply_patch") =>
-        {
-            match extract_heredoc_body_from_apply_patch_command(script) {
-                Ok(body) => match parse_patch(&body) {
-                    Ok(hunks) => MaybeApplyPatch::Body(hunks),
-                    Err(e) => MaybeApplyPatch::PatchParseError(e),
-                },
-                Err(e) => MaybeApplyPatch::ShellParseError(e),
-            }
-        }
-        _ => MaybeApplyPatch::NotApplyPatch,
+impl PartialEq for IoError {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context && self.source.to_string() == other.source.to_string()
     }
 }
 
-#[derive(Debug)]
+/// Both the raw PATCH argument to `apply_patch` as well as the PATCH argument
+/// parsed into hunks.
+#[derive(Debug, PartialEq)]
+pub struct ApplyPatchArgs {
+    pub patch: String,
+    pub hunks: Vec<Hunk>,
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum ApplyPatchFileChange {
     Add {
         content: String,
     },
-    Delete,
+    Delete {
+        content: String,
+    },
     Update {
         unified_diff: String,
         move_path: Option<PathBuf>,
@@ -91,14 +98,14 @@ pub enum ApplyPatchFileChange {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MaybeApplyPatchVerified {
     /// `argv` corresponded to an `apply_patch` invocation, and these are the
     /// resulting proposed file changes.
     Body(ApplyPatchAction),
     /// `argv` could not be parsed to determine whether it corresponds to an
     /// `apply_patch` invocation.
-    ShellParseError(Error),
+    ShellParseError(ExtractHeredocError),
     /// `argv` corresponded to an `apply_patch` invocation, but it could not
     /// be fulfilled due to the specified error.
     CorrectnessError(ApplyPatchError),
@@ -106,11 +113,19 @@ pub enum MaybeApplyPatchVerified {
     NotApplyPatch,
 }
 
-#[derive(Debug)]
 /// ApplyPatchAction is the result of parsing an `apply_patch` command. By
 /// construction, all paths should be absolute paths.
+#[derive(Debug, PartialEq)]
 pub struct ApplyPatchAction {
     changes: HashMap<PathBuf, ApplyPatchFileChange>,
+
+    /// The raw patch argument that can be used with `apply_patch` as an exec
+    /// call. i.e., if the original arg was parsed in "lenient" mode with a
+    /// heredoc, this should be the value without the heredoc wrapper.
+    pub patch: String,
+
+    /// The working directory that was used to resolve relative paths in the patch.
+    pub cwd: PathBuf,
 }
 
 impl ApplyPatchAction {
@@ -130,114 +145,27 @@ impl ApplyPatchAction {
             panic!("path must be absolute");
         }
 
+        #[expect(clippy::expect_used)]
+        let filename = path
+            .file_name()
+            .expect("path should not be empty")
+            .to_string_lossy();
+        let patch = format!(
+            r#"*** Begin Patch
+*** Update File: {filename}
+@@
++ {content}
+*** End Patch"#,
+        );
         let changes = HashMap::from([(path.to_path_buf(), ApplyPatchFileChange::Add { content })]);
-        Self { changes }
-    }
-}
-
-/// cwd must be an absolute path so that we can resolve relative paths in the
-/// patch.
-pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApplyPatchVerified {
-    match maybe_parse_apply_patch(argv) {
-        MaybeApplyPatch::Body(hunks) => {
-            let mut changes = HashMap::new();
-            for hunk in hunks {
-                match hunk {
-                    Hunk::AddFile { path, contents } => {
-                        changes.insert(
-                            cwd.join(path),
-                            ApplyPatchFileChange::Add {
-                                content: contents.clone(),
-                            },
-                        );
-                    }
-                    Hunk::DeleteFile { path } => {
-                        changes.insert(cwd.join(path), ApplyPatchFileChange::Delete);
-                    }
-                    Hunk::UpdateFile {
-                        path,
-                        move_path,
-                        chunks,
-                    } => {
-                        let ApplyPatchFileUpdate {
-                            unified_diff,
-                            content: contents,
-                        } = match unified_diff_from_chunks(&path, &chunks) {
-                            Ok(diff) => diff,
-                            Err(e) => {
-                                return MaybeApplyPatchVerified::CorrectnessError(e);
-                            }
-                        };
-                        changes.insert(
-                            cwd.join(path),
-                            ApplyPatchFileChange::Update {
-                                unified_diff,
-                                move_path: move_path.map(|p| cwd.join(p)),
-                                new_content: contents,
-                            },
-                        );
-                    }
-                }
-            }
-            MaybeApplyPatchVerified::Body(ApplyPatchAction { changes })
-        }
-        MaybeApplyPatch::ShellParseError(e) => MaybeApplyPatchVerified::ShellParseError(e),
-        MaybeApplyPatch::PatchParseError(e) => MaybeApplyPatchVerified::CorrectnessError(e.into()),
-        MaybeApplyPatch::NotApplyPatch => MaybeApplyPatchVerified::NotApplyPatch,
-    }
-}
-
-/// Attempts to extract a heredoc_body object from a string bash command like:
-/// Optimistically
-///
-/// ```bash
-/// bash -lc 'apply_patch <<EOF\n***Begin Patch\n...EOF'
-/// ```
-///
-/// # Arguments
-///
-/// * `src` - A string slice that holds the full command
-///
-/// # Returns
-///
-/// This function returns a `Result` which is:
-///
-/// * `Ok(String)` - The heredoc body if the extraction is successful.
-/// * `Err(anyhow::Error)` - An error if the extraction fails.
-///
-fn extract_heredoc_body_from_apply_patch_command(src: &str) -> anyhow::Result<String> {
-    if !src.trim_start().starts_with("apply_patch") {
-        anyhow::bail!("expected command to start with 'apply_patch'");
-    }
-
-    let lang = BASH.into();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&lang)
-        .context("failed to load bash grammar")?;
-    let tree = parser
-        .parse(src, None)
-        .ok_or_else(|| anyhow::anyhow!("failed to parse patch into AST"))?;
-
-    let bytes = src.as_bytes();
-    let mut c = tree.root_node().walk();
-
-    loop {
-        let node = c.node();
-        if node.kind() == "heredoc_body" {
-            let text = node
-                .utf8_text(bytes)
-                .context("failed to interpret heredoc body as UTF-8")?;
-            return Ok(text.trim_end_matches('\n').to_owned());
-        }
-
-        if c.goto_first_child() {
-            continue;
-        }
-        while !c.goto_next_sibling() {
-            if !c.goto_parent() {
-                anyhow::bail!("expected to find heredoc_body in patch candidate");
-            }
+        #[expect(clippy::expect_used)]
+        Self {
+            changes,
+            cwd: path
+                .parent()
+                .expect("path should have parent")
+                .to_path_buf(),
+            patch,
         }
     }
 }
@@ -249,7 +177,7 @@ pub fn apply_patch(
     stderr: &mut impl std::io::Write,
 ) -> Result<(), ApplyPatchError> {
     let hunks = match parse_patch(patch) {
-        Ok(hunks) => hunks,
+        Ok(source) => source.hunks,
         Err(e) => {
             match &e {
                 InvalidPatchError(message) => {
@@ -311,13 +239,21 @@ pub fn apply_hunks(
     match apply_hunks_to_files(hunks) {
         Ok(affected) => {
             print_summary(&affected, stdout).map_err(ApplyPatchError::from)?;
+            Ok(())
         }
         Err(err) => {
-            writeln!(stderr, "{err:?}").map_err(ApplyPatchError::from)?;
+            let msg = err.to_string();
+            writeln!(stderr, "{msg}").map_err(ApplyPatchError::from)?;
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                Err(ApplyPatchError::from(io))
+            } else {
+                Err(ApplyPatchError::IoError(IoError {
+                    context: msg,
+                    source: std::io::Error::other(err),
+                }))
+            }
         }
     }
-
-    Ok(())
 }
 
 /// Applies each parsed patch hunk to the filesystem.
@@ -342,12 +278,12 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).with_context(|| {
-                            format!("Failed to create parent directories for {}", path.display())
-                        })?;
-                    }
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create parent directories for {}", path.display())
+                    })?;
                 }
                 std::fs::write(path, contents)
                     .with_context(|| format!("Failed to write file {}", path.display()))?;
@@ -366,15 +302,12 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                 let AppliedPatch { new_contents, .. } =
                     derive_new_contents_from_chunks(path, chunks)?;
                 if let Some(dest) = move_path {
-                    if let Some(parent) = dest.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!(
-                                    "Failed to create parent directories for {}",
-                                    dest.display()
-                                )
-                            })?;
-                        }
+                    if let Some(parent) = dest.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(parent).with_context(|| {
+                            format!("Failed to create parent directories for {}", dest.display())
+                        })?;
                     }
                     std::fs::write(dest, new_contents)
                         .with_context(|| format!("Failed to write file {}", dest.display()))?;
@@ -417,21 +350,18 @@ fn derive_new_contents_from_chunks(
         }
     };
 
-    let mut original_lines: Vec<String> = original_contents
-        .split('\n')
-        .map(|s| s.to_string())
-        .collect();
+    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
 
     // Drop the trailing empty element that results from the final newline so
     // that line counts match the behaviour of standard `diff`.
-    if original_lines.last().is_some_and(|s| s.is_empty()) {
+    if original_lines.last().is_some_and(String::is_empty) {
         original_lines.pop();
     }
 
     let replacements = compute_replacements(&original_lines, path, chunks)?;
     let new_lines = apply_replacements(original_lines, &replacements);
     let mut new_lines = new_lines;
-    if !new_lines.last().is_some_and(|s| s.is_empty()) {
+    if !new_lines.last().is_some_and(String::is_empty) {
         new_lines.push(String::new());
     }
     let new_contents = new_lines.join("\n");
@@ -456,9 +386,12 @@ fn compute_replacements(
         // If a chunk has a `change_context`, we use seek_sequence to find it, then
         // adjust our `line_index` to continue from there.
         if let Some(ctx_line) = &chunk.change_context {
-            if let Some(idx) =
-                seek_sequence::seek_sequence(original_lines, &[ctx_line.clone()], line_index, false)
-            {
+            if let Some(idx) = seek_sequence::seek_sequence(
+                original_lines,
+                std::slice::from_ref(ctx_line),
+                line_index,
+                false,
+            ) {
                 line_index = idx + 1;
             } else {
                 return Err(ApplyPatchError::ComputeReplacements(format!(
@@ -472,7 +405,7 @@ fn compute_replacements(
         if chunk.old_lines.is_empty() {
             // Pure addition (no old lines). We'll add them at the end or just
             // before the final empty line if one exists.
-            let insertion_idx = if original_lines.last().is_some_and(|s| s.is_empty()) {
+            let insertion_idx = if original_lines.last().is_some_and(String::is_empty) {
                 original_lines.len() - 1
             } else {
                 original_lines.len()
@@ -498,11 +431,11 @@ fn compute_replacements(
 
         let mut new_slice: &[String] = &chunk.new_lines;
 
-        if found.is_none() && pattern.last().is_some_and(|s| s.is_empty()) {
+        if found.is_none() && pattern.last().is_some_and(String::is_empty) {
             // Retry without the trailing empty line which represents the final
             // newline in the file.
             pattern = &pattern[..pattern.len() - 1];
-            if new_slice.last().is_some_and(|s| s.is_empty()) {
+            if new_slice.last().is_some_and(String::is_empty) {
                 new_slice = &new_slice[..new_slice.len() - 1];
             }
 
@@ -519,12 +452,14 @@ fn compute_replacements(
             line_index = start_idx + pattern.len();
         } else {
             return Err(ApplyPatchError::ComputeReplacements(format!(
-                "Failed to find expected lines {:?} in {}",
-                chunk.old_lines,
-                path.display()
+                "Failed to find expected lines in {}:\n{}",
+                path.display(),
+                chunk.old_lines.join("\n"),
             )));
         }
     }
+
+    replacements.sort_by(|(lhs_idx, _, _), (rhs_idx, _, _)| lhs_idx.cmp(rhs_idx));
 
     Ok(replacements)
 }
@@ -609,72 +544,15 @@ pub fn print_summary(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
     use pretty_assertions::assert_eq;
     use std::fs;
+    use std::string::ToString;
     use tempfile::tempdir;
 
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
-        format!("*** Begin Patch\n{}\n*** End Patch", body)
-    }
-
-    fn strs_to_strings(strs: &[&str]) -> Vec<String> {
-        strs.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn test_literal() {
-        let args = strs_to_strings(&[
-            "apply_patch",
-            r#"*** Begin Patch
-*** Add File: foo
-+hi
-*** End Patch
-"#,
-        ]);
-
-        match maybe_parse_apply_patch(&args) {
-            MaybeApplyPatch::Body(hunks) => {
-                assert_eq!(
-                    hunks,
-                    vec![Hunk::AddFile {
-                        path: PathBuf::from("foo"),
-                        contents: "hi\n".to_string()
-                    }]
-                );
-            }
-            result => panic!("expected MaybeApplyPatch::Body got {:?}", result),
-        }
-    }
-
-    #[test]
-    fn test_heredoc() {
-        let args = strs_to_strings(&[
-            "bash",
-            "-lc",
-            r#"apply_patch <<'PATCH'
-*** Begin Patch
-*** Add File: foo
-+hi
-*** End Patch
-PATCH"#,
-        ]);
-
-        match maybe_parse_apply_patch(&args) {
-            MaybeApplyPatch::Body(hunks) => {
-                assert_eq!(
-                    hunks,
-                    vec![Hunk::AddFile {
-                        path: PathBuf::from("foo"),
-                        contents: "hi\n".to_string()
-                    }]
-                );
-            }
-            result => panic!("expected MaybeApplyPatch::Body got {:?}", result),
-        }
+        format!("*** Begin Patch\n{body}\n*** End Patch")
     }
 
     #[test]
@@ -874,6 +752,33 @@ PATCH"#,
         assert_eq!(contents, "a\nB\nc\nd\nE\nf\ng\n");
     }
 
+    #[test]
+    fn test_pure_addition_chunk_followed_by_removal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("panic.txt");
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+@@
++after-context
++second-line
+@@
+ line1
+-line2
+-line3
++line2-replacement"#,
+            path.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(
+            contents,
+            "line1\nline2-replacement\nafter-context\nsecond-line\n"
+        );
+    }
+
     /// Ensure that patches authored with ASCII characters can update lines that
     /// contain typographic Unicode punctuation (e.g. EN DASH, NON-BREAKING
     /// HYPHEN). Historically `git apply` succeeds in such scenarios but our
@@ -939,7 +844,7 @@ PATCH"#,
         ));
         let patch = parse_patch(&patch).unwrap();
 
-        let update_file_chunks = match patch.as_slice() {
+        let update_file_chunks = match patch.hunks.as_slice() {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
@@ -977,7 +882,7 @@ PATCH"#,
         ));
 
         let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.as_slice() {
+        let chunks = match patch.hunks.as_slice() {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
@@ -1014,7 +919,7 @@ PATCH"#,
         ));
 
         let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.as_slice() {
+        let chunks = match patch.hunks.as_slice() {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
@@ -1049,7 +954,7 @@ PATCH"#,
         ));
 
         let patch = parse_patch(&patch).unwrap();
-        let chunks = match patch.as_slice() {
+        let chunks = match patch.hunks.as_slice() {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
@@ -1095,7 +1000,7 @@ PATCH"#,
 
         // Extract chunks then build the unified diff.
         let parsed = parse_patch(&patch).unwrap();
-        let chunks = match parsed.as_slice() {
+        let chunks = match parsed.hunks.as_slice() {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
@@ -1136,5 +1041,25 @@ f
 g
 "#
         );
+    }
+
+    #[test]
+    fn test_apply_patch_fails_on_write_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readonly.txt");
+        fs::write(&path, "before\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n-before\n+after\n*** End Patch",
+            path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        assert!(result.is_err());
     }
 }

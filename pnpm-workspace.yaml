@@ -1,10 +1,7 @@
 packages:
-  - codex-cli
   - docs
-  - packages/*
+  - sdk/typescript
+  - shell-tool-mcp
 
 ignoredBuiltDependencies:
   - esbuild
-
-patchedDependencies:
-  marked-terminal@7.3.0: patches/marked-terminal@7.3.0.patch
