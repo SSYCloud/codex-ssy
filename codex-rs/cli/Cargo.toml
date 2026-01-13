@@ -29,6 +29,7 @@ codex-core = { workspace = true }
 codex-exec = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-login = { workspace = true }
+codex-login-ssy = { workspace = true }
 codex-mcp-server = { workspace = true }
 codex-protocol = { workspace = true }
 codex-responses-api-proxy = { workspace = true }
