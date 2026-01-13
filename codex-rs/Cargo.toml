@@ -25,6 +25,7 @@ members = [
     "linux-sandbox",
     "lmstudio",
     "login",
+    "login-ssy",
     "mcp-server",
     "mcp-types",
     "ollama",
@@ -83,6 +84,7 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
+codex-login-ssy = { path = "login-ssy" }
 codex-mcp-server = { path = "mcp-server" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
