@@ -1,52 +1,52 @@
-use std::fmt;
 use std::path::Path;
 
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_protocol::auth::AuthMode;
 use serde::Deserialize;
 use serde::Serialize;
 
 use super::manager::save_auth;
 use super::storage::AuthDotJson;
 use super::storage::AuthKeyringBackendKind;
-use codex_protocol::auth::AuthMode;
 
-/// Managed Amazon Bedrock API key persisted in `auth.json`.
+/// ShengSuanYun auth credentials persisted in auth storage.
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
-pub struct BedrockApiKeyAuth {
+pub struct ShengSuanYunAuth {
     pub api_key: String,
-    pub region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_token: Option<String>,
 }
 
-impl fmt::Debug for BedrockApiKeyAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BedrockApiKeyAuth")
+impl std::fmt::Debug for ShengSuanYunAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShengSuanYunAuth")
             .field("api_key", &"<redacted>")
-            .field("region", &self.region)
+            .field("jwt_token", &self.jwt_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
 
-/// Writes an `auth.json` that contains only the Amazon Bedrock API key auth.
-pub fn login_with_bedrock_api_key(
+/// Writes auth storage containing only ShengSuanYun auth.
+pub fn login_with_shengsuanyun(
     codex_home: &Path,
     api_key: &str,
-    region: &str,
+    jwt_token: Option<&str>,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> std::io::Result<()> {
     let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::BedrockApiKey),
+        auth_mode: Some(AuthMode::ShengSuanYunAccessKeys),
         openai_api_key: None,
         tokens: None,
         last_refresh: None,
         agent_identity: None,
         personal_access_token: None,
-        bedrock_api_key: Some(BedrockApiKeyAuth {
-            api_key: api_key.to_string(),
-            region: region.to_string(),
-        }),
         bedrock_access_keys: None,
-        shengsuanyun_access_keys: None,
+        bedrock_api_key: None,
+        shengsuanyun_access_keys: Some(ShengSuanYunAuth {
+            api_key: api_key.to_string(),
+            jwt_token: jwt_token.map(str::to_string),
+        }),
     };
     save_auth(
         codex_home,
@@ -55,7 +55,3 @@ pub fn login_with_bedrock_api_key(
         keyring_backend_kind,
     )
 }
-
-#[cfg(test)]
-#[path = "bedrock_api_key_tests.rs"]
-mod tests;

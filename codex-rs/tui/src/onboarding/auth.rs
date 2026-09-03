@@ -16,6 +16,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_login::AuthConfig;
+use codex_login::LoginKind;
 use codex_login::read_openai_api_key_from_env;
 use codex_protocol::auth::AuthMode;
 use crossterm::event::KeyCode;
@@ -91,6 +92,8 @@ pub(crate) enum SignInState {
     ApiKeyConfigured,
     Bedrock(BedrockState),
     BedrockConfigured,
+    ShengSuanYunSuccess,
+    ShengSuanYunSuccessMessage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +102,7 @@ pub(crate) enum SignInOption {
     DeviceCode,
     ApiKey,
     Bedrock,
+    ShengSuanYun,
 }
 
 const API_KEY_DISABLED_MESSAGE: &str = "API key login is disabled.";
@@ -131,6 +135,9 @@ pub(crate) struct ApiKeyInputState {
 pub(crate) struct ContinueInBrowserState {
     login_id: String,
     auth_url: String,
+    /// Which provider this in-browser login belongs to, so a completed login
+    /// can be routed to the matching provider's success message.
+    login_kind: LoginKind,
 }
 
 #[derive(Clone)]
@@ -348,8 +355,17 @@ impl AuthModeWidget {
             .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
     }
 
+    fn is_shengsuanyun_login_allowed(&self) -> bool {
+        self.auth_config
+            .is_login_method_allowed(ForcedLoginMethod::ShengSuanYun)
+    }
+
     fn displayed_sign_in_options(&self) -> Vec<SignInOption> {
-        let mut options = vec![SignInOption::ChatGpt];
+        let mut options = vec![];
+        if self.is_shengsuanyun_login_allowed() {
+            options.push(SignInOption::ShengSuanYun);
+        }
+        options.push(SignInOption::ChatGpt);
         if self.is_chatgpt_login_allowed() {
             options.push(SignInOption::DeviceCode);
         }
@@ -363,18 +379,7 @@ impl AuthModeWidget {
     }
 
     fn selectable_sign_in_options(&self) -> Vec<SignInOption> {
-        let mut options = Vec::new();
-        if self.is_chatgpt_login_allowed() {
-            options.push(SignInOption::ChatGpt);
-            options.push(SignInOption::DeviceCode);
-        }
-        if self.is_api_login_allowed() {
-            options.push(SignInOption::ApiKey);
-            if self.bedrock_setup_enabled {
-                options.push(SignInOption::Bedrock);
-            }
-        }
-        options
+        self.displayed_sign_in_options()
     }
 
     fn move_highlight(&mut self, delta: isize) {
@@ -401,6 +406,11 @@ impl AuthModeWidget {
 
     fn handle_sign_in_option(&mut self, option: SignInOption) {
         match option {
+            SignInOption::ShengSuanYun => {
+                if self.is_shengsuanyun_login_allowed() {
+                    self.start_shengsuanyun_login();
+                }
+            }
             SignInOption::ChatGpt => {
                 if self.is_chatgpt_login_allowed() {
                     self.start_chatgpt_login();
@@ -429,7 +439,7 @@ impl AuthModeWidget {
     }
 
     fn disallow_api_login(&mut self) {
-        self.highlighted_mode = SignInOption::ChatGpt;
+        self.highlighted_mode = SignInOption::ShengSuanYun;
         self.set_error(Some(API_KEY_DISABLED_MESSAGE.to_string()));
         *self.sign_in_state.write().unwrap() = SignInState::PickMode;
         self.request_frame.schedule_frame();
@@ -490,6 +500,14 @@ impl AuthModeWidget {
 
         for (idx, option) in self.displayed_sign_in_options().into_iter().enumerate() {
             match option {
+                SignInOption::ShengSuanYun => {
+                    lines.extend(create_mode_item(
+                        idx,
+                        option,
+                        "登录胜算云",
+                        "注册胜算云，新用户赠送10元额度。",
+                    ));
+                }
                 SignInOption::ChatGpt => {
                     lines.extend(create_mode_item(
                         idx,
@@ -656,12 +674,51 @@ impl AuthModeWidget {
         mark_buffer_hyperlinks(buf, area, &lines, /*scroll_rows*/ 0);
     }
 
+    fn render_shengsuanyun_success_message(&self, area: Rect, buf: &mut Buffer) {
+        let mut docs_line = HyperlinkLine::new(Line::from("  For more details see the ").dim());
+        docs_line.push_span(
+            "Codex docs".underlined(),
+            Some("https://developers.openai.com/codex/security"),
+        );
+        let lines = vec![
+            HyperlinkLine::new(
+                "✓ 成功登录胜算云账户"
+                    .fg(Color::Green)
+                    .into(),
+            ),
+            "  Codex 可能会犯错".into(),
+            HyperlinkLine::new(
+                "  审查它编写的代码和执行的命令".dim().into(),
+            ),
+            "".into(),
+            "  由您的胜算云账户提供支持".into(),
+            HyperlinkLine::new(Line::from(vec![
+                "  Press ".fg(Color::Cyan),
+                self.confirm_binding().into(),
+                " to continue".fg(Color::Cyan),
+            ])),
+        ];
+
+        Paragraph::new(visible_lines(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+        mark_buffer_hyperlinks(buf, area, &lines, /*scroll_rows*/ 0);
+    }
+
     fn render_chatgpt_success(&self, area: Rect, buf: &mut Buffer) {
         let lines = vec![
             "✓ Signed in with your ChatGPT account"
                 .fg(Color::Green)
                 .into(),
         ];
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    fn render_shengsuanyun_success(&self, area: Rect, buf: &mut Buffer) {
+        let lines = vec!["✓ 成功登录你的胜算云账户".fg(Color::Green).into()];
 
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -922,6 +979,19 @@ impl AuthModeWidget {
         }
     }
 
+    fn handle_existing_shengsuanyun_login(&mut self) -> bool {
+        if matches!(
+            self.login_status,
+            LoginStatus::AuthMode(auth_mode) if auth_mode.has_shengsuanyun_account()
+        ) {
+            *self.sign_in_state.write().unwrap() = SignInState::ShengSuanYunSuccess;
+            self.request_frame.schedule_frame();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Kicks off the ChatGPT auth flow and keeps the UI state consistent with the attempt.
     fn start_chatgpt_login(&mut self) {
         // If we're already authenticated with ChatGPT, don't start a new login –
@@ -954,6 +1024,53 @@ impl AuthModeWidget {
                         SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
                             login_id,
                             auth_url,
+                            login_kind: LoginKind::Chatgpt,
+                        });
+                }
+                Ok(other) => {
+                    *sign_in_state.write().unwrap() = SignInState::PickMode;
+                    *error.write().unwrap() = Some(format!(
+                        "Unexpected account/login/start response: {other:?}"
+                    ));
+                }
+                Err(err) => {
+                    *sign_in_state.write().unwrap() = SignInState::PickMode;
+                    *error.write().unwrap() = Some(err.to_string());
+                }
+            }
+            request_frame.schedule_frame();
+        });
+    }
+
+    fn start_shengsuanyun_login(&mut self) {
+        if self.handle_existing_shengsuanyun_login() {
+            return;
+        }
+        self.set_error(/*message*/ None);
+        let request_handle = self.app_server_request_handle.clone();
+        let sign_in_state = self.sign_in_state.clone();
+        let error = self.error.clone();
+        let request_frame = self.request_frame.clone();
+        tokio::spawn(async move {
+            match request_handle
+                .request_typed::<LoginAccountResponse>(ClientRequest::LoginAccount {
+                    request_id: onboarding_request_id(),
+                    params: LoginAccountParams::ShengSuanYun {
+                        app_brand: None,
+                        codex_streamlined_login: false,
+                        use_hosted_login_success_page: false,
+                    },
+                })
+                .await
+            {
+                Ok(LoginAccountResponse::ShengSuanYun { login_id, auth_url }) => {
+                    maybe_open_auth_url_in_browser(&request_handle, &auth_url);
+                    *error.write().unwrap() = None;
+                    *sign_in_state.write().unwrap() =
+                        SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
+                            login_id,
+                            auth_url,
+                            login_kind: LoginKind::ShengSuanYun,
                         });
                 }
                 Ok(other) => {
@@ -987,22 +1104,31 @@ impl AuthModeWidget {
         let Some(login_id) = notification.login_id else {
             return;
         };
-        let guard = self.sign_in_state.read().unwrap();
-        let is_matching_login = matches!(
-            &*guard,
-            SignInState::ChatGptContinueInBrowser(state) if state.login_id == login_id
-        ) || matches!(
-            &*guard,
-            SignInState::ChatGptDeviceCode(state) if state.login_id() == Some(login_id.as_str())
-        );
-        drop(guard);
-        if !is_matching_login {
+        let completed_login_kind = {
+            let guard = self.sign_in_state.read().unwrap();
+            match &*guard {
+                SignInState::ChatGptContinueInBrowser(state) if state.login_id == login_id => {
+                    Some(state.login_kind)
+                }
+                SignInState::ChatGptDeviceCode(state)
+                    if state.login_id() == Some(login_id.as_str()) =>
+                {
+                    Some(LoginKind::Chatgpt)
+                }
+                _ => None,
+            }
+        };
+        let Some(login_kind) = completed_login_kind else {
             return;
-        }
+        };
 
         if notification.success {
             self.set_error(/*message*/ None);
-            *self.sign_in_state.write().unwrap() = SignInState::ChatGptSuccessMessage;
+            let next = match login_kind {
+                LoginKind::ShengSuanYun => SignInState::ShengSuanYunSuccessMessage,
+                LoginKind::Chatgpt => SignInState::ChatGptSuccessMessage,
+            };
+            *self.sign_in_state.write().unwrap() = next;
         } else {
             self.set_error(notification.error);
             *self.sign_in_state.write().unwrap() = SignInState::PickMode;
@@ -1023,6 +1149,7 @@ impl AuthModeWidget {
                     ApiAuthMode::PersonalAccessToken => AuthMode::PersonalAccessToken,
                     ApiAuthMode::BedrockApiKey => AuthMode::BedrockApiKey,
                     ApiAuthMode::BedrockAccessKeys => AuthMode::BedrockAccessKeys,
+                    ApiAuthMode::ShengSuanYunAccessKeys => AuthMode::ShengSuanYunAccessKeys,
                 })
             })
             .unwrap_or(LoginStatus::NotAuthenticated);
@@ -1040,6 +1167,8 @@ impl StepStateProvider for AuthModeWidget {
             | SignInState::ChatGptSuccessMessage
             | SignInState::Bedrock(_) => StepState::InProgress,
             SignInState::ChatGptSuccess
+            | SignInState::ShengSuanYunSuccess
+            | SignInState::ShengSuanYunSuccessMessage
             | SignInState::ApiKeyConfigured
             | SignInState::BedrockConfigured => StepState::Complete,
         }
@@ -1078,6 +1207,12 @@ impl WidgetRef for AuthModeWidget {
                 Paragraph::new("✓ Amazon Bedrock configured".green())
                     .wrap(Wrap { trim: false })
                     .render(area, buf);
+            }
+            SignInState::ShengSuanYunSuccess => {
+                self.render_shengsuanyun_success(area, buf);
+            }
+            SignInState::ShengSuanYunSuccessMessage => {
+                self.render_shengsuanyun_success_message(area, buf);
             }
         }
     }
@@ -1162,10 +1297,10 @@ mod tests {
         })
         .await
         .unwrap();
-        auth_config.forced_login_method = Some(ForcedLoginMethod::Chatgpt);
+        auth_config.forced_login_method = Some(ForcedLoginMethod::ShengSuanYun);
         let widget = AuthModeWidget {
             request_frame: FrameRequester::test_dummy(),
-            highlighted_mode: SignInOption::ChatGpt,
+            highlighted_mode: SignInOption::ShengSuanYun,
             error: Arc::new(RwLock::new(None)),
             sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
             login_status: LoginStatus::NotAuthenticated,
@@ -1201,6 +1336,7 @@ mod tests {
         assert_eq!(
             widget.displayed_sign_in_options(),
             vec![
+                SignInOption::ShengSuanYun,
                 SignInOption::ChatGpt,
                 SignInOption::DeviceCode,
                 SignInOption::ApiKey,
@@ -1211,6 +1347,7 @@ mod tests {
         assert_eq!(
             widget.displayed_sign_in_options(),
             vec![
+                SignInOption::ShengSuanYun,
                 SignInOption::ChatGpt,
                 SignInOption::DeviceCode,
                 SignInOption::ApiKey,
@@ -1299,6 +1436,7 @@ mod tests {
             SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
                 login_id: "login-1".to_string(),
                 auth_url: "https://auth.example.com".to_string(),
+                login_kind: LoginKind::Chatgpt,
             });
 
         widget.cancel_active_attempt();
@@ -1359,6 +1497,7 @@ mod tests {
             SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
                 login_id: "login-1".to_string(),
                 auth_url: PRODUCTION_LENGTH_AUTH_URL.to_string(),
+                login_kind: LoginKind::Chatgpt,
             });
 
         let width = 44;
@@ -1501,7 +1640,7 @@ mod tests {
             SignInState::ChatGptSuccessMessage
         ));
     }
-
+    
     #[test]
     fn mark_url_hyperlink_wraps_cyan_underlined_cells() {
         let url = "https://example.com";

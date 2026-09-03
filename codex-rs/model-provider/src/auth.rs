@@ -316,7 +316,8 @@ pub fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider {
         CodexAuth::ApiKey(_)
         | CodexAuth::Chatgpt(_)
         | CodexAuth::ChatgptAuthTokens(_)
-        | CodexAuth::PersonalAccessToken(_) => Arc::new(BearerAuthProvider {
+        | CodexAuth::PersonalAccessToken(_)
+        | CodexAuth::ShengSuanYun(_) => Arc::new(BearerAuthProvider {
             token: auth.get_token().ok(),
             account_id: auth.get_account_id(),
             is_fedramp_account: auth.is_fedramp_account(),

@@ -17,5 +17,6 @@ pub(crate) fn auth_mode_to_api(auth_mode: AuthMode) -> ApiAuthMode {
         AuthMode::PersonalAccessToken => ApiAuthMode::PersonalAccessToken,
         AuthMode::BedrockApiKey => ApiAuthMode::BedrockApiKey,
         AuthMode::BedrockAccessKeys => ApiAuthMode::BedrockAccessKeys,
+        AuthMode::ShengSuanYunAccessKeys => ApiAuthMode::ShengSuanYunAccessKeys,
     }
 }

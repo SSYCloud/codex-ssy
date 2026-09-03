@@ -558,6 +558,7 @@ impl ServiceTier {
 pub enum ForcedLoginMethod {
     Chatgpt,
     Api,
+    ShengSuanYun,
 }
 
 const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;

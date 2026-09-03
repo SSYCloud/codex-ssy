@@ -59,6 +59,11 @@ pub enum AuthMode {
     #[ts(rename = "bedrockAccessKeys")]
     #[strum(serialize = "bedrockAccessKeys")]
     BedrockAccessKeys,
+    /// ShengSuanYun API key managed by Codex.
+    #[serde(rename = "shengSuanYunAccessKeys")]
+    #[ts(rename = "shengSuanYunAccessKeys")]
+    #[strum(serialize = "shengSuanYunAccessKeys")]
+    ShengSuanYunAccessKeys,
 }
 
 impl AuthMode {
@@ -67,6 +72,7 @@ impl AuthMode {
         match self {
             Self::Chatgpt | Self::ChatgptAuthTokens | Self::PersonalAccessToken => true,
             Self::ApiKey
+            | Self::ShengSuanYunAccessKeys
             | Self::Headers
             | Self::AgentIdentity
             | Self::BedrockApiKey
@@ -82,7 +88,10 @@ impl AuthMode {
             | Self::Headers
             | Self::AgentIdentity
             | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::BedrockApiKey | Self::BedrockAccessKeys => false,
+            Self::ApiKey
+            | Self::BedrockApiKey
+            | Self::BedrockAccessKeys
+            | Self::ShengSuanYunAccessKeys => false,
         }
     }
 }

@@ -20,6 +20,7 @@ use tracing::warn;
 
 use super::BedrockAccessKeysAuth;
 use super::BedrockApiKeyAuth;
+use super::ShengSuanYunAuth;
 use crate::token_data::TokenData;
 use codex_agent_identity::AgentIdentityJwtClaims;
 use codex_agent_identity::decode_agent_identity_jwt;
@@ -62,6 +63,9 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_access_keys: Option<BedrockAccessKeysAuth>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shengsuanyun_access_keys: Option<ShengSuanYunAuth>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]

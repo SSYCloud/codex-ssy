@@ -21,6 +21,7 @@ fn api_key_auth() -> AuthDotJson {
         personal_access_token: None,
         bedrock_api_key: None,
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn bedrock_only_auth() -> AuthDotJson {
         personal_access_token: None,
         bedrock_api_key: Some(bedrock_auth()),
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     }
 }
 
@@ -93,6 +95,7 @@ async fn login_with_bedrock_api_key_replaces_openai_auth() -> anyhow::Result<()>
         personal_access_token: None,
         bedrock_api_key: Some(bedrock_auth()),
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     };
     assert_eq!(loaded, expected);
     assert_eq!(auth_manager.auth_mode(), Some(AuthMode::BedrockApiKey));
@@ -105,7 +108,8 @@ async fn login_with_bedrock_api_key_replaces_openai_auth() -> anyhow::Result<()>
             | CodexAuth::Headers(_)
             | CodexAuth::AgentIdentity(_)
             | CodexAuth::PersonalAccessToken(_)
-            | CodexAuth::BedrockAccessKeys(_) => None,
+            | CodexAuth::BedrockAccessKeys(_)
+            | CodexAuth::ShengSuanYun(_) => None,
         }),
         Some(bedrock_auth())
     );
@@ -176,7 +180,8 @@ async fn access_keys_auth_round_trips_and_logs_out() -> anyhow::Result<()> {
             | CodexAuth::Headers(_)
             | CodexAuth::AgentIdentity(_)
             | CodexAuth::PersonalAccessToken(_)
-            | CodexAuth::BedrockApiKey(_) => None,
+            | CodexAuth::BedrockApiKey(_)
+            | CodexAuth::ShengSuanYun(_) => None,
         }),
         Some(crate::auth::BedrockAccessKeysAuth {
             access_key_id: "access-key-id".to_string(),
@@ -224,7 +229,8 @@ async fn bedrock_only_auth_storage_creates_primary_auth() -> anyhow::Result<()> 
             | CodexAuth::Headers(_)
             | CodexAuth::AgentIdentity(_)
             | CodexAuth::PersonalAccessToken(_)
-            | CodexAuth::BedrockAccessKeys(_) => None,
+            | CodexAuth::BedrockAccessKeys(_)
+            | CodexAuth::ShengSuanYun(_) => None,
         }),
         Some(bedrock_auth())
     );

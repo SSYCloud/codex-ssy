@@ -264,6 +264,7 @@ fn chatgpt_auth_with_refresh_token(refresh_token: &str) -> AuthDotJson {
         personal_access_token: None,
         bedrock_api_key: None,
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     }
 }
 

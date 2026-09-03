@@ -30,12 +30,14 @@ impl ManagedAuthPolicy {
         forced_login_method: Option<ForcedLoginMethod>,
         forced_workspaces: Option<&[String]>,
     ) -> Vec<ForcedLoginMethod> {
-        [ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt]
-            .into_iter()
-            .filter(|method| {
-                self.allows_login_method(*method, forced_login_method, forced_workspaces)
-            })
-            .collect()
+        [
+            ForcedLoginMethod::Api,
+            ForcedLoginMethod::Chatgpt,
+            ForcedLoginMethod::ShengSuanYun,
+        ]
+        .into_iter()
+        .filter(|method| self.allows_login_method(*method, forced_login_method, forced_workspaces))
+        .collect()
     }
 
     pub fn effective_chatgpt_workspaces(

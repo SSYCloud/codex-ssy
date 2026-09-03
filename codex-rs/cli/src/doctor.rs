@@ -1421,6 +1421,7 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
         AuthMode::BedrockAccessKeys => "bedrock_access_keys",
+        AuthMode::ShengSuanYunAccessKeys => "sheng_suan_yun_access_keys",
     }
 }
 
@@ -1526,6 +1527,14 @@ fn stored_auth_issues(
                 }
             }
             None => issues.push("Bedrock access key auth is missing AWS access keys"),
+        },
+        AuthMode::ShengSuanYunAccessKeys => match auth.shengsuanyun_access_keys.as_ref() {
+            Some(tokens) => {
+                if tokens.api_key.trim().is_empty() {
+                    issues.push("ShengSuanYun auth is missing an API key");
+                }
+            }
+            None => issues.push("ShengSuanYun auth is missing an API key"),
         },
     }
     issues
@@ -2524,6 +2533,7 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
         AuthMode::BedrockAccessKeys => "bedrock_access_keys",
+        AuthMode::ShengSuanYunAccessKeys => "sheng_suan_yun_access_keys",
     }
 }
 
@@ -2673,9 +2683,12 @@ fn provider_auth_reachability_mode_from_auth(
         return ProviderAuthReachabilityMode::Chatgpt;
     }
     match stored_auth.map(stored_auth_mode_value) {
-        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys) => {
-            ProviderAuthReachabilityMode::ApiKey
-        }
+        Some(
+            AuthMode::ApiKey
+            | AuthMode::BedrockApiKey
+            | AuthMode::BedrockAccessKeys
+            | AuthMode::ShengSuanYunAccessKeys,
+        ) => ProviderAuthReachabilityMode::ApiKey,
         Some(
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
@@ -3598,6 +3611,7 @@ mod tests {
             personal_access_token: None,
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         };
 
         assert_eq!(
@@ -3618,6 +3632,7 @@ mod tests {
             personal_access_token: None,
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         };
 
         assert_eq!(
@@ -3640,6 +3655,7 @@ mod tests {
             personal_access_token: Some("at-test".to_string()),
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         };
 
         assert_eq!(stored_auth_mode(&auth), "personal_access_token");
@@ -3664,6 +3680,7 @@ mod tests {
             personal_access_token: None,
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         };
 
         assert_eq!(

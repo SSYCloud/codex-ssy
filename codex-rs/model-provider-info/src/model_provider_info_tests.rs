@@ -155,6 +155,25 @@ fn test_header_auth_uses_chatgpt_codex_base_url() {
 }
 
 #[test]
+fn test_shengsuanyun_auth_uses_shengsuanyun_base_url() {
+    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        .to_api_provider(Some(AuthMode::ShengSuanYunAccessKeys))
+        .expect("OpenAI provider should build API provider");
+
+    assert_eq!(api_provider.base_url, SHENGSUANYUN_BASE_URL);
+}
+
+#[test]
+fn test_shengsuanyun_auth_respects_explicit_base_url_override() {
+    let api_provider =
+        ModelProviderInfo::create_openai_provider(Some("https://proxy.example.com/v1".to_string()))
+            .to_api_provider(Some(AuthMode::ShengSuanYunAccessKeys))
+            .expect("OpenAI provider should build API provider");
+
+    assert_eq!(api_provider.base_url, "https://proxy.example.com/v1");
+}
+
+#[test]
 fn codex_backend_routes_require_codex_base_url() {
     for (base_url, expected) in [
         (None, true),

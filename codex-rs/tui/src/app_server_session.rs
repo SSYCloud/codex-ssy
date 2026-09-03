@@ -1602,6 +1602,10 @@ pub(crate) fn status_account_display_from_auth_mode(
     plan_type: Option<codex_protocol::account::PlanType>,
 ) -> Option<StatusAccountDisplay> {
     match auth_mode {
+        Some(AuthMode::ShengSuanYunAccessKeys) => Some(StatusAccountDisplay::ShengSuanYun {
+            name: None,
+            plan: plan_type.map(plan_type_display_name),
+        }),
         Some(AuthMode::ApiKey) => Some(StatusAccountDisplay::ApiKey),
         Some(AuthMode::Chatgpt)
         | Some(AuthMode::ChatgptAuthTokens)

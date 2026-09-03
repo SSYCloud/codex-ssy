@@ -11,16 +11,22 @@ use codex_api::TransportError;
 use codex_api::is_azure_responses_provider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_http_client::HttpClientFactory;
 use codex_login::default_client::RESIDENCY_HEADER_NAME;
 use codex_login::default_client::ResidencyRequirement;
 use codex_login::default_client::read_default_client_residency_requirement;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::cache::ModelsCache;
+use codex_models_manager::manager::ModelsEndpointClient;
+use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CoreResult;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderValue;
 
@@ -31,6 +37,7 @@ use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
+use crate::shengsuanyun_models_endpoint::ShengSuanYunModelsEndpoint;
 
 pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
     if let Some(requirement) = read_default_client_residency_requirement() {
@@ -331,6 +338,82 @@ impl ConfiguredModelProvider {
             auth_manager,
         }
     }
+
+    fn models_endpoint_client(&self) -> Arc<dyn ModelsEndpointClient> {
+        Arc::new(DynamicModelsEndpointClient::new(
+            self.info.clone(),
+            self.auth_manager.clone(),
+        ))
+    }
+}
+
+/// Routes `/models` requests to the endpoint matching the caller's *current* auth mode.
+///
+/// `ConfiguredModelProvider::models_manager()` selects a single endpoint when the
+/// manager is constructed, but a user may log into a new provider (e.g. ShengSuanYun)
+/// *after* that manager already exists. Because the fixed `OpenAiModelsEndpoint` reads
+/// `should_refresh_models()` lazily and ShengSuanYun auth is not Codex-backed, a manager
+/// built before login would never refresh and would keep serving the bundled catalog.
+/// This proxy re-evaluates the auth mode on every request, so the correct endpoint is
+/// chosen regardless of when the manager was created.
+#[derive(Debug)]
+struct DynamicModelsEndpointClient {
+    provider_info: ModelProviderInfo,
+    auth_manager: Option<Arc<AuthManager>>,
+}
+
+impl DynamicModelsEndpointClient {
+    fn new(provider_info: ModelProviderInfo, auth_manager: Option<Arc<AuthManager>>) -> Self {
+        Self {
+            provider_info,
+            auth_manager,
+        }
+    }
+
+    fn uses_shengsuanyun_auth(&self) -> bool {
+        self.auth_manager
+            .as_ref()
+            .and_then(|auth_manager| auth_manager.auth_mode())
+            == Some(AuthMode::ShengSuanYunAccessKeys)
+    }
+
+    fn inner(&self) -> Arc<dyn ModelsEndpointClient> {
+        if self.uses_shengsuanyun_auth() {
+            Arc::new(ShengSuanYunModelsEndpoint::new(
+                self.provider_info.clone(),
+                self.auth_manager.clone(),
+            ))
+        } else {
+            Arc::new(OpenAiModelsEndpoint::new(
+                self.provider_info.clone(),
+                self.auth_manager.clone(),
+            ))
+        }
+    }
+}
+
+impl ModelsEndpointClient for DynamicModelsEndpointClient {
+    fn has_command_auth(&self) -> bool {
+        self.inner().has_command_auth()
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        let inner = self.inner();
+        Box::pin(async move { inner.uses_codex_backend().await })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        let inner = self.inner();
+        Box::pin(async move {
+            inner
+                .list_models(client_version, http_client_factory)
+                .await
+        })
+    }
 }
 
 impl ModelProvider for ConfiguredModelProvider {
@@ -401,7 +484,9 @@ impl ModelProvider for ConfiguredModelProvider {
                     Some(auth)
                 })
                 .map(|auth| match &auth {
-                    CodexAuth::ApiKey(_) => Ok(ProviderAccount::ApiKey),
+                    CodexAuth::ApiKey(_) | CodexAuth::ShengSuanYun(_) => {
+                        Ok(ProviderAccount::ApiKey)
+                    }
                     CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_) => {
                         Err(ProviderAccountError::UnsupportedBedrockApiKeyAuth)
                     }
@@ -440,10 +525,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 model_catalog,
             )),
             None => {
-                let endpoint = Arc::new(OpenAiModelsEndpoint::new(
-                    self.info.clone(),
-                    self.auth_manager.clone(),
-                ));
+                let endpoint = self.models_endpoint_client();
                 Arc::new(OpenAiModelsManager::new(
                     codex_home,
                     endpoint,
@@ -463,10 +545,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 model_catalog,
             )),
             None => {
-                let endpoint = Arc::new(OpenAiModelsEndpoint::new(
-                    self.info.clone(),
-                    self.auth_manager.clone(),
-                ));
+                let endpoint = self.models_endpoint_client();
                 Arc::new(OpenAiModelsManager::new_without_cache(
                     endpoint,
                     self.auth_manager.clone(),
@@ -486,10 +565,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 model_catalog,
             )),
             None => {
-                let endpoint = Arc::new(OpenAiModelsEndpoint::new(
-                    self.info.clone(),
-                    self.auth_manager.clone(),
-                ));
+                let endpoint = self.models_endpoint_client();
                 Arc::new(OpenAiModelsManager::new_with_cache(
                     cache,
                     endpoint,
@@ -506,6 +582,7 @@ mod tests {
 
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
+    use codex_login::ShengSuanYunAuth;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_login::auth::BedrockApiKeyAuth;
     use codex_model_provider_info::AwsAuthRefreshConfig;
@@ -1192,6 +1269,64 @@ mod tests {
                 .models
                 .iter()
                 .any(|model| model.slug == "provider-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_provider_models_manager_uses_shengsuanyun_catalog_when_authed() {
+        let server = MockServer::start().await;
+        // ShengSuanYun's own `/models` schema: `{ data: [...] }` with per-model
+        // `support_apis`. Only the entry advertising `/v1/responses` should survive.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {
+                        "id": "deepseek/deepseek-v4-pro",
+                        "name": "DeepSeek-V4-Pro-0813",
+                        "context_window": 1_000_000,
+                        "support_apis": ["/v1/chat/completions", "/v1/responses"]
+                    },
+                    {
+                        "id": "legacy/legacy-model",
+                        "name": "Legacy-Model",
+                        "context_window": 8192,
+                        "support_apis": ["/v1/chat/completions"]
+                    }
+                ],
+                "object": "list",
+                "success": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ Some(server.uri())),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::ShengSuanYun(
+                ShengSuanYunAuth {
+                    api_key: "test-shengsuanyun-key".to_string(),
+                    jwt_token: None,
+                },
+            ))),
+        );
+
+        let manager =
+            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let catalog = manager
+            .raw_model_catalog(
+                RefreshStrategy::Online,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await;
+
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deepseek/deepseek-v4-pro"]
         );
     }
 }

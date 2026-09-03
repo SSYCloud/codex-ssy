@@ -13,6 +13,7 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::ExternalAuth;
+use codex_login::ShengSuanYunAuth;
 use codex_login::ExternalAuthRefreshContext;
 use codex_login::TokenData;
 use codex_protocol::auth::AuthMode;
@@ -577,6 +578,7 @@ c2ln",
         personal_access_token: None,
         bedrock_api_key: None,
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     };
     std::fs::create_dir_all(codex_home).expect("codex home should be created");
     std::fs::write(
@@ -1036,6 +1038,44 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
         .expect("refresh succeeds");
 
     assert_eq!(manager.get_remote_models().await, expected);
+    assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+}
+
+#[tokio::test]
+async fn refresh_available_models_uses_remote_only_catalog_for_shengsuanyun_auth() {
+    let remote_models = vec![remote_model(
+        "shengsuanyun-visible-source-of-truth",
+        "ShengSuanYun Visible",
+        /*priority*/ 100,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = Arc::new(TestModelsEndpoint {
+        has_command_auth: false,
+        uses_codex_backend: true,
+        responses: Mutex::new(vec![remote_models.clone()].into()),
+        fetch_count: AtomicUsize::new(0),
+        observed_proxy_policy: Mutex::new(None),
+    });
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(CodexAuth::ShengSuanYun(
+            ShengSuanYunAuth {
+                api_key: "test-shengsuanyun-key".to_string(),
+                jwt_token: None,
+            },
+        ))),
+    );
+
+    manager
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("refresh succeeds");
+
+    assert_eq!(manager.get_remote_models().await, remote_models);
     assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
 }
 

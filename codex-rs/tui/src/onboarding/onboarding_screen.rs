@@ -135,8 +135,8 @@ impl OnboardingScreen {
         )));
         if show_login_screen {
             let highlighted_mode =
-                if auth_config.is_login_method_allowed(ForcedLoginMethod::Chatgpt) {
-                    SignInOption::ChatGpt
+                if auth_config.is_login_method_allowed(ForcedLoginMethod::ShengSuanYun) {
+                    SignInOption::ShengSuanYun
                 } else {
                     SignInOption::ApiKey
                 };

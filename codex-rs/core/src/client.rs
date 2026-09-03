@@ -532,6 +532,15 @@ impl ModelClient {
         self.state.provider.auth_manager()
     }
 
+    /// ShengSuanYun rides the generic `"OpenAI"`-named provider entry (see
+    /// `ModelProviderInfo::to_api_provider`), so provider-identity checks like
+    /// `is_openai()` can't distinguish it from the real OpenAI/ChatGPT backend on their own.
+    fn uses_shengsuanyun_auth(&self) -> bool {
+        self.auth_manager()
+            .and_then(|auth_manager| auth_manager.auth_mode())
+            .is_some_and(|auth_mode| auth_mode.has_shengsuanyun_account())
+    }
+
     fn take_cached_websocket_session(&self) -> WebsocketSession {
         let mut cached_websocket_session = self
             .state
@@ -898,7 +907,7 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
-        let is_openai = self.state.provider.info().is_openai();
+        let is_openai = self.state.provider.info().is_openai() && !self.uses_shengsuanyun_auth();
         let (instructions, tools) = if model_info.use_responses_lite {
             // These prompt-only items are rebuilt on every request. Hash their visible payloads
             // within the thread so retries and resumed sessions preserve their identity.
@@ -1013,6 +1022,7 @@ impl ModelClient {
     pub fn responses_websocket_enabled(&self) -> bool {
         if !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
+            || self.uses_shengsuanyun_auth()
         {
             return false;
         }
@@ -2317,9 +2327,10 @@ impl AuthRequestTelemetryContext {
         let auth_telemetry = auth_header_telemetry(api_auth);
         Self {
             auth_mode: auth_mode.map(|mode| match mode {
-                AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys => {
-                    "ApiKey"
-                }
+                AuthMode::ApiKey
+                | AuthMode::BedrockApiKey
+                | AuthMode::BedrockAccessKeys
+                | AuthMode::ShengSuanYunAccessKeys => "ApiKey",
                 AuthMode::Chatgpt
                 | AuthMode::ChatgptAuthTokens
                 | AuthMode::Headers

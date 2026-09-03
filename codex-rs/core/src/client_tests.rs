@@ -284,6 +284,121 @@ fn test_model_info() -> ModelInfo {
     .expect("deserialize test model info")
 }
 
+#[tokio::test]
+async fn build_responses_request_strips_internal_metadata_for_shengsuanyun_auth() -> anyhow::Result<()>
+{
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::ShengSuanYun(
+        codex_login::ShengSuanYunAuth {
+            api_key: "test-shengsuanyun-key".to_string(),
+            jwt_token: None,
+        },
+    ));
+    let provider = ModelProviderInfo::create_openai_provider(Some(
+        "https://router.shengsuanyun.com/api/v1".to_string(),
+    ));
+    let client = ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                codex_protocol::models::InternalChatMessageMetadataPassthrough {
+                    turn_id: Some("turn-1".to_string()),
+                    ..Default::default()
+                },
+            ),
+        }],
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+            provenance: None,
+        },
+        ..Default::default()
+    };
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+
+    let request = client.build_responses_request(
+        &prompt,
+        &test_model_info(),
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &responses_metadata,
+    )?;
+
+    let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &request.input[0]
+    else {
+        anyhow::bail!("expected a Message input item");
+    };
+    assert_eq!(internal_chat_message_metadata_passthrough, &None);
+
+    Ok(())
+}
+
+#[test]
+fn responses_websocket_disabled_for_shengsuanyun_auth() {
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::ShengSuanYun(
+        codex_login::ShengSuanYunAuth {
+            api_key: "test-shengsuanyun-key".to_string(),
+            jwt_token: None,
+        },
+    ));
+    // `create_openai_provider` sets `supports_websockets: true`, which is what
+    // would otherwise make the code try (and repeatedly fail) to open Codex's
+    // internal WebSocket transport against a provider that only speaks HTTPS.
+    let provider = ModelProviderInfo::create_openai_provider(Some(
+        "https://router.shengsuanyun.com/api/v1".to_string(),
+    ));
+    let client = ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+
+    assert!(
+        !client.responses_websocket_enabled(),
+        "ShengSuanYun auth must not use the Codex-internal WebSocket transport"
+    );
+}
+
 #[test]
 fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
     let thread_id = ThreadId::new();

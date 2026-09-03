@@ -200,7 +200,11 @@ impl ChatWidget {
             let description =
                 (!preset.description.is_empty()).then_some(preset.description.to_string());
             let is_current = preset.model.as_str() == self.current_model();
-            let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
+            // A model with zero or one effort choices needs no effort sub-popup:
+            // selecting it applies the model directly and dismisses the picker.
+            // (Zero applies to provider models like ShengSuanYun that don't advertise
+            // reasoning levels; otherwise the picker stays stuck and re-applies on Enter.)
+            let single_supported_effort = preset.supported_reasoning_efforts.len() <= 1;
             let preset_for_action = preset.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 let preset_for_event = preset_for_action.clone();

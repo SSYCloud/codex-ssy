@@ -738,6 +738,12 @@ impl HistoryCell for StatusHistoryCell {
         }
 
         let account_value = self.account.as_ref().map(|account| match account {
+            StatusAccountDisplay::ShengSuanYun { name, plan } => match (name, plan) {
+                (Some(name), Some(plan)) => format!("{name} ({plan})"),
+                (Some(name), None) => name.clone(),
+                (None, Some(plan)) => plan.clone(),
+                (None, None) => "胜算云".to_string(),
+            },
             StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
                 (Some(email), Some(plan)) => format!("{email} ({plan})"),
                 (Some(email), None) => email.clone(),

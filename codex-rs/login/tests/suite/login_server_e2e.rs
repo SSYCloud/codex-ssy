@@ -12,6 +12,7 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_http_client::HttpClientBuilder;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::LoginCallbackResult;
+use codex_login::LoginKind;
 use codex_login::LoginOnboardingEntrypoint;
 use codex_login::LoginSuccessPage;
 use codex_login::LoginSuccessPageBrand;
@@ -136,6 +137,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
         forced_chatgpt_workspace_id: Some(vec![chatgpt_account_id.to_string()]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -213,6 +215,7 @@ async fn hosted_login_redirects_to_configured_open_app_url() -> Result<()> {
             app_brand: LoginSuccessPageBrand::Chatgpt,
         },
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
     })?;
     let login_port = server.actual_port;
     let client = HttpClientBuilder::new()
@@ -262,6 +265,7 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -308,6 +312,7 @@ async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<
         ]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -349,6 +354,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
         forced_chatgpt_workspace_id: Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -412,6 +418,7 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -483,6 +490,7 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
@@ -633,6 +641,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
 
@@ -657,6 +666,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_kind: LoginKind::Chatgpt,
         login_success_page: LoginSuccessPage::Local,
     };
 

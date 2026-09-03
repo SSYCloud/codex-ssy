@@ -121,6 +121,7 @@ async fn list_apps_returns_empty_with_api_key_auth() -> Result<()> {
             personal_access_token: None,
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),

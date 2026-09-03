@@ -362,6 +362,28 @@ impl AccountRequestProcessor {
                 )
                 .await;
             }
+            LoginAccountParams::ShengSuanYun {
+                app_brand,
+                codex_streamlined_login,
+                use_hosted_login_success_page,
+            } => {
+                let login_success_page = if use_hosted_login_success_page {
+                    let app_brand = match app_brand.unwrap_or_default() {
+                        LoginAppBrand::Codex => LoginSuccessPageBrand::Codex,
+                        LoginAppBrand::Chatgpt => LoginSuccessPageBrand::Chatgpt,
+                    };
+                    LoginSuccessPage::Hosted {
+                        url: CODEX_OPEN_APP_URL.parse().map_err(|err| {
+                            internal_error(format!("invalid Codex open app URL: {err}"))
+                        })?,
+                        app_brand,
+                    }
+                } else {
+                    LoginSuccessPage::default()
+                };
+                self.login_shengsuanyun(request_id, codex_streamlined_login, login_success_page)
+                    .await;
+            }
         }
         Ok(())
     }
@@ -594,6 +616,44 @@ impl AccountRequestProcessor {
         Ok(opts)
     }
 
+    async fn login_shengsuanyun_common(
+        &self,
+        codex_streamlined_login: bool,
+        login_success_page: LoginSuccessPage,
+    ) -> std::result::Result<LoginServerOptions, JSONRPCErrorError> {
+        let config = self.config.as_ref();
+
+        if self.auth_manager.is_external_chatgpt_auth_active() {
+            return Err(self.external_auth_active_error());
+        }
+
+        if !self
+            .auth_manager
+            .is_login_method_allowed(ForcedLoginMethod::ShengSuanYun)
+        {
+            return Err(invalid_request(
+                "ShengSuanYun login is disabled. Use API key login instead.",
+            ));
+        }
+
+        let opts = LoginServerOptions {
+            open_browser: false,
+            codex_streamlined_login,
+            login_success_page,
+            login_kind: LoginKind::ShengSuanYun,
+            ..LoginServerOptions::new(
+                config.codex_home.to_path_buf(),
+                String::new(),
+                None,
+                config.cli_auth_credentials_store_mode,
+                config.auth_keyring_backend_kind(),
+                config.auth_route_config(),
+            )
+        };
+
+        Ok(opts)
+    }
+
     fn login_chatgpt_device_code_start_error(err: IoError) -> JSONRPCErrorError {
         let is_not_found = err.kind() == std::io::ErrorKind::NotFound;
         if is_not_found {
@@ -691,6 +751,100 @@ impl AccountRequestProcessor {
         });
 
         Ok(LoginAccountResponse::Chatgpt {
+            login_id: login_id.to_string(),
+            auth_url,
+        })
+    }
+
+    async fn login_shengsuanyun(
+        &self,
+        request_id: ConnectionRequestId,
+        codex_streamlined_login: bool,
+        login_success_page: LoginSuccessPage,
+    ) {
+        let result = self
+            .login_shengsuanyun_response(codex_streamlined_login, login_success_page)
+            .await;
+        self.outgoing.send_result(request_id, result).await;
+    }
+
+    async fn login_shengsuanyun_response(
+        &self,
+        codex_streamlined_login: bool,
+        login_success_page: LoginSuccessPage,
+    ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+        let opts = self
+            .login_shengsuanyun_common(codex_streamlined_login, login_success_page)
+            .await?;
+        let server = run_login_server(opts)
+            .map_err(|err| internal_error(format!("failed to start login server: {err}")))?;
+        let login_id = Uuid::new_v4();
+        let shutdown_handle = server.cancel_handle();
+
+        // Replace active login if present.
+        {
+            let mut guard = self.active_login.lock().await;
+            if let Some(existing) = guard.take() {
+                drop(existing);
+            }
+            *guard = Some(ActiveLogin::Browser {
+                shutdown_handle: shutdown_handle.clone(),
+                login_id,
+            });
+        }
+
+        let outgoing_clone = self.outgoing.clone();
+        let config_manager = self.config_manager.clone();
+        let thread_manager = Arc::clone(&self.thread_manager);
+        let config = Arc::clone(&self.config);
+        let active_login = self.active_login.clone();
+        let auth_url = server.auth_url.clone();
+
+        tokio::spawn(async move {
+            let (success, error_msg, onboarding_entrypoint) = match tokio::time::timeout(
+                LOGIN_CHATGPT_TIMEOUT,
+                server.block_until_done_with_callback_result(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => (
+                    true,
+                    None,
+                    result
+                        .onboarding_entrypoint
+                        .map(|LoginOnboardingEntrypoint::LifeSciences| {
+                            DesktopOnboardingEntrypoint::LifeSciences
+                        }),
+                ),
+                Ok(Err(err)) => (false, Some(format!("Login server error: {err}")), None),
+                Err(_elapsed) => {
+                    shutdown_handle.shutdown();
+                    (false, Some("Login timed out".to_string()), None)
+                }
+            };
+
+            Self::send_shengsuanyun_login_completion_notifications(
+                &outgoing_clone,
+                config_manager,
+                thread_manager,
+                config,
+                AccountLoginCompletedNotification {
+                    login_id: Some(login_id.to_string()),
+                    success,
+                    error: error_msg,
+                    onboarding_entrypoint,
+                },
+            )
+            .await;
+
+            // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
+            let mut guard = active_login.lock().await;
+            if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+                *guard = None;
+            }
+        });
+
+        Ok(LoginAccountResponse::ShengSuanYun {
             login_id: login_id.to_string(),
             auth_url,
         })
@@ -907,6 +1061,50 @@ impl AccountRequestProcessor {
     }
 
     async fn send_chatgpt_login_completion_notifications(
+        outgoing: &OutgoingMessageSender,
+        config_manager: ConfigManager,
+        thread_manager: Arc<ThreadManager>,
+        config: Arc<Config>,
+        payload_v2: AccountLoginCompletedNotification,
+    ) {
+        let success = payload_v2.success;
+        outgoing
+            .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
+            .await;
+
+        if success {
+            let auth_manager = thread_manager.auth_manager();
+            auth_manager.reload().await;
+            config_manager.replace_cloud_config_bundle_loader(
+                auth_manager.clone(),
+                config.chatgpt_base_url.clone(),
+                config.http_client_factory(),
+            );
+            config_manager
+                .sync_default_client_residency_requirement()
+                .await;
+
+            let auth = auth_manager.auth_cached();
+            Self::maybe_refresh_plugin_caches_for_current_config(
+                &config_manager,
+                &thread_manager,
+                auth.clone(),
+            )
+            .await;
+            let payload_v2 = AccountUpdatedNotification {
+                auth_mode: auth
+                    .as_ref()
+                    .map(CodexAuth::api_auth_mode)
+                    .map(auth_mode_to_api),
+                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+            };
+            outgoing
+                .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
+                .await;
+        }
+    }
+
+    async fn send_shengsuanyun_login_completion_notifications(
         outgoing: &OutgoingMessageSender,
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,

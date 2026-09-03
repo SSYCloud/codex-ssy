@@ -38,6 +38,7 @@ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const SHENGSUANYUN_BASE_URL: &str = "https://router.shengsuanyun.com/api/v1";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 const AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME: &str = "Amazon Bedrock Runtime";
@@ -301,6 +302,8 @@ impl ModelProviderInfo {
             )
         ) {
             CHATGPT_CODEX_BASE_URL
+        } else if matches!(auth_mode, Some(AuthMode::ShengSuanYunAccessKeys)) {
+            SHENGSUANYUN_BASE_URL
         } else {
             "https://api.openai.com/v1"
         };

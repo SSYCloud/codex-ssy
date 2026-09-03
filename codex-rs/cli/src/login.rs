@@ -495,6 +495,10 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
                 eprintln!("Logged in using Amazon Bedrock AWS access keys");
                 std::process::exit(0);
             }
+            AuthMode::ShengSuanYunAccessKeys => {
+                eprintln!("登录胜算云");
+                std::process::exit(0);
+            }
         },
         Ok(None) => {
             eprintln!("Not logged in");

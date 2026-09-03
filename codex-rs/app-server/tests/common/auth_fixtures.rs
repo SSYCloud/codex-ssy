@@ -168,6 +168,7 @@ pub fn write_chatgpt_auth(
         personal_access_token: None,
         bedrock_api_key: None,
         bedrock_access_keys: None,
+        shengsuanyun_access_keys: None,
     };
 
     save_auth(

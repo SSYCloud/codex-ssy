@@ -7,7 +7,6 @@ use crate::model_info;
 use chrono::Utc;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
-use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::ModelInfo;
@@ -451,9 +450,9 @@ impl OpenAiModelsManager {
                 .iter()
                 .any(|model| model.visibility == ModelVisibility::List)
             && self.auth_manager.as_ref().is_some_and(|auth_manager| {
-                auth_manager
-                    .auth_mode()
-                    .is_some_and(AuthMode::has_chatgpt_account)
+                auth_manager.auth_mode().is_some_and(|mode| {
+                    mode.has_chatgpt_account() || mode.has_shengsuanyun_account()
+                })
             });
         if should_use_remote_models_only {
             *self.remote_models.write().await = models;

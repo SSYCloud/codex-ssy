@@ -4,6 +4,7 @@ mod bearer_auth_provider;
 mod models_endpoint;
 mod provider;
 mod shared_state;
+mod shengsuanyun_models_endpoint;
 
 pub use amazon_bedrock::is_supported_amazon_bedrock_region;
 pub use auth::AgentIdentitySessionFallback;
@@ -17,6 +18,7 @@ pub use bearer_auth_provider::BearerAuthProvider as CoreAuthProvider;
 pub use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 pub use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 pub use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
+pub use codex_model_provider_info::SHENGSUANYUN_BASE_URL;
 pub use codex_protocol::account::ProviderAccount;
 pub use provider::ModelProvider;
 pub use provider::ModelProviderFuture;

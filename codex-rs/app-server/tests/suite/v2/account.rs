@@ -1194,6 +1194,7 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider(
                 secret_access_key: "test-secret".to_string(),
                 session_token: Some("test-token".to_string()),
             }),
+            shengsuanyun_access_keys: None,
         })
     );
     assert_eq!(read_config_toml(codex_home.path())?, expected_config);
@@ -1418,6 +1419,7 @@ async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
                 region: "us-west-2".to_string(),
             }),
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
         })
     );
     assert_eq!(read_config_toml(codex_home.path())?, expected_config);

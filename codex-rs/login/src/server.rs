@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use crate::auth::AuthDotJson;
 use crate::auth::AuthKeyringBackendKind;
+use crate::auth::ShengSuanYunAuth;
 use crate::auth::save_auth;
 use crate::callback_params::LoginCallbackResult;
 use crate::callback_params::login_callback_result_from_state;
@@ -65,6 +66,14 @@ static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
 });
 
+/// Which login flow the local callback server should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoginKind {
+    #[default]
+    Chatgpt,
+    ShengSuanYun,
+}
+
 /// Options for launching the local login callback server.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -80,6 +89,7 @@ pub struct ServerOptions {
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     pub auth_keyring_backend_kind: AuthKeyringBackendKind,
     pub auth_route_config: AuthRouteConfig,
+    pub login_kind: LoginKind,
 }
 
 impl ServerOptions {
@@ -105,6 +115,7 @@ impl ServerOptions {
             cli_auth_credentials_store_mode,
             auth_keyring_backend_kind,
             auth_route_config,
+            login_kind: LoginKind::default(),
         }
     }
 }
@@ -173,15 +184,24 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     };
     let server = Arc::new(server);
 
-    let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
-    let auth_url = build_authorize_url(
-        &opts.issuer,
-        &opts.client_id,
-        &redirect_uri,
-        &pkce,
-        &state,
-        opts.forced_chatgpt_workspace_id.as_deref(),
-    );
+    let redirect_uri = match opts.login_kind {
+        LoginKind::Chatgpt => format!("http://localhost:{actual_port}/auth/callback"),
+        LoginKind::ShengSuanYun => format!("http://localhost:{actual_port}/auth"),
+    };
+    let auth_url = match opts.login_kind {
+        LoginKind::Chatgpt => build_authorize_url(
+            &opts.issuer,
+            &opts.client_id,
+            &redirect_uri,
+            &pkce,
+            &state,
+            opts.forced_chatgpt_workspace_id.as_deref(),
+        ),
+        LoginKind::ShengSuanYun => format!(
+            "https://router.shengsuanyun.com/auth?from=codex-ssy&callback_url={}",
+            urlencoding::encode(&redirect_uri)
+        ),
+    };
 
     if opts.open_browser {
         let _ = webbrowser::open(&auth_url);
@@ -487,6 +507,67 @@ async fn process_request(
                 Err(err) => {
                     eprintln!("Token exchange error: {err}");
                     error!("login callback token exchange failed");
+                    login_error_response(
+                        &format!("Token exchange failed: {err}"),
+                        io::ErrorKind::Other,
+                        Some("token_exchange_failed"),
+                        /*error_description*/ None,
+                    )
+                }
+            }
+        }
+        "/auth" => {
+            let params: std::collections::HashMap<String, String> =
+                parsed_url.query_pairs().into_owned().collect();
+            let code = match params.get("code") {
+                Some(c) if !c.is_empty() => c.clone(),
+                _ => {
+                    return login_error_response(
+                        "Missing authorization code. Sign-in could not be completed.",
+                        io::ErrorKind::InvalidData,
+                        Some("missing_authorization_code"),
+                        /*error_description*/ None,
+                    );
+                }
+            };
+
+            match exchange_shengsuanyun_code(&code, redirect_uri, &opts.auth_route_config).await {
+                Ok(exchanged) => {
+                    if let Err(err) = persist_shengsuanyun_tokens_async(
+                        &opts.codex_home,
+                        exchanged.api_key,
+                        exchanged.jwt_token,
+                        opts.cli_auth_credentials_store_mode,
+                        opts.auth_keyring_backend_kind,
+                    )
+                    .await
+                    {
+                        eprintln!("Persist error: {err}");
+                        return login_error_response(
+                            "Sign-in completed but credentials could not be saved locally.",
+                            io::ErrorKind::Other,
+                            Some("persist_failed"),
+                            Some(&err.to_string()),
+                        );
+                    }
+
+                    let redirect_url = format!("http://localhost:{actual_port}/success");
+                    match tiny_http::Header::from_bytes(&b"Location"[..], redirect_url.as_bytes()) {
+                        Ok(header) => HandledRequest::RedirectWithHeader {
+                            header,
+                            result: LoginCallbackResult::default(),
+                        },
+                        Err(_) => login_error_response(
+                            "Sign-in completed but redirecting back to Codex failed.",
+                            io::ErrorKind::Other,
+                            Some("redirect_failed"),
+                            /*error_description*/ None,
+                        ),
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Token exchange error: {err}");
+                    error!("shengsuanyun login callback token exchange failed");
                     login_error_response(
                         &format!("Token exchange failed: {err}"),
                         io::ErrorKind::Other,
@@ -916,6 +997,111 @@ pub(crate) async fn persist_tokens_async(
             personal_access_token: None,
             bedrock_api_key: None,
             bedrock_access_keys: None,
+            shengsuanyun_access_keys: None,
+        };
+        save_auth(
+            &codex_home,
+            &auth,
+            auth_credentials_store_mode,
+            keyring_backend_kind,
+        )
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+}
+
+/// Tokens returned by the ShengSuanYun code exchange.
+pub(crate) struct ExchangedShengSuanYunTokens {
+    pub api_key: String,
+    pub jwt_token: Option<String>,
+}
+
+/// Exchanges a ShengSuanYun authorization code for an API key and JWT token.
+pub(crate) async fn exchange_shengsuanyun_code(
+    code: &str,
+    callback_url: &str,
+    auth_route_config: &AuthRouteConfig,
+) -> io::Result<ExchangedShengSuanYunTokens> {
+    #[derive(serde::Deserialize)]
+    struct ExchangeData {
+        api_key: Option<String>,
+        jwt_token: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ExchangeResponse {
+        code: i64,
+        data: Option<ExchangeData>,
+        msg: Option<String>,
+    }
+
+    let endpoint = "https://api.shengsuanyun.com/auth/keys?from=codex-ssy";
+    let client = create_raw_auth_client(endpoint, auth_route_config)?;
+    let resp = client
+        .post(endpoint)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "code": code,
+                "callback_url": callback_url,
+            }))
+            .map_err(io::Error::other)?,
+        )
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "shengsuanyun auth exchange returned status {status}"
+        )));
+    }
+
+    let body: ExchangeResponse = resp.json().await.map_err(io::Error::other)?;
+    if body.code != 0 {
+        return Err(io::Error::other(format!(
+            "shengsuanyun auth exchange failed: {}",
+            body.msg.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+    let Some(data) = body.data else {
+        return Err(io::Error::other(
+            "shengsuanyun auth exchange response is missing data",
+        ));
+    };
+    let Some(api_key) = data.api_key.filter(|api_key| !api_key.is_empty()) else {
+        return Err(io::Error::other(
+            "shengsuanyun auth exchange response is missing an api_key",
+        ));
+    };
+
+    Ok(ExchangedShengSuanYunTokens {
+        api_key,
+        jwt_token: data.jwt_token,
+    })
+}
+
+/// Persists exchanged ShengSuanYun credentials using the configured local auth store.
+pub(crate) async fn persist_shengsuanyun_tokens_async(
+    codex_home: &Path,
+    api_key: String,
+    jwt_token: Option<String>,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> io::Result<()> {
+    let codex_home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let auth = AuthDotJson {
+            auth_mode: Some(AuthMode::ShengSuanYunAccessKeys),
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
+            personal_access_token: None,
+            bedrock_api_key: None,
+            bedrock_access_keys: None,
+            shengsuanyun_access_keys: Some(ShengSuanYunAuth { api_key, jwt_token }),
         };
         save_auth(
             &codex_home,

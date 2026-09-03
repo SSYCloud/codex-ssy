@@ -48,6 +48,7 @@ pub fn login_with_bedrock_access_keys(
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        shengsuanyun_access_keys: None,
         bedrock_access_keys: Some(BedrockAccessKeysAuth {
             access_key_id: access_key_id.to_string(),
             secret_access_key: secret_access_key.to_string(),
