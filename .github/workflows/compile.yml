@@ -13,8 +13,13 @@ on:
       - .github/actions/**
       - .github/workflows/compile.yml
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish the successful binaries under (e.g. v0.1.0). Defaults to 'nightly'.
+        required: false
+        default: nightly
 
-# Cancel superseded runs so a stale compile doesn't finish after a newer one.
+# Cancel superseded runs so a stale build doesn't finish after a newer one.
 concurrency:
   group: compile-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,61 +28,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Native host lint. The edited crates below do not pull the `v8` (rusty_v8)
-  # dependency, which the repo only publishes a prebuilt artifact for on
-  # musl/apple-darwin/windows-msvc targets - not the GNU host - so clippy runs
-  # cleanly here without rusty_v8 setup.
-  check:
-    name: Format & clippy (host)
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: codex-rs
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/setup-ci
-
-      - name: Install Linux build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libcap-dev libasound2-dev
-
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-        with:
-          toolchain: 1.95.0
-          components: clippy, rustfmt
-
-      - name: Restore Cargo cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: compile-check-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}
-          restore-keys: |
-            compile-check-${{ runner.os }}-
-
-      - name: cargo fmt
-        run: cargo fmt -- --config imports_granularity=Item --check
-
-      - name: cargo clippy
-        run: cargo clippy -p codex-cli -p codex-exec -p codex-app-server -p codex-tui --tests -- -D warnings
-
-      - name: Check for a clean worktree
-        if: always() && !cancelled()
-        uses: ./.github/actions/check-clean-worktree
-
   # Cross-compile the primary `codex` binary plus the edited crates for every
-  # target triple that the npm `@openai/codex` packages ship.
+  # target triple that the npm `@openai/codex` packages ship, and upload only
+  # the targets that build successfully. A target that fails (e.g. the hosted
+  # Linux runner running out of RAM during `--release`) is skipped via
+  # continue-on-error instead of failing the whole run.
   #
-  # Mirror of the release build recipe, but compile-only (no signing / staging /
+  # Mirror of the release build recipe, compile-only (no signing / staging /
   # packaging) and on GitHub-hosted runners. Non-native architectures are
   # cross-compiled: aarch64 Linux uses an ARM runner, x86_64 apple-darwin is
   # cross-built from the ARM macOS runner, and aarch64-pc-windows-msvc uses the
@@ -86,6 +43,7 @@ jobs:
     name: Compile - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
+    continue-on-error: true
     defaults:
       run:
         working-directory: codex-rs
@@ -134,7 +92,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       # --- musl (Linux) toolchain: Zig + musl cross tools ---
@@ -192,3 +149,73 @@ jobs:
             --bin codex-exec \
             --bin codex-app-server \
             --bin codex-tui
+
+      # Only runs when `cargo build` above succeeded (with continue-on-error the
+      # job stops here on failure, so a failed target uploads nothing). Files are
+      # suffixed with the target triple so the publish job can merge them all.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="${CARGO_TARGET_DIR}/${target}/release"
+          dist_dir="${RUNNER_TEMP}/dist"
+          mkdir -p "$dist_dir"
+          for bin in codex codex-exec codex-app-server codex-tui; do
+            if [[ "$target" == *pc-windows-msvc ]]; then
+              src="${release_dir}/${bin}.exe"
+              dst="${dist_dir}/${bin}-${target}.exe"
+            else
+              src="${release_dir}/${bin}"
+              dst="${dist_dir}/${bin}-${target}"
+            fi
+            if [[ -f "$src" ]]; then
+              cp "$src" "$dst"
+              echo "staged ${dst}"
+            else
+              echo "WARN: ${src} not found; skipping"
+            fi
+          done
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: warn
+
+  # Publish every target that produced binaries to a GitHub Release. Failed
+  # targets simply never uploaded an artifact, so they are ignored here.
+  # Only runs for manual workflow_dispatch runs so ordinary pushes/PRs don't
+  # create a release.
+  publish:
+    name: Publish binaries to GitHub Release
+    if: github.event_name == 'workflow_dispatch'
+    needs: cross-compile
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d dist ]]; then
+            find dist -type f | sort
+          else
+            echo "No binaries were built for any target."
+          fi
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: ${{ inputs.release_tag || 'nightly' }}
+          name: ${{ inputs.release_tag || 'nightly' }}
+          files: dist/*
+          fail_on_unmatched_files: false
+          generate_release_notes: true

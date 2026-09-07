@@ -9,9 +9,9 @@ use codex_api::Provider;
 use codex_api::SharedAuthProvider;
 use codex_api::TransportError;
 use codex_api::is_azure_responses_provider;
+use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_http_client::HttpClientFactory;
 use codex_login::default_client::RESIDENCY_HEADER_NAME;
 use codex_login::default_client::ResidencyRequirement;
 use codex_login::default_client::read_default_client_residency_requirement;
@@ -420,11 +420,7 @@ impl ModelsEndpointClient for DynamicModelsEndpointClient {
         http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
         let inner = self.inner();
-        Box::pin(async move {
-            inner
-                .list_models(client_version, http_client_factory)
-                .await
-        })
+        Box::pin(async move { inner.list_models(client_version, http_client_factory).await })
     }
 }
 

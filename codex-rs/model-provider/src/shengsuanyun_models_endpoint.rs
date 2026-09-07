@@ -97,8 +97,8 @@ impl ShengSuanYunModelsEndpoint {
                 .execute(request)
                 .await
                 .map_err(map_transport_error)?;
-            let parsed: ShengSuanYunModelsResponse =
-                serde_json::from_slice(&response.body).map_err(|err| {
+            let parsed: ShengSuanYunModelsResponse = serde_json::from_slice(&response.body)
+                .map_err(|err| {
                     CodexErr::Stream(format!(
                         "failed to decode shengsuanyun models response: {err}; body: {}",
                         String::from_utf8_lossy(&response.body)

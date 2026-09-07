@@ -287,8 +287,8 @@ fn test_model_info() -> ModelInfo {
 }
 
 #[tokio::test]
-async fn build_responses_request_strips_internal_metadata_for_shengsuanyun_auth() -> anyhow::Result<()>
-{
+async fn build_responses_request_strips_internal_metadata_for_shengsuanyun_auth()
+-> anyhow::Result<()> {
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::ShengSuanYun(
         codex_login::ShengSuanYunAuth {
             api_key: "test-shengsuanyun-key".to_string(),

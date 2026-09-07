@@ -681,15 +681,9 @@ impl AuthModeWidget {
             Some("https://developers.openai.com/codex/security"),
         );
         let lines = vec![
-            HyperlinkLine::new(
-                "✓ 成功登录胜算云账户"
-                    .fg(Color::Green)
-                    .into(),
-            ),
+            HyperlinkLine::new("✓ 成功登录胜算云账户".fg(Color::Green).into()),
             "  Codex 可能会犯错".into(),
-            HyperlinkLine::new(
-                "  审查它编写的代码和执行的命令".dim().into(),
-            ),
+            HyperlinkLine::new("  审查它编写的代码和执行的命令".dim().into()),
             "".into(),
             "  由您的胜算云账户提供支持".into(),
             HyperlinkLine::new(Line::from(vec![
@@ -1640,7 +1634,7 @@ mod tests {
             SignInState::ChatGptSuccessMessage
         ));
     }
-    
+
     #[test]
     fn mark_url_hyperlink_wraps_cyan_underlined_cells() {
         let url = "https://example.com";
