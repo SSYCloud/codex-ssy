@@ -1,0 +1,194 @@
+name: compile
+on:
+  push:
+    paths:
+      - codex-rs/**
+      - justfile
+      - .github/actions/**
+      - .github/workflows/compile.yml
+  pull_request:
+    paths:
+      - codex-rs/**
+      - justfile
+      - .github/actions/**
+      - .github/workflows/compile.yml
+  workflow_dispatch:
+
+# Cancel superseded runs so a stale compile doesn't finish after a newer one.
+concurrency:
+  group: compile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Native host lint. The edited crates below do not pull the `v8` (rusty_v8)
+  # dependency, which the repo only publishes a prebuilt artifact for on
+  # musl/apple-darwin/windows-msvc targets - not the GNU host - so clippy runs
+  # cleanly here without rusty_v8 setup.
+  check:
+    name: Format & clippy (host)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+
+      - name: Restore Cargo cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: compile-check-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            compile-check-${{ runner.os }}-
+
+      - name: cargo fmt
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: cargo clippy
+        run: cargo clippy -p codex-cli -p codex-exec -p codex-app-server -p codex-tui --tests -- -D warnings
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
+  # Cross-compile the primary `codex` binary plus the edited crates for every
+  # target triple that the npm `@openai/codex` packages ship.
+  #
+  # Mirror of the release build recipe, but compile-only (no signing / staging /
+  # packaging) and on GitHub-hosted runners. Non-native architectures are
+  # cross-compiled: aarch64 Linux uses an ARM runner, x86_64 apple-darwin is
+  # cross-built from the ARM macOS runner, and aarch64-pc-windows-msvc uses the
+  # ARM64 MSVC toolchain via the setup-msvc-env action.
+  cross-compile:
+    name: Compile - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            family: musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            family: musl
+          - target: x86_64-apple-darwin
+            runner: macos-15
+            family: darwin
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            family: darwin
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            family: msvc
+          - target: aarch64-pc-windows-msvc
+            runner: windows-2022
+            family: msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # setup-ci provisions a Windows Dev Drive and throws if it cannot - the
+      # release relies on self-hosted runners for that. On GitHub-hosted Windows
+      # we instead point Cargo at a writable temp tree via the msvc branch.
+      - if: ${{ matrix.family != 'msvc' }}
+        uses: ./.github/actions/setup-ci
+
+      - if: ${{ matrix.family == 'msvc' }}
+        name: Configure CI build paths (Windows)
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "codex-cargo"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          "CARGO_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          git config --global core.longpaths true
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      # --- musl (Linux) toolchain: Zig + musl cross tools ---
+      - if: ${{ matrix.family == 'musl' }}
+        name: Use hermetic Cargo home (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - if: ${{ matrix.family == 'musl' }}
+        name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - if: ${{ matrix.family == 'musl' }}
+        name: Install musl build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - if: ${{ matrix.family == 'musl' }}
+        name: Disable aws-lc jitter entropy (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          target_no_jitter="AWS_LC_SYS_NO_JITTER_ENTROPY_${{ matrix.target }}"
+          target_no_jitter="${target_no_jitter//-/_}"
+          echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
+
+      # --- Windows (msvc) toolchain: ARM64/MSVC cross environment ---
+      - if: ${{ matrix.family == 'msvc' }}
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cargo build
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
+          cargo build --target "$target" --release --timings \
+            --bin codex \
+            --bin codex-exec \
+            --bin codex-app-server \
+            --bin codex-tui

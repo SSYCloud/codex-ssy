@@ -4,6 +4,7 @@
 //! app-server integration tests can receive `CARGO_BIN_EXE_exec-server`. It
 //! also handles the helper argv modes because exec-server re-execs
 //! `codex_self_exe` for sandboxed filesystem and process requests.
+#![recursion_limit = "256"]
 
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_http_client::HttpClientFactory;

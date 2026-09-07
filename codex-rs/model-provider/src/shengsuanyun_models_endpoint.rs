@@ -213,6 +213,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         model.name
     };
     ModelInfo {
+        guardian: None,
         slug: model.id,
         display_name,
         description: Some(description),
@@ -228,6 +229,9 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         availability_nux: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
+            confirmation_policies: None,
             instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
             instructions_variables: None,
             approvals: None,
@@ -258,6 +262,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
@@ -265,6 +270,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
     }
 }
 
