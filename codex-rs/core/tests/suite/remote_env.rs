@@ -38,7 +38,6 @@ use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkProxyConfig;
@@ -97,6 +96,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_no_remote_env;
 use core_test_support::skip_if_target_windows;
+use core_test_support::startup::expect_startup;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
@@ -326,7 +326,7 @@ async fn remote_test_env_can_connect_and_use_filesystem() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
+async fn remote_test_env_exposes_target_shell_and_exec_guidance_to_model() -> Result<()> {
     skip_if_no_remote_env!(Ok(()));
 
     let server = start_mock_server().await;
@@ -339,19 +339,26 @@ async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
         ]),
     )
     .await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .disable(Feature::ShellTool)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build_with_auto_env(&server).await?;
 
     test.submit_turn("report remote environment").await?;
 
     let request = response_mock.single_request();
-    let tools = tool_names(&request.body_json());
-    assert!(!tools.contains(&"exec_command".to_string()));
+    let body = request.body_json();
+    let exec_command = body["tools"]
+        .as_array()
+        .context("tools should be an array")?
+        .iter()
+        .find(|tool| tool["name"] == "exec_command")
+        .context("exec_command should be available")?;
+    let has_windows_guidance = exec_command["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("Windows safety rules:"));
+    assert_eq!(
+        has_windows_guidance,
+        matches!(test_target_os(), TestTargetOs::Windows)
+    );
     let environment_context = request
         .message_input_texts("user")
         .into_iter()
@@ -376,7 +383,7 @@ async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
+async fn approved_remote_shell_runs_in_remote_cwd() -> Result<()> {
     const CALL_ID: &str = "remote-explicit-shell";
 
     skip_if_no_remote_env!(Ok(()));
@@ -399,9 +406,15 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
         "shell": shell,
         "login": false,
         "yield_time_ms": 10_000,
+        "sandbox_permissions": SandboxPermissions::RequireEscalated,
+        "justification": "Test target-native command approval cwd.",
     }))?;
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.approvals_reviewer = ApprovalsReviewer::User;
+    });
     let test = builder.build_with_auto_env(&server).await?;
+    let selection = test.executor_environment().selection().clone();
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -419,16 +432,39 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
     )
     .await;
 
-    test.submit_turn_with_environments(
+    submit_turn_with_approval_and_environments(
+        &test,
         "run the remote shell in the remote cwd",
-        Some(vec![TurnEnvironmentSelection {
-            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-            cwd: test.executor_environment().selection().cwd.clone(),
-            workspace_roots: vec![test.executor_environment().selection().cwd.clone()],
-            config: EnvironmentConfigState::FromThread,
-        }]),
+        vec![selection.clone()],
+        AskForApproval::OnRequest,
     )
     .await?;
+
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    let EventMsg::ExecApprovalRequest(approval) = event else {
+        panic!("expected remote command approval before completion: {event:?}");
+    };
+    assert_eq!(
+        approval.cwd.to_inferred_path_uri().as_ref(),
+        Some(&selection.cwd)
+    );
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: Some(approval.turn_id),
+            decision: ReviewDecision::Approved,
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     let request = response_mock
         .last_request()
         .context("model should receive the command output")?;
@@ -1070,7 +1106,7 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
     let rollout = fs::read_to_string(test.codex.rollout_path().context("rollout path")?)?;
     let world_state_patch = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -2133,9 +2169,7 @@ async fn deferred_executor_stays_pending_after_materialization() -> Result<()> {
     let mut builder = test_codex_with_wait_for_environment().with_config(|config| {
         assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
     });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should not wait for the remote environment")??;
+    let test = expect_startup(builder.build(&server)).await;
     let environment_manager = test.thread_manager.environment_manager();
     let provider = Arc::new(FailingNoiseConnectProvider::default());
     environment_manager.materialize_pending_noise_environment(
@@ -2275,12 +2309,7 @@ async fn deferred_executor_spawn_agent_inherits_ready_step_environments(
         attach_rx,
         shutdown_rx,
     ));
-    let test = timeout(
-        Duration::from_secs(5),
-        builder.build_with_remote_and_local_env(&server),
-    )
-    .await
-    .context("thread startup should not wait for the remote environment")??;
+    let test = expect_startup(builder.build_with_remote_and_local_env(&server)).await;
     let owner_active_profile = ActivePermissionProfile::new("owner-read-only");
     let owner_profile_workspace_root = test.config.cwd.join("owner-profile-root");
     let remote_selection = TurnEnvironmentSelection {
@@ -2440,12 +2469,7 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment() -> Resul
         attach_rx,
         shutdown_rx,
     ));
-    let test = timeout(
-        Duration::from_secs(5),
-        builder.build_with_remote_and_local_env(&server),
-    )
-    .await
-    .context("thread startup should not wait for the remote environment")??;
+    let test = expect_startup(builder.build_with_remote_and_local_env(&server)).await;
     let remote_cwd = test.cwd.path().join("guardian-remote").abs();
     let local_cwd = test.cwd.path().abs();
     fs::create_dir_all(remote_cwd.as_path())?;
@@ -2591,9 +2615,7 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
         attach_rx,
         shutdown_rx,
     ));
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should not wait for the remote environment")??;
+    let test = expect_startup(builder.build(&server)).await;
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2699,9 +2721,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(90);
         });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should not wait for the remote environment")??;
+    let test = expect_startup(builder.build(&server)).await;
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2774,7 +2794,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
     let rollout = fs::read_to_string(rollout_path)?;
     let world_state_items = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -3295,7 +3315,16 @@ async fn remote_request_permissions_grant_unblocks_later_remote_exec() -> Result
         request.environment_id.as_deref(),
         Some(REMOTE_ENVIRONMENT_ID)
     );
-    assert_eq!(request.cwd.as_ref(), Some(&remote_cwd));
+    let request_cwd = request.cwd.expect("request cwd");
+    let expected_cwd = PathUri::from_abs_path(&remote_cwd);
+    assert_eq!(
+        request_cwd.as_str(),
+        expected_cwd.inferred_native_path_string()
+    );
+    let request_cwd: PathUri = request_cwd
+        .try_into()
+        .expect("request cwd should remain target-native");
+    assert_eq!(request_cwd, expected_cwd);
     assert_eq!(request.permissions, expected_permissions);
 
     test.codex

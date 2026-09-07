@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -39,6 +40,7 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
 use crate::stream_events_utils::HandleOutputCtx;
+use crate::stream_events_utils::InFlightFuture;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -89,8 +91,8 @@ use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -98,7 +100,6 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::PlanDeltaEvent;
-use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
@@ -123,7 +124,6 @@ use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
-use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
@@ -137,6 +137,13 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
+
+/// Explicit MCP startup requirements retained across restarts within one user turn.
+#[derive(Default)]
+pub(crate) struct McpStartupRequirements {
+    required_servers: Vec<String>,
+    required_plugins: HashSet<String>,
+}
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -156,6 +163,7 @@ pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<TurnInput>,
+    mcp_startup_requirements: &mut McpStartupRequirements,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
@@ -192,7 +200,16 @@ pub(crate) async fn run_turn(
     }
 
     let user_input = turn_user_input(&input);
-    let (required_servers, mentioned_plugins) =
+    let allow_plugin_mentions =
+        !crate::guardian::is_basic_session_source(&turn_context.session_source);
+    let McpStartupRequirements {
+        required_servers,
+        required_plugins,
+    } = mcp_startup_requirements;
+    if allow_plugin_mentions {
+        required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(&user_input));
+    }
+    let (input_required_servers, mentioned_plugins) =
         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
             .or_cancel(&cancellation_token)
             .await
@@ -205,12 +222,17 @@ pub(crate) async fn run_turn(
             }
         };
 
+    required_servers.extend(input_required_servers);
+    required_servers.sort_unstable();
+    required_servers.dedup();
+
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
         .capture_step_context_with_required_mcp_servers(
             Arc::clone(&turn_context),
             &cancellation_token,
-            &required_servers,
+            required_servers,
+            required_plugins,
         )
         .await
     {
@@ -267,6 +289,15 @@ pub(crate) async fn run_turn(
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::TurnStart).await {
         return Ok(None);
+    }
+
+    // Only speculate after hooks accept the turn, using its finalized tools and permissions.
+    {
+        let mut state = sess.state.lock().await;
+        if state.shell_snapshot_prewarm.is_none() {
+            state.shell_snapshot_prewarm =
+                sess.prewarm_shell_snapshots(first_step_context.as_ref());
+        }
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -334,24 +365,38 @@ pub(crate) async fn run_turn(
 
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
-            Some(step_context) => step_context,
+            Some(step_context) if pending_input.is_empty() => step_context,
             None if pending_input.is_empty() => {
-                sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
-                    .await?
+                sess.capture_step_context_with_required_mcp_servers(
+                    Arc::clone(&turn_context),
+                    &cancellation_token,
+                    required_servers,
+                    required_plugins,
+                )
+                .await?
             }
-            None => {
+            Some(_) | None => {
                 let pending_user_input = turn_user_input(&pending_input);
-                let (required_servers, _) = required_mcp_servers_for_input(
+                if allow_plugin_mentions {
+                    required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(
+                        &pending_user_input,
+                    ));
+                }
+                let (pending_required_servers, _) = required_mcp_servers_for_input(
                     &sess,
                     turn_context.as_ref(),
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
                 .await?;
+                required_servers.extend(pending_required_servers);
+                required_servers.sort_unstable();
+                required_servers.dedup();
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
-                    &required_servers,
+                    required_servers,
+                    required_plugins,
                 )
                 .await?
             }
@@ -367,6 +412,10 @@ pub(crate) async fn run_turn(
             world_state = sess
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                 .await?;
+
+            // Keep the override after accepted input so ordinary turn rollback removes it too.
+            sess.record_reasoning_effort_override(step_context.as_ref())
+                .await;
 
             // Construct the input that we will send to the model.
             let sampling_request_input: Vec<ResponseItem> = async {
@@ -931,6 +980,7 @@ async fn build_extension_turn_input_items(
         .turn_environments()
         .enumerate()
         .map(|(index, environment)| TurnInputEnvironment {
+            _lifetime: PhantomData,
             environment_id: environment.selection.environment_id.clone(),
             cwd: environment.cwd().clone(),
             is_primary: index == 0,
@@ -1019,6 +1069,11 @@ async fn track_turn_resolved_config_analytics(
                 .and_then(ServiceTier::from_request_value),
             approval_policy: turn_context.approval_policy(),
             approvals_reviewer: turn_context.config.approvals_reviewer,
+            guardian_v2_enabled: sess
+                .services
+                .thread_extension_data
+                .get::<codex_extension_api::GuardianV2Enabled>()
+                .is_some(),
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
             collaboration_mode: turn_context.mode(),
             personality: turn_context.personality(),
@@ -1087,7 +1142,7 @@ async fn capture_current_model_fallback_step_context(
     {
         return Ok(None);
     }
-    sess.capture_step_context(Arc::clone(turn_context), cancellation_token)
+    sess.capture_speculative_step_context(Arc::clone(turn_context), cancellation_token)
         .await
         .map(Some)
 }
@@ -1368,7 +1423,7 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_prompt_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
@@ -1386,6 +1441,10 @@ async fn run_sampling_request(
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
     loop {
+        // A retry must not attribute the next tool call to the previous response.
+        turn_context
+            .extension_data
+            .remove::<codex_api::ResponseId>();
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -1503,17 +1562,20 @@ pub(crate) async fn prepare_tool_recommendations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
     fields(
         turn_id = %turn_context.sub_id,
-        model = %turn_context.model_info().slug,
+        model = %model_info.slug,
         apps_enabled = turn_context.apps_enabled()
     )
 )]
 pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
+    model_info: &codex_protocol::openai_models::ModelInfo,
+    model_messages: Option<&ModelMessages>,
     environments: &TurnEnvironmentSnapshot,
     mcp: &Arc<codex_mcp::McpBinding>,
     step_store: &ExtensionData,
@@ -1582,6 +1644,8 @@ pub(crate) async fn built_tools(
     Ok(Arc::new(build_tool_router(
         sess,
         turn_context,
+        model_info,
+        model_messages,
         environments,
         mcp,
         apps_enabled,
@@ -1793,6 +1857,8 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         }
         EventMsg::Error(_)
         | EventMsg::Warning(_)
+        | EventMsg::AuthRecoveryStarted(_)
+        | EventMsg::AuthRecoveryCompleted(_)
         | EventMsg::GuardianWarning(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)
@@ -2059,6 +2125,7 @@ async fn emit_agent_message_in_plan_mode(
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 })
             });
         sess.emit_turn_item_started(turn_context, &start_item).await;
@@ -2148,22 +2215,21 @@ async fn handle_assistant_item_done_in_plan_mode(
 
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
+    in_flight: &mut FuturesOrdered<InFlightFuture<'static>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
-            Ok(response_input) => {
-                let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-                    .await;
+            Ok(envelope) => {
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),
-                    &response_item,
+                    &envelope.item,
                 )
                 .await;
+                sess.record_annotated_conversation_items(&turn_context, vec![envelope])
+                    .await;
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
@@ -2241,8 +2307,7 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
+    let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -2315,7 +2380,13 @@ async fn try_run_sampling_request(
         record_turn_ttft_metric(&turn_context, &event).await;
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created { response_id } => {
+                if let Some(response_id) = response_id {
+                    turn_context
+                        .extension_data
+                        .insert(codex_api::ResponseId(response_id));
+                }
+            }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -2399,6 +2470,7 @@ async fn try_run_sampling_request(
                     | ResponseItem::WebSearchCall { .. }
                     | ResponseItem::ImageGenerationCall { .. }
                     | ResponseItem::Compaction { .. }
+                    | ResponseItem::ConfigurationUpdate { .. }
                     | ResponseItem::CompactionTrigger { .. }
                     | ResponseItem::ContextCompaction { .. }
                     | ResponseItem::Other => false,
@@ -2563,6 +2635,7 @@ async fn try_run_sampling_request(
             ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                usage_metadata,
                 end_turn,
             } => {
                 sess.services
@@ -2582,12 +2655,11 @@ async fn try_run_sampling_request(
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
-                sess.send_event(
+                sess.record_observed_response_completed(
                     &turn_context,
-                    EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
-                        response_id,
-                        token_usage: token_usage.clone(),
-                    }),
+                    &response_id,
+                    token_usage.as_ref(),
+                    usage_metadata.as_ref(),
                 )
                 .await;
                 let budget_result = sess

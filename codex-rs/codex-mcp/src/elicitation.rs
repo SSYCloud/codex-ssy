@@ -211,6 +211,14 @@ impl ElicitationRequestManager {
             let server_name = server_name.clone();
             let authority = authority.clone();
             async move {
+                // Activate only once the typed app-server and UI path is available.
+                if matches!(&elicitation, Elicitation::UserVerification { .. }) {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Cancel,
+                        content: None,
+                        meta: None,
+                    });
+                }
                 if router.auto_deny() {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Decline,
@@ -320,19 +328,26 @@ impl ElicitationRequestManager {
 
                 let should_surface_form_in_full_access = router.full_access_form_input_enabled()
                     && permission_prompt_is_auto_approved
-                    && matches!(
-                        &elicitation,
+                    && !elicitation
+                        .meta()
+                        .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
+                    && match &elicitation {
                         Elicitation::Mcp(
                             rmcp::model::ElicitRequestParams::FormElicitationParams {
-                                meta,
                                 requested_schema,
                                 ..
-                            }
-                        ) if !requested_schema.properties.is_empty()
-                            && !meta
-                                .as_ref()
-                                .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
-                    );
+                            },
+                        ) => !requested_schema.properties.is_empty(),
+                        Elicitation::OpenAiElicitationForm {
+                            requested_schema, ..
+                        } => requested_schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| !properties.is_empty()),
+                        Elicitation::Mcp(_)
+                        | Elicitation::OpenAiForm { .. }
+                        | Elicitation::UserVerification { .. } => false,
+                    };
 
                 if !should_surface_form_in_full_access {
                     if elicitation_is_rejected_by_policy(approval_policy) {
@@ -369,6 +384,13 @@ impl ElicitationRequestManager {
                 );
                 let routed_request_id = RequestId::String(public_request_id.clone().into());
                 let request = match elicitation {
+                    Elicitation::UserVerification { .. } => {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Cancel,
+                            content: None,
+                            meta: None,
+                        });
+                    }
                     Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
                         meta,
                         message,
@@ -408,6 +430,15 @@ impl ElicitationRequestManager {
                         message,
                         requested_schema,
                     } => ElicitationRequest::OpenAiForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    },
+                    Elicitation::OpenAiElicitationForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    } => ElicitationRequest::OpenAiElicitationForm {
                         meta,
                         message,
                         requested_schema,
@@ -475,7 +506,10 @@ fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
+        Elicitation::Mcp(_)
+        | Elicitation::OpenAiForm { .. }
+        | Elicitation::OpenAiElicitationForm { .. }
+        | Elicitation::UserVerification { .. } => false,
     }
 }
 

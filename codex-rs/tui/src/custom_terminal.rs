@@ -48,6 +48,8 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 
+mod cursor;
+
 fn osc8_hyperlink_parts(symbol: &str) -> Option<(&str, &str)> {
     let content = symbol.strip_prefix("\x1b]8;;")?;
     let destination_end = content.find('\x07')?;
@@ -428,7 +430,7 @@ where
         match cursor_position {
             None => self.hide_cursor()?,
             Some(position) => {
-                self.set_cursor_style(cursor_style)?;
+                self.set_cursor_style_with_repair(cursor_style)?;
                 self.set_cursor_position(position)?;
                 self.show_cursor()?;
             }
@@ -835,7 +837,9 @@ impl ModifierDiff {
     }
 }
 
+// Keep nested #[path] modules discoverable by cargo-shear as well as rustc.
 #[cfg(test)]
+#[path = "custom_terminal/tests"]
 mod tests {
     use super::*;
     use std::num::NonZeroU16;
@@ -851,6 +855,9 @@ mod tests {
     use ratatui::widgets::Paragraph;
     use ratatui::widgets::Widget;
     use ratatui::widgets::Wrap;
+
+    #[path = "cursor_tests.rs"]
+    mod cursor;
 
     struct CaptureBackend {
         output: Vec<u8>,
@@ -999,6 +1006,79 @@ mod tests {
         assert_snapshot!(terminal.backend().vt100().screen().contents(), @r"
         probe-08 clean words
         probe-09 clean words
+        ");
+    }
+
+    #[tokio::test]
+    async fn leaving_alternate_screen_repaints_restored_inline_viewport() {
+        let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+        let size = tui.terminal.last_known_screen_size;
+        let inline = Rect::new(/*x*/ 0, /*y*/ 3, size.width, /*height*/ 6);
+        tui.terminal.set_viewport_area(inline);
+        tui.enter_alt_screen().expect("enter alternate screen");
+        tui.terminal
+            .draw(|frame| {
+                Paragraph::new(vec![
+                    Line::from(" Resume a previous session"),
+                    Line::default(),
+                    Line::from(" Type to search".dim()),
+                ])
+                .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw picker");
+        tui.leave_alt_screen().expect("leave alternate screen");
+
+        let mut terminal = Terminal::with_options(VT100Backend::new(size.width, size.height))
+            .expect("physical terminal");
+        write!(terminal.backend_mut(), "Previous conversation").expect("write history");
+        terminal.set_viewport_area(inline);
+        terminal
+            .draw(|frame| {
+                Paragraph::new(vec![
+                    Line::default(),
+                    Line::default(),
+                    Line::from(vec!["›".bold(), " ".into(), "/resume".dim()]),
+                ])
+                .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw submitted command");
+
+        // Apply the real Tui screen-return baseline to the unchanged physical main screen.
+        // Matching spaces and letters in the picker must not leave /resume cells behind.
+        *terminal.previous_buffer_mut() = tui.terminal.previous_buffer().clone();
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    Paragraph::new(vec![
+                        Line::default(),
+                        Line::default(),
+                        Line::from(vec![
+                            "›".bold(),
+                            " ".into(),
+                            "Ask Codex to do anything".dim(),
+                        ]),
+                    ])
+                    .render(frame.area(), frame.buffer_mut());
+                })
+                .expect("restore composer");
+        }
+
+        let visible = terminal
+            .backend()
+            .vt100()
+            .screen()
+            .contents()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!(visible.trim_end(), @r"
+        Previous conversation
+
+
+
+
+        › Ask Codex to do anything
         ");
     }
 
@@ -1229,31 +1309,6 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Put { x: 1, y: 0, .. })),
             "expected the styled trailing cell to be cleared; commands: {commands:?}"
-        );
-    }
-
-    #[test]
-    fn terminal_draw_applies_requested_cursor_style() {
-        let mut output = Vec::new();
-        let mut terminal =
-            Terminal::with_options(CaptureBackend::new(/*width*/ 2, /*height*/ 1))
-                .expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 0, 2, 1));
-
-        terminal
-            .try_draw(|frame| {
-                frame.set_cursor_style(SetCursorStyle::SteadyBar);
-                frame.set_cursor_position((0, 0));
-                io::Result::Ok(())
-            })
-            .expect("draw");
-
-        queue!(output, SetCursorStyle::SteadyBar).expect("queue style");
-        let expected = String::from_utf8(output).expect("utf8");
-        let actual = terminal.backend().output();
-        assert!(
-            actual.contains(&expected),
-            "expected terminal output to contain cursor style {expected:?}, got {actual:?}"
         );
     }
 

@@ -515,6 +515,7 @@ impl App {
             });
         self.abort_thread_event_listener(thread_id);
         self.thread_event_channels.remove(&thread_id);
+        self.agents_overview.activity.remove(&thread_id);
         self.side_threads.remove(&thread_id);
         self.agent_navigation.remove(thread_id);
         if self.active_thread_id == Some(thread_id) {
@@ -702,7 +703,7 @@ impl App {
 
         let fork_config = self.side_fork_config();
         match app_server
-            .fork_side_thread(fork_config, parent_thread_id)
+            .fork_side_thread(&self.local_settings, fork_config, parent_thread_id)
             .await
         {
             Ok(forked) => {

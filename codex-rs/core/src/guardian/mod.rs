@@ -1,5 +1,6 @@
 //! Guardian review decides whether an `on-request` approval should be granted
 //! automatically instead of shown to the user.
+//! Full Access (`never` approvals with a disabled sandbox) approves without review.
 //!
 //! High-level approach:
 //! 1. Reconstruct a compact transcript that preserves user intent plus the most
@@ -12,10 +13,12 @@
 //! 4. Apply the guardian's explicit allow/deny outcome.
 
 mod approval_request;
+mod feedback;
 mod metrics;
 mod prompt;
 mod review;
 mod review_session;
+mod runtime;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,15 +68,16 @@ pub(crate) const MAX_RECENT_CYBER_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 1;
 pub(crate) const MAX_RECENT_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 10;
 pub(crate) const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
 pub(crate) const AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX: &str =
-    "The user has manually approved a specific action that was previously `Rejected`.";
-const GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
+    codex_guardian_context::MANUAL_APPROVAL_DEVELOPER_PREFIX;
+const GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 20_000;
 const GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
-const GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS: usize = 2_000;
+const GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS: usize = 5_000;
 const GUARDIAN_MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
+pub(crate) const GUARDIAN_MAX_ROOT_MESSAGE_TOKENS: usize = 900;
 pub(crate) const GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS: usize = 6_000;
+pub(crate) const GUARDIAN_MAX_ACTION_BYTES: usize = 8_000;
 const GUARDIAN_MAX_ACTION_STRING_TOKENS: usize = 16_000;
 const GUARDIAN_RECENT_ENTRY_LIMIT: usize = 40;
-const TRUNCATION_TAG: &str = "truncated";
 
 /// Captures review inputs from the issuing step without retaining its MCP bindings or tool router.
 /// Background network approvals and Unix interception use the active task's resolved settings.
@@ -84,6 +88,8 @@ const TRUNCATION_TAG: &str = "truncated";
 /// step-scoped things past their lifetime (like MCP bindings)
 #[derive(Clone)]
 pub(crate) struct GuardianReviewContext {
+    /// The response currently handled in this execution context.
+    pub(crate) parent_response_id: Option<String>,
     turn: Arc<TurnContext>,
     environments: TurnEnvironmentSnapshot,
     // Model and reasoning inputs are carried for the follow-up Guardian and V2 migrations.
@@ -103,6 +109,10 @@ impl GuardianReviewContext {
         settings: &ResolvedStepSettings,
     ) -> Self {
         Self {
+            parent_response_id: turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             environments: turn.environments.clone(),
             model_info: Arc::clone(&settings.model_info),
             reasoning_effort: settings.reasoning_effort().cloned(),
@@ -125,6 +135,11 @@ impl GuardianReviewContext {
 impl From<&Arc<StepContext>> for GuardianReviewContext {
     fn from(step: &Arc<StepContext>) -> Self {
         Self {
+            parent_response_id: step
+                .turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             turn: Arc::clone(&step.turn),
             environments: step.environments.clone(),
             model_info: Arc::clone(&step.settings.model_info),
@@ -139,6 +154,10 @@ impl From<&Arc<StepContext>> for GuardianReviewContext {
 impl From<Arc<TurnContext>> for GuardianReviewContext {
     fn from(turn: Arc<TurnContext>) -> Self {
         Self {
+            parent_response_id: turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             environments: turn.environments.clone(),
             model_info: Arc::clone(turn.model_info()),
             reasoning_effort: turn.reasoning_effort().cloned(),
@@ -244,8 +263,7 @@ impl GuardianRejectionCircuitBreaker {
     }
 }
 
-#[cfg(test)]
-use approval_request::format_guardian_action_pretty;
+pub(crate) use approval_request::format_guardian_action_pretty;
 #[cfg(test)]
 use approval_request::guardian_assessment_action;
 #[cfg(test)]
@@ -255,15 +273,9 @@ use prompt::GuardianPromptMode;
 #[cfg(test)]
 use prompt::GuardianTranscriptCursor;
 #[cfg(test)]
-use prompt::GuardianTranscriptEntry;
-#[cfg(test)]
-use prompt::GuardianTranscriptEntryKind;
-#[cfg(test)]
 use prompt::build_guardian_prompt_items;
 #[cfg(test)]
 use prompt::build_guardian_prompt_items_with_parent_turn;
-#[cfg(test)]
-use prompt::collect_guardian_transcript_entries;
 #[cfg(test)]
 use prompt::guardian_output_schema;
 #[cfg(test)]

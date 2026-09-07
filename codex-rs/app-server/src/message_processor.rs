@@ -22,6 +22,8 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
+use crate::plugin_config_reload;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
@@ -258,7 +260,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
-    pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
+    /// `None` skips startup tasks; otherwise preserve the initial config-loading path.
+    pub(crate) plugin_startup_tasks: Option<PluginStartupConfig>,
 }
 
 impl MessageProcessor {
@@ -345,6 +348,7 @@ impl MessageProcessor {
                     config.codex_home.clone(),
                 )),
                 Some(analytics_events_client.clone()),
+                codex_core::passthrough_image_store(),
                 Arc::clone(&thread_store),
                 codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
                 installation_id,
@@ -519,14 +523,23 @@ impl MessageProcessor {
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
-        if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
+        if let Some(startup_config) = plugin_startup_tasks {
             // Keep plugin startup warmups aligned at app-server startup.
+            let reload_config = match startup_config {
+                PluginStartupConfig::Current => {
+                    plugin_config_reload::for_cwd(config_manager.clone(), config.cwd.clone())
+                }
+                PluginStartupConfig::Defaults => {
+                    plugin_config_reload::defaults(config_manager.clone())
+                }
+            };
             let on_effective_plugins_changed =
                 plugin_processor.effective_plugins_changed_callback();
             thread_manager
                 .plugins_manager()
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
+                    reload_config,
                     Some(on_effective_plugins_changed),
                 );
         }
@@ -967,6 +980,12 @@ impl MessageProcessor {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
             }
+            ClientRequest::UserVerificationStatus { .. }
+            | ClientRequest::UserVerificationEnroll { .. }
+            | ClientRequest::UserVerificationDelete { .. }
+            | ClientRequest::UserVerificationVerify { .. } => {
+                Err(crate::user_verification::unavailable())
+            }
             ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
             ClientRequest::ConfigRead { params, .. } => self
                 .config_processor
@@ -1377,6 +1396,15 @@ impl MessageProcessor {
             ClientRequest::PluginInstalled { params, .. } => {
                 self.plugin_processor.plugin_installed(params).await
             }
+            ClientRequest::PluginReconcile { params, .. } => {
+                self.plugin_processor
+                    .plugin_reconcile(
+                        params,
+                        self.config_processor.clone(),
+                        &self.request_serialization_queues,
+                    )
+                    .await
+            }
             ClientRequest::PluginRead { params, .. } => {
                 self.plugin_processor.plugin_read(params).await
             }
@@ -1571,8 +1599,8 @@ impl MessageProcessor {
             ClientRequest::GetAuthStatus { params, .. } => {
                 self.account_processor.get_auth_status(params).await
             }
-            ClientRequest::GetAccountRateLimits { .. } => {
-                self.account_processor.get_account_rate_limits().await
+            ClientRequest::GetAccountRateLimits { params, .. } => {
+                self.account_processor.get_account_rate_limits(params).await
             }
             ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
                 self.account_processor

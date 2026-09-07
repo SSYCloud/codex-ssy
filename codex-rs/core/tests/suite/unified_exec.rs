@@ -1,3 +1,4 @@
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::EnvironmentConfig;
 use codex_core::TurnInputRequest;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -306,6 +307,96 @@ async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_command_hides_and_rejects_tty_when_disabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let builder = test_codex().with_model("gpt-5.4").with_cloud_config_bundle(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            "[features]\nunified_exec_tty = false\n",
+        ),
+    );
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let call_id = "tty-denied";
+    let arguments = json!({"cmd": "echo should-not-run > tty-disabled-rejected", "tty": true});
+    let request_log = mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                ev_response_created(call_id),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&arguments)?),
+                ev_completed(call_id),
+            ]),
+            sse(vec![ev_completed("done")]),
+        ],
+    )
+    .await;
+
+    harness
+        .submit("run commands with and without a terminal")
+        .await?;
+
+    let rejection = harness.function_call_stdout("tty-denied").await;
+    insta::assert_snapshot!("exec_command_tty_disabled", rejection);
+    assert!(!harness.path_exists("tty-disabled-rejected").await?);
+
+    let request = request_log.requests()[0].body_json();
+    let tools = request["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    let exec_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "exec_command")
+        .expect("exec_command should be available");
+    assert!(exec_tool["parameters"]["properties"].get("tty").is_none());
+    assert!(tools.iter().any(|tool| tool["name"] == "write_stdin"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_command_runs_without_tty_when_tty_disabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "basic PowerShell execution through Wine is unavailable"
+    );
+
+    let builder = test_codex().with_model("gpt-5.4").with_cloud_config_bundle(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            "[features]\nunified_exec_tty = false\n",
+        ),
+    );
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let mut responses = Vec::new();
+    for (call_id, arguments) in [
+        ("tty-false", json!({"cmd": "echo pipe-ok", "tty": false})),
+        ("tty-omitted", json!({"cmd": "echo pipe-ok"})),
+    ] {
+        responses.push(sse(vec![
+            ev_response_created(call_id),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&arguments)?),
+            ev_completed(call_id),
+        ]));
+    }
+    responses.push(sse(vec![ev_completed("done")]));
+    mount_sse_sequence(harness.server(), responses).await;
+
+    harness
+        .submit("run commands with and without a terminal")
+        .await?;
+
+    for call_id in ["tty-false", "tty-omitted"] {
+        let output = parse_unified_exec_output(&harness.function_call_stdout(call_id).await)?;
+        assert_eq!(
+            (output.exit_code, output.output.trim()),
+            (Some(0), "pipe-ok")
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_command_does_not_expose_configured_noise_auth_token() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
@@ -375,6 +466,10 @@ async fn exec_command_uses_installed_environment_shell_policy_with_explicit_over
             r#set: HashMap::from([
                 ("KEEP".to_string(), "preserved".to_string()),
                 ("DROP".to_string(), "filtered".to_string()),
+                (
+                    "CODEX_VERSION".to_string(),
+                    "configured-version".to_string(),
+                ),
             ]),
             ..Default::default()
         };
@@ -427,10 +522,10 @@ async fn exec_command_uses_installed_environment_shell_policy_with_explicit_over
     let call_id = "exec-command-environment-shell-policy";
     let command = match core_test_support::test_target_os() {
         core_test_support::TestTargetOs::Linux | core_test_support::TestTargetOs::MacOs => {
-            r#"printf '%s:%s:%s' "$KEEP" "${DROP:-missing}" "${OWNER_ONLY:-missing}""#
+            r#"printf '%s:%s:%s:%s' "$KEEP" "${DROP:-missing}" "${OWNER_ONLY:-missing}" "$CODEX_VERSION""#
         }
         core_test_support::TestTargetOs::Windows => {
-            r#"if (Test-Path Env:DROP) { $drop = $env:DROP } else { $drop = 'missing' }; if (Test-Path Env:OWNER_ONLY) { $owner = $env:OWNER_ONLY } else { $owner = 'missing' }; Write-Output "${env:KEEP}:${drop}:${owner}""#
+            r#"if (Test-Path Env:DROP) { $drop = $env:DROP } else { $drop = 'missing' }; if (Test-Path Env:OWNER_ONLY) { $owner = $env:OWNER_ONLY } else { $owner = 'missing' }; Write-Output "${env:KEEP}:${drop}:${owner}:${env:CODEX_VERSION}""#
         }
     };
     let arguments = json!({
@@ -461,7 +556,10 @@ async fn exec_command_uses_installed_environment_shell_policy_with_explicit_over
         )
         .await?;
     let output = parse_unified_exec_output(&harness.function_call_stdout(call_id).await)?;
-    assert_eq!(output.output.trim(), "preserved:missing:missing");
+    assert_eq!(
+        output.output.trim(),
+        concat!("preserved:missing:missing:", env!("CARGO_PKG_VERSION")),
+    );
     Ok(())
 }
 
@@ -3224,6 +3322,132 @@ async fn unified_exec_timeout_and_followup_poll() -> Result<()> {
         output_text.contains("ready"),
         "expected ready output, got {output_text:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_unified_exec_disable_runs_commands_without_retained_authority() -> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses a POSIX-only command fixture");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_cloud_config_bundle(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[features]
+unified_exec = false
+shell_tool = true
+"#,
+        ),
+    );
+    let test = builder.build_with_auto_env(&server).await?;
+    let late_marker = test.config.cwd.join("one-shot-late-marker");
+    let call_id = "managed-one-shot";
+    let args = json!({
+        "cmd": "sleep 1; printf late > one-shot-late-marker",
+        "timeout_ms": 10,
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    submit_unified_exec_turn(&test, "run one-shot command", PermissionProfile::Disabled).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let outputs = collect_tool_outputs(
+        &request_log
+            .requests()
+            .iter()
+            .map(core_test_support::responses::ResponsesRequest::body_json)
+            .collect::<Vec<_>>(),
+    )?;
+    let output = outputs.get(call_id).expect("missing one-shot output");
+    assert_eq!(output.process_id, None);
+    assert_eq!(output.exit_code, Some(124));
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        fs::metadata(late_marker.as_path()).is_err(),
+        "timed-out one-shot command must not survive to write the marker"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_one_shot_command_is_terminated_when_the_turn_is_interrupted() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_target_windows!(Ok(()), "uses a POSIX command and process checks");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_cloud_config_bundle(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[features]
+unified_exec = false
+shell_tool = true
+"#,
+        ),
+    );
+    let test = builder.build_with_auto_env(&server).await?;
+    let temp_dir = tempfile::tempdir()?;
+    let pid_path = temp_dir.path().join("managed_one_shot_pid");
+    let command = format!(
+        "printf '%s' $$ > '{}' && exec sleep 3000",
+        pid_path.to_string_lossy()
+    );
+    let call_id = "managed-one-shot-interrupt";
+    let args = json!({
+        "cmd": command,
+        "timeout_ms": 30_000,
+    });
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    submit_unified_exec_turn(
+        &test,
+        "interrupt one-shot command",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::ExecCommandBegin(event) if event.call_id == call_id => Some(()),
+        _ => None,
+    })
+    .await;
+    let pid = wait_for_pid_file(&pid_path).await?;
+
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    wait_for_process_exit(&pid).await?;
 
     Ok(())
 }

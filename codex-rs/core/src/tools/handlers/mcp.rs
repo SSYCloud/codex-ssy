@@ -37,6 +37,7 @@ use codex_tools::agent_plugin_mcp_tool_to_responses_api_tool;
 use codex_tools::mcp_tool_to_responses_api_tool;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_data_url_for_prompt_uncached;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_string::take_bytes_at_char_boundary;
 use futures::future::BoxFuture;
 use serde_json::Map;
@@ -163,7 +164,10 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -214,6 +218,12 @@ impl McpHandler {
             }
         };
 
+        // Capture presentation policy from the same config snapshot used for execution.
+        let truncation_policy = prepared_mcp_call
+            .as_ref()
+            .and_then(codex_mcp::PreparedMcpCall::output_token_limit)
+            .map(TruncationPolicy::Tokens)
+            .unwrap_or(turn.model_info().truncation_policy.into());
         let started = Instant::now();
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
@@ -234,7 +244,7 @@ impl McpHandler {
             tool_input: result.tool_input,
             wall_time: started.elapsed(),
             original_image_detail_supported: can_request_original_image_detail(turn.model_info()),
-            truncation_policy: turn.model_info().truncation_policy.into(),
+            truncation_policy,
         }))
     }
 }
@@ -274,6 +284,12 @@ impl CoreToolRuntime for McpHandler {
     }
 
     fn on_tool_result_accepted(&self, invocation: &ToolInvocation, result: &dyn ToolOutput) {
+        // Direct calls also record sources, before the Code Mode-only evidence path below.
+        if let Some(recorder) = invocation.session.services.executed_tool_calls.as_ref()
+            && let Some(sources) = result.tool_result_sources()
+        {
+            recorder.record_tool_result_sources(&invocation.source, &invocation.call_id, sources);
+        }
         let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source else {
             return;
         };

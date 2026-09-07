@@ -23,6 +23,7 @@ pub(super) async fn revert(
     let RevertThreadParams {
         thread_id,
         before_turn_id,
+        multi_agent_version,
     } = params;
     let state_db = store
         .state_db()
@@ -48,7 +49,7 @@ pub(super) async fn revert(
         .await?
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
     let source_path = current_rollout.path;
-    let source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
+    let mut source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!(
@@ -68,19 +69,22 @@ pub(super) async fn revert(
         });
     }
 
-    // HistoryPosition stores byte offsets in plain JSONL, so materialize any compressed
-    // immutable lineage before deriving the retained boundary.
+    // Preserve old-reader compatibility when introducing the first reference to a standalone
+    // source. Already-shared ancestors stay read-only; their offsets address decoded JSONL bytes.
     let mut lineage = store.resolve_rollout_lineage(thread_id).await?;
     for segment in &mut lineage.segments {
-        segment.rollout_path =
-            codex_rollout::materialize_rollout_for_reference(segment.rollout_path.as_path())
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!(
-                        "failed to materialize rollout {} for revert: {err}",
-                        segment.rollout_path.display()
-                    ),
-                })?;
+        if segment.rollout_id() == current_rollout.rollout_id && source_meta.history_base.is_none()
+        {
+            segment.rollout_path =
+                codex_rollout::materialize_rollout_for_reference(segment.rollout_path.as_path())
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to materialize rollout {} for revert: {err}",
+                            segment.rollout_path.display()
+                        ),
+                    })?;
+        }
         super::thread_history_materialization::materialize_to_sqlite(
             store,
             segment.rollout_id(),
@@ -103,6 +107,7 @@ pub(super) async fn revert(
                 cutoff.min(history_base.map_or(0, |base| base.end_ordinal_exclusive))
             });
 
+    source_meta.multi_agent_version = multi_agent_version.or(source_meta.multi_agent_version);
     let rollout_id = ThreadId::new();
     let recorder = create_replacement_recorder(
         store,

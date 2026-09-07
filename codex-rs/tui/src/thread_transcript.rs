@@ -8,6 +8,7 @@ use crate::git_action_directives::parse_assistant_markdown;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::PrefixedWrappedHistoryCell;
 use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::split_reasoning_summary_parts;
@@ -47,6 +48,7 @@ pub(crate) async fn load_session_transcript(
             /*turn_cursor*/ None,
             /*item_cursor*/ None,
             /*config*/ None,
+            /*local_settings*/ None,
             HistoryHydrationScope::Complete,
         )
         .await
@@ -131,6 +133,26 @@ pub(crate) fn thread_items_to_transcript_cells(
                         parsed.visible_markdown,
                         cwd.as_path(),
                         inline_visualization_context.clone(),
+                    )));
+                }
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    cells.push(Arc::new(PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
                     )));
                 }
             }

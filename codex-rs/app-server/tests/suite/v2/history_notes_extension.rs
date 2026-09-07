@@ -1,18 +1,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
-use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
-use codex_config::types::AuthCredentialsStoreMode;
-use codex_features::Feature;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
-use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -22,6 +17,7 @@ use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -117,6 +113,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .with_model_provider("openai-custom")
         .with_provider_name("OpenAI")
         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
@@ -126,11 +123,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             server.uri(),
         ))
         .write(codex_home.path())?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -144,7 +137,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
     timeout(
         Duration::from_secs(10),
         app_server.start_turn_and_wait_for_completion(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
                 text: "inspect history and notes".to_string(),
                 text_elements: Vec::new(),
@@ -219,186 +212,28 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             && item["name"] == "thread_hint"
     }));
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_can_read_parent_history_without_inheriting_notes_tools() -> Result<()> {
-    // TODO: Remove after Guardian accepts executor-native cwd across host operating systems.
-    skip_if_wine_exec!(
-        Ok(()),
-        "Guardian approval currently rejects a Windows executor cwd on the Linux host"
-    );
-
-    let server = responses::start_mock_server().await;
-    Mock::given(method("POST"))
-        .and(path("/backend-api/codex/alpha/notes/v2/thread_hint"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": ""})))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/backend-api/codex/alpha/history/v2/list_items"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": [],
-            "n_returned": 0,
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let response_mock = responses::mount_sse_sequence(
-        &server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-parent-command"),
-                responses::ev_function_call(
-                    "parent-shell-call",
-                    "exec_command",
-                    &json!({
-                        "cmd": "echo guardian",
-                        "sandbox_permissions": "require_escalated",
-                        "justification": "Review a command using parent history.",
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-parent-command"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-guardian-history"),
-                responses::ev_function_call_with_namespace(
-                    "guardian-history-call",
-                    "history",
-                    "list_items",
-                    &json!({"role": "user"}).to_string(),
-                ),
-                responses::ev_completed("resp-guardian-history"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-guardian-review"),
-                responses::ev_assistant_message(
-                    "guardian-review",
-                    &json!({
-                        "outcome": "deny",
-                        "rationale": "The original user instructions do not authorize this command.",
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-guardian-review"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-parent-done"),
-                responses::ev_assistant_message("parent-done", "Done"),
-                responses::ev_completed("resp-parent-done"),
-            ]),
-        ],
-    )
-    .await;
-
-    let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .with_model_provider("openai-custom")
-        .with_provider_name("OpenAI")
-        .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
-        .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
-        .with_approval_policy("on-request")
-        .with_root_config("approvals_reviewer = \"auto_review\"")
-        .enable_feature(Feature::GuardianApproval)
-        .with_extra_config(
-            "[features.token_budget]\nenabled = true\nuse_history_notes_extension = true",
-        )
-        .write(codex_home.path())?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
-
-    let mut app_server = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build_initialized()
-        .await?;
-    let thread = app_server
-        .start_thread(ThreadStartParams::default())
-        .await?
-        .thread;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.start_turn_and_wait_for_completion(TurnStartParams {
-            thread_id: thread.id.clone(),
-            input: vec![UserInput::Text {
-                text: "Review a command using the original user instructions".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        }),
-    )
-    .await??;
-
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
-    let guardian_request = &requests[1];
-    let guardian_body = guardian_request.body_json();
-    assert_eq!(
-        guardian_body["client_metadata"]["x-openai-subagent"],
-        "guardian"
-    );
-    let guardian_tools = guardian_body.get("tools").or_else(|| {
-        guardian_body["input"]
-            .as_array()?
-            .iter()
-            .find(|item| item["type"] == "additional_tools")?
-            .get("tools")
-    });
-    let guardian_tools = json!({"tools": guardian_tools.expect("Guardian tool definitions")});
-    for tool_name in ["list_windows", "list_items", "read_item", "search_contents"] {
-        assert!(
-            responses::namespace_child_tool(&guardian_tools, "history", tool_name).is_some(),
-            "Guardian should expose history.{tool_name}"
-        );
-    }
-    for tool_name in [
-        "list_files_by_prefix",
-        "read_file",
-        "search_contents",
-        "append_to_file",
-        "write_file",
-    ] {
-        assert!(
-            requests[0].tool_by_name("notes", tool_name).is_some(),
-            "the parent should retain notes.{tool_name}"
-        );
-        assert!(
-            responses::namespace_child_tool(&guardian_tools, "notes", tool_name).is_none(),
-            "Guardian must not inherit notes.{tool_name}"
-        );
-    }
-    assert_eq!(
-        requests[2].function_call_output_text("guardian-history-call"),
-        Some(json!({"results": [], "n_returned": 0}).to_string())
-    );
-
-    let backend_requests = server.received_requests().await.expect("recorded requests");
-    let history_request = backend_requests
-        .iter()
-        .find(|request| request.url.path() == "/backend-api/codex/alpha/history/v2/list_items")
-        .expect("Guardian history request");
-    assert_eq!(
-        history_request.body_json::<Value>()?,
-        json!({
-            "role": "user",
-            "context": {
-                "session_id": thread.id,
-                "current_agent_name": "/root",
-            },
+    if use_history_notes_extension {
+        let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+            event["event_type"] == "codex_thread_hint_status"
+                && event["event_params"]["thread_id"] == thread.id
         })
-    );
+        .await?;
+        assert_eq!(
+            event["event_params"]["status"],
+            if hint_status == 200 {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+    }
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result<()> {
+    let encrypted_query = format!("enc_query_{}", "x".repeat(1_001));
     let calls = [
         ("history", "list_windows", json!({})),
         ("history", "list_items", json!({})),
@@ -410,7 +245,7 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         (
             "history",
             "search_contents",
-            json!({"query": "PRIVATE_QUERY"}),
+            json!({"query": encrypted_query, "limit": 2, "recent_first": false}),
         ),
         (
             "notes",
@@ -421,22 +256,22 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         (
             "notes",
             "search_contents",
-            json!({"query": "PRIVATE_QUERY"}),
+            json!({"query": encrypted_query, "max_files": 2}),
         ),
         (
             "notes",
             "append_to_file",
-            json!({"path": "PRIVATE_PATH", "text": "PRIVATE_TEXT"}),
+            json!({"path": "PRIVATE_PATH", "text": "enc_append_text"}),
         ),
         (
             "notes",
             "write_file",
-            json!({"path": "PRIVATE_PATH", "text": "PRIVATE_TEXT"}),
+            json!({"path": "PRIVATE_PATH", "text": "enc_write_text"}),
         ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": "PRIVATE_MESSAGE"}),
+            "request_user_input_async",
+            json!({"questions": [{"title": "PRIVATE_MESSAGE"}]}),
         ),
         (
             "notes",
@@ -445,16 +280,17 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": " "}),
+            "request_user_input_async",
+            json!({"questions": [{"title": " "}]}),
         ),
     ];
     let server = responses::start_mock_server().await;
-    for (namespace, tool, _) in &calls[..9] {
+    for (namespace, tool, arguments) in &calls[..9] {
         Mock::given(method("POST"))
             .and(path(format!(
                 "/backend-api/codex/alpha/{namespace}/v2/{tool}"
             )))
+            .and(body_partial_json(arguments.clone()))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"text": "PRIVATE_RESULT"})),
             )
@@ -529,6 +365,19 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
             ..Default::default()
         })
         .await?;
+
+    let request = &response_mock.requests()[0];
+    for (namespace, name, field) in [
+        ("history", "search_contents", "query"),
+        ("notes", "search_contents", "query"),
+        ("notes", "append_to_file", "text"),
+        ("notes", "write_file", "text"),
+    ] {
+        let tool = request
+            .tool_by_name(namespace, name)
+            .expect("declared history or notes tool");
+        assert_eq!(tool["parameters"]["properties"][field]["encrypted"], true);
+    }
 
     for (index, (namespace, tool, _)) in calls.iter().enumerate() {
         let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {

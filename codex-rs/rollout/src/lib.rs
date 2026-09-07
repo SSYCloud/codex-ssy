@@ -20,6 +20,7 @@ mod reverse_jsonl_scanner;
 mod rollout_file_name;
 mod rollout_reference_index;
 pub(crate) mod search;
+mod seekable_reader;
 pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_db;
@@ -28,6 +29,8 @@ pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
 pub use codex_history::ResponseItemEnvelope;
 pub use codex_history::ResumedHistory;
+pub use codex_history::RetainedContextEntry;
+pub use codex_history::RetainedContextEvent;
 pub use codex_history::RolloutItem;
 pub use codex_history::RolloutLine;
 pub(crate) use codex_protocol::protocol;
@@ -44,7 +47,9 @@ pub(crate) use codex_protocol::protocol;
 /// Remove it once Serde supports format-specific buffering.
 pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     let Value::Object(mut fields) = value else {
-        return serde_json::from_value(value);
+        return Err(serde_json::Error::custom(
+            "rollout line must be a JSON object",
+        ));
     };
     let timestamp = fields
         .remove("timestamp")
@@ -64,6 +69,16 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
     })
 }
 
+/// Parses a persisted JSONL rollout record through the canonical JSON decoder.
+pub fn parse_rollout_line(line: &str) -> serde_json::Result<RolloutLine> {
+    serde_json::from_str::<Value>(line).and_then(decode_rollout_line)
+}
+
+/// Parses persisted JSONL rollout record bytes through the canonical JSON decoder.
+pub fn parse_rollout_line_bytes(bytes: &[u8]) -> serde_json::Result<RolloutLine> {
+    serde_json::from_slice::<Value>(bytes).and_then(decode_rollout_line)
+}
+
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
@@ -81,6 +96,8 @@ pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+pub use seekable_reader::open_rollout_seekable_reader;
+pub use seekable_reader::rollout_contains_prefix;
 
 /// Materializes a compressed rollout as plain JSONL before another rollout references it.
 pub async fn materialize_rollout_for_reference(

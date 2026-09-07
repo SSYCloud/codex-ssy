@@ -324,15 +324,40 @@ impl fmt::Debug for ChatgptAuthTokensRefreshResponse {
     }
 }
 
+/// Usage-read capabilities of the requesting client, never inferred from its experiment arm.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetAccountRateLimitsParams {
+    /// The client supports automatic Luna Reserve fallback. For eligible ChatGPT CLI users,
+    /// allow the backend to record experiment exposure after ordinary usage is blocked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_luna_reserve: bool,
+    /// Skip the separate reset-credit detail lookup for background usage polls. The usage
+    /// response still includes the available count; omitted/false preserves detailed reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclude_reset_credit_details: bool,
+}
+
+pub type NullableGetAccountRateLimitsParams = Option<GetAccountRateLimitsParams>;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountRateLimitsResponse {
+    /// Backend permission for ordinary included usage, validated against the active account.
+    /// Null means unavailable; clients must not infer recovery from percentages or reset times.
+    pub ordinary_usage_allowed: Option<bool>,
     /// Backward-compatible single-bucket view; mirrors the historical payload.
     pub rate_limits: RateLimitSnapshot,
     /// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
     pub rate_limits_by_limit_id: Option<HashMap<String, RateLimitSnapshot>>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    /// Account associated with this usage snapshot, when supplied by the backend.
+    pub account_id: Option<String>,
+    /// Optional backend-owned banner from the same usage read. Its nested keys retain the
+    /// backend's snake_case contract; an absent banner leaves the client's existing UI unchanged.
+    pub rate_limit_upsell: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -576,6 +601,8 @@ pub struct AccountRateLimitsUpdatedNotification {
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
+    /// Normal model whose display name and reasoning options describe this quota alias.
+    pub normal_model_slug: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
@@ -591,6 +618,7 @@ impl From<CoreRateLimitSnapshot> for RateLimitSnapshot {
         Self {
             limit_id: value.limit_id,
             limit_name: value.limit_name,
+            normal_model_slug: value.normal_model_slug,
             primary: value.primary.map(RateLimitWindow::from),
             secondary: value.secondary.map(RateLimitWindow::from),
             credits: value.credits.map(CreditsSnapshot::from),

@@ -63,6 +63,43 @@ use wiremock::matchers::path;
 const REMOTE_MODEL_SLUG: &str = "codex-test";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_update_plan_preserves_custom_catalog_instructions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const INSTRUCTIONS: &str = "## Plan tool\nNever deploy without explicit approval.\n";
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let mut catalog = bundled_models_response()?;
+    let model = catalog
+        .models
+        .iter_mut()
+        .find(|model| model.slug == "gpt-5.2")
+        .expect("bundled gpt-5.2 model");
+    let messages = model
+        .model_messages
+        .as_mut()
+        .expect("model prompt templates");
+    messages.instructions_template = Some(INSTRUCTIONS.to_string());
+    messages.instructions_variables = None;
+    let test = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(move |config| {
+            config.update_plan_enabled = false;
+            config.model_catalog = Some(catalog);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_turn("hello").await?;
+    let request = response.single_request().body_json();
+    assert_eq!(request["instructions"], INSTRUCTIONS);
+    assert!(!request["tools"].to_string().contains("update_plan"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_model_sends_builtin_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -72,7 +109,9 @@ async fn unknown_model_sends_builtin_instructions() -> Result<()> {
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
     .await;
-    let mut builder = test_codex().with_model("future-custom-model");
+    let mut builder = test_codex()
+        .with_model("future-custom-model")
+        .with_config(|config| config.update_plan_enabled = true);
     let test = builder.build_with_auto_env(&server).await?;
 
     test.submit_turn("use fallback model metadata").await?;
@@ -115,6 +154,8 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
     let specific = ModelInfo {
         display_name: "GPT 5.3 Codex".to_string(),
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some("use specific prefix".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -123,6 +164,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }),
         ..specific
@@ -130,6 +172,8 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
     let generic = ModelInfo {
         display_name: "GPT 5.3".to_string(),
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some("use generic prefix".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -138,6 +182,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }),
         ..generic
@@ -366,12 +411,15 @@ async fn remote_models_use_context_window_when_config_override_is_absent() -> Re
     Ok(())
 }
 
-#[test_case(ReasoningEffort::Custom("future".to_string()), "future"; "custom")]
-#[test_case(ReasoningEffort::Persistent, "disabled"; "persistent")]
+#[test_case(ReasoningEffort::Custom("future".to_string()), "future", Some("Catalog follow-up instructions."); "custom")]
+#[test_case(ReasoningEffort::Persistent, "disabled", None; "persistent")]
+#[test_case(ReasoningEffort::Persistent, "disabled", Some("Catalog follow-up instructions."); "persistent override")]
+#[test_case(ReasoningEffort::Persistent, "disabled", Some(""); "empty persistent override")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
     effort: ReasoningEffort,
     expected_wire_effort: &str,
+    catalog_instructions: Option<&str>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
@@ -379,6 +427,8 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
     let server = MockServer::start().await;
     let requested_model = "gpt-5.3-codex-test";
     let prefix_model = "gpt-5.3-codex";
+    let base_instructions = "Keep the catalog base instructions.";
+    let developer_instructions = "Keep the configured developer instructions.";
     let mut remote_model = test_remote_model_with_policy(
         prefix_model,
         ModelVisibility::List,
@@ -397,6 +447,20 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
         },
     ];
     remote_model.default_reasoning_summary = ReasoningSummary::Detailed;
+    remote_model.model_messages = Some(ModelMessages {
+        persistent_instructions: catalog_instructions.map(str::to_string),
+        tools: None,
+        instructions_template: Some(base_instructions.to_string()),
+        instructions_variables: None,
+        approvals: None,
+        collaboration_modes: None,
+        auto_review: None,
+        permissions: None,
+        multi_agent: None,
+        token_budget: None,
+        guardian_v2: None,
+        confirmation_policies: None,
+    });
     mount_models_once(
         &server,
         ModelsResponse {
@@ -415,6 +479,7 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model = Some(requested_model.to_string());
+            config.developer_instructions = Some(developer_instructions.to_string());
         })
         .build_with_auto_env(&server)
         .await?;
@@ -441,6 +506,34 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
     assert_eq!(body["model"].as_str(), Some(requested_model));
     assert_eq!(reasoning_effort, Some(expected_wire_effort));
     assert_eq!(reasoning_summary, Some("detailed"));
+    assert_eq!(request.instructions_text(), base_instructions);
+    assert!(
+        request
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| text.contains(developer_instructions))
+    );
+
+    let persistent_instructions = request
+        .message_input_texts("developer")
+        .into_iter()
+        .filter(|text| text.starts_with("<persistent_mode>"))
+        .collect::<Vec<_>>();
+    if effort != ReasoningEffort::Persistent || catalog_instructions == Some("") {
+        assert!(persistent_instructions.is_empty());
+    } else if let Some(instructions) = catalog_instructions {
+        assert_eq!(
+            persistent_instructions,
+            vec![format!(
+                "<persistent_mode>\n{instructions}\n</persistent_mode>"
+            )]
+        );
+    } else {
+        assert_eq!(persistent_instructions.len(), 1);
+        assert!(persistent_instructions[0].starts_with(
+            "<persistent_mode>\n## Proactivity\n\nAfter you've completed the user task and delivered the final answer,"
+        ));
+    }
 
     Ok(())
 }
@@ -516,13 +609,16 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
@@ -784,19 +880,24 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some(remote_instructions.to_string()),
             instructions_variables: None,
             approvals: None,
@@ -805,6 +906,7 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }),
         include_skills_usage_instructions: false,
@@ -860,6 +962,7 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model = Some("gpt-5.2".to_string());
         });
     let TestCodex {
@@ -1366,13 +1469,16 @@ fn test_remote_model_with_policy(
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),

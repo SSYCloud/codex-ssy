@@ -34,10 +34,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 
+mod chatgpt_turn_cost;
 mod rate_limit_resets;
 mod thread_usage;
 pub(crate) mod turn_usage;
 
+pub use chatgpt_turn_cost::ChatgptThreadTurnCosts;
+pub use chatgpt_turn_cost::ChatgptTurnCost;
 pub use thread_usage::ThreadUsage;
 pub use thread_usage::ThreadUsageBreakdownGroup;
 
@@ -158,7 +161,27 @@ impl fmt::Debug for Client {
 
 impl Client {
     pub fn new(base_url: impl Into<String>, http_client_factory: HttpClientFactory) -> Self {
-        let mut base_url = base_url.into();
+        let http = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+            http_client_factory,
+            ClientRouteClass::Api,
+        );
+        Self::with_http(base_url.into(), http)
+    }
+
+    /// Creates a client that never forwards its credentials to a redirect destination.
+    pub fn new_without_redirects(
+        base_url: impl Into<String>,
+        http_client_factory: HttpClientFactory,
+    ) -> Self {
+        let http =
+            RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_redirects_or_request_logging(
+                http_client_factory,
+                ClientRouteClass::Api,
+            );
+        Self::with_http(base_url.into(), http)
+    }
+
+    fn with_http(mut base_url: String, http: RouteAwareClientPool) -> Self {
         // Normalize common ChatGPT hostnames to include /backend-api so we hit the WHAM paths.
         // Also trim trailing slashes for consistent URL building.
         while base_url.ends_with('/') {
@@ -170,10 +193,6 @@ impl Client {
         {
             base_url = format!("{base_url}/backend-api");
         }
-        let http = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
-            http_client_factory,
-            ClientRouteClass::Api,
-        );
         let path_style = PathStyle::from_base_url(&base_url);
         Self {
             base_url,
@@ -546,19 +565,28 @@ impl Client {
             rate_limit_reached_type,
         )];
         if let Some(additional) = payload.additional_rate_limits.flatten() {
-            snapshots.extend(additional.into_iter().map(|details| {
-                Self::make_rate_limit_snapshot(
-                    Some(details.metered_feature),
-                    Some(details.limit_name),
-                    details.rate_limit.flatten().map(|rate_limit| *rate_limit),
-                    /*credits*/ None,
-                    /*spend_control*/ None,
-                    plan_type,
-                    /*rate_limit_reached_type*/ None,
-                )
-            }));
+            snapshots.extend(
+                additional
+                    .into_iter()
+                    .map(|details| Self::make_additional_rate_limit_snapshot(details, plan_type)),
+            );
         }
         snapshots
+    }
+
+    fn make_additional_rate_limit_snapshot(
+        details: codex_backend_openapi_models::models::AdditionalRateLimitDetails,
+        plan_type: Option<AccountPlanType>,
+    ) -> RateLimitSnapshot {
+        Self::make_rate_limit_snapshot(
+            Some(details.metered_feature),
+            Some(details.limit_name),
+            details.rate_limit.flatten().map(|rate_limit| *rate_limit),
+            /*credits*/ None,
+            /*spend_control*/ None,
+            plan_type,
+            /*rate_limit_reached_type*/ None,
+        )
     }
 
     fn make_rate_limit_snapshot(
@@ -584,6 +612,7 @@ impl Client {
         RateLimitSnapshot {
             limit_id,
             limit_name,
+            normal_model_slug: None,
             primary,
             secondary,
             credits: Self::map_credits(credits),
@@ -934,6 +963,7 @@ mod tests {
             RateLimitSnapshot {
                 limit_id: Some("codex_other".to_string()),
                 limit_name: Some("codex_other".to_string()),
+                normal_model_slug: None,
                 primary: Some(RateLimitWindow {
                     used_percent: 90.0,
                     window_minutes: Some(60),
@@ -949,6 +979,7 @@ mod tests {
             RateLimitSnapshot {
                 limit_id: Some("codex".to_string()),
                 limit_name: Some("codex".to_string()),
+                normal_model_slug: None,
                 primary: Some(RateLimitWindow {
                     used_percent: 10.0,
                     window_minutes: Some(60),

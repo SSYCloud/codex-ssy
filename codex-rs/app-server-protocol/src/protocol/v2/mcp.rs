@@ -79,6 +79,9 @@ pub struct McpServerStatus {
     pub plugin_id: Option<String>,
     pub server_info: Option<McpServerInfo>,
     pub tools: std::collections::HashMap<String, McpTool>,
+    /// Tool discovery failed and no catalog was returned.
+    /// Null when a catalog is returned, including cached or empty catalogs.
+    pub tools_error: Option<String>,
     pub resources: Vec<McpResource>,
     pub resource_templates: Vec<McpResourceTemplate>,
     pub auth_status: McpAuthStatus,
@@ -755,9 +758,19 @@ pub enum McpServerElicitationRequest {
         message: String,
         requested_schema: McpElicitationSchema,
     },
+    // TODO(victor): Deprecate once migrated to `openai/elicitation/create`.
     #[serde(rename = "openai/form", rename_all = "camelCase")]
     #[ts(rename = "openai/form", rename_all = "camelCase")]
     OpenAiForm {
+        #[serde(rename = "_meta")]
+        #[ts(rename = "_meta")]
+        meta: Option<JsonValue>,
+        message: String,
+        requested_schema: JsonValue,
+    },
+    #[serde(rename = "openaiForm", rename_all = "camelCase")]
+    #[ts(rename = "openaiForm", rename_all = "camelCase")]
+    OpenAiElicitationForm {
         #[serde(rename = "_meta")]
         #[ts(rename = "_meta")]
         meta: Option<JsonValue>,
@@ -795,6 +808,15 @@ impl TryFrom<CoreElicitationRequest> for McpServerElicitationRequest {
                 message,
                 requested_schema,
             } => Ok(Self::OpenAiForm {
+                meta,
+                message,
+                requested_schema,
+            }),
+            CoreElicitationRequest::OpenAiElicitationForm {
+                meta,
+                message,
+                requested_schema,
+            } => Ok(Self::OpenAiElicitationForm {
                 meta,
                 message,
                 requested_schema,

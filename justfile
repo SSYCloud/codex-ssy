@@ -169,13 +169,9 @@ bazel-argument-comment-lint:
 build-for-release:
     bazel build //codex-rs/cli:release_binaries
 
-# Run the MCP server
-mcp-server-run *args:
-    cargo run -p codex-mcp-server -- {args}
-
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
-    cargo run -p codex-core --bin codex-write-config-schema
+    cargo run -p codex-config-schema --bin codex-write-config-schema
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:

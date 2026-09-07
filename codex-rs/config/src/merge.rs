@@ -67,7 +67,10 @@ pub fn is_structured_feature_path<S: AsRef<str>>(path: &[S]) -> bool {
     };
 
     features.as_ref() == "features"
-        && matches!(feature.as_ref(), "multi_agent_v2" | "network_proxy")
+        && matches!(
+            feature.as_ref(),
+            "multi_agent_v2" | "network_proxy" | "sleep_tool"
+        )
 }
 
 fn merge_toml_values_at_path(base: &mut TomlValue, overlay: &TomlValue, path: &mut Vec<String>) {
@@ -95,7 +98,7 @@ fn merge_toml_values_at_path(base: &mut TomlValue, overlay: &TomlValue, path: &m
         normalize_key_aliases(path, base_table);
         let mut overlay_table = overlay_table.clone();
         normalize_key_aliases(path, &mut overlay_table);
-        if is_permission_network_domains_path(path) {
+        if is_network_domains_path(path) {
             normalize_network_domain_keys(base_table);
             normalize_network_domain_keys(&mut overlay_table);
         }
@@ -184,11 +187,15 @@ pub fn shell_environment_filter_entry<'a>(
         .find(|(candidate, _)| candidate.to_lowercase() == pattern)
 }
 
-fn is_permission_network_domains_path(path: &[String]) -> bool {
+fn is_network_domains_path(path: &[String]) -> bool {
     matches!(
         path,
         [permissions, _, network, domains]
             if permissions == "permissions" && network == "network" && domains == "domains"
+    ) || matches!(
+        path,
+        [application, network, domains]
+            if application == "application" && network == "network" && domains == "domains"
     )
 }
 

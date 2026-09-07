@@ -259,6 +259,8 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            sess.set_last_known_step_context(fallback_step_context)
+                .await;
             let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
@@ -295,6 +297,7 @@ async fn run_remote_compact_task_inner_impl(
         prompt_input,
         prompt_input_metadata,
         compaction_output,
+        compaction_response_id,
         token_usage,
         owned_client_session: _owned_client_session,
     } = attempt;
@@ -347,6 +350,8 @@ async fn run_remote_compact_task_inner_impl(
             message: String::new(),
             window_number: new_window_number,
             window_ids: new_window_ids,
+            compaction_response_id: Some(compaction_response_id),
+            compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
         },
     )
     .await;
@@ -365,11 +370,12 @@ struct RemoteCompactionV2Output {
 
 async fn run_remote_compaction_request_v2(
     sess: &Session,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
 ) -> CodexResult<RemoteCompactionV2Output> {
+    let turn_context = &step_context.turn;
     let max_retries = turn_context
         .provider
         .info()
@@ -384,13 +390,13 @@ async fn run_remote_compaction_request_v2(
                 &turn_context.session_telemetry,
                 turn_context.reasoning_effort().cloned(),
                 turn_context.reasoning_summary(),
-                turn_context.config.service_tier.clone(),
+                step_context.settings.service_tier.clone(),
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
             .await
         {
-            Ok(stream) => collect_compaction_output(stream).await,
+            Ok(stream) => collect_compaction_output(sess, turn_context, stream).await,
             Err(err) => Err(err),
         };
 
@@ -414,12 +420,13 @@ async fn run_remote_compaction_request_v2(
 }
 
 async fn collect_compaction_output(
+    sess: &Session,
+    turn_context: &TurnContext,
     mut stream: ResponseStream,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let mut output_item_count = 0usize;
     let mut compaction_count = 0usize;
     let mut compaction_output = None;
-    let mut saw_completed = false;
     let mut completed_response_id = None;
     let mut completed_token_usage = None;
     while let Some(event) = stream.next().await {
@@ -436,9 +443,16 @@ async fn collect_compaction_output(
             ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                usage_metadata,
                 ..
             } => {
-                saw_completed = true;
+                sess.record_observed_response_completed(
+                    turn_context,
+                    &response_id,
+                    token_usage.as_ref(),
+                    usage_metadata.as_ref(),
+                )
+                .await;
                 completed_response_id = Some(response_id);
                 completed_token_usage = token_usage;
                 break;
@@ -447,11 +461,11 @@ async fn collect_compaction_output(
         }
     }
 
-    if !saw_completed {
+    let Some(response_id) = completed_response_id else {
         return Err(CodexErr::Stream(
             "remote compaction v2 stream closed before response.completed".to_string(),
         ));
-    }
+    };
 
     if compaction_count != 1 {
         return Err(CodexErr::Fatal(format!(
@@ -461,9 +475,6 @@ async fn collect_compaction_output(
 
     let Some(compaction_output) = compaction_output else {
         unreachable!("compaction output must exist when count is exactly one");
-    };
-    let Some(response_id) = completed_response_id else {
-        unreachable!("response id must exist after response.completed");
     };
     Ok(RemoteCompactionV2Output {
         compaction_output,
@@ -875,6 +886,7 @@ mod tests {
                     None,
                     Some(CodexHarnessMetadata {
                         client_authored: true,
+                        ..Default::default()
                     }),
                     Some(CodexHarnessMetadata::default()),
                     None,
@@ -898,6 +910,7 @@ mod tests {
                         item: client.clone(),
                         metadata: Some(CodexHarnessMetadata {
                             client_authored: true,
+                            ..Default::default()
                         }),
                     },
                 );
@@ -1161,16 +1174,34 @@ mod tests {
                     total_tokens: 123_498,
                     codex_rollout_budget_units: None,
                 }),
+                usage_metadata: Some(codex_protocol::ResponseUsageMetadata {
+                    amount: Some("0.125".to_string()),
+                    metadata: Some(serde_json::json!({ "extra": { "label": "example" } })),
+                }),
                 end_turn: Some(true),
             }),
         ]);
 
-        let output = collect_compaction_output(stream)
+        let (sess, turn_context, rx) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let output = collect_compaction_output(&sess, &turn_context, stream)
             .await
             .expect("compaction should be collected");
 
         assert_eq!(output.compaction_output, compaction);
         assert_eq!(output.response_id, "resp-compact");
+        let event = rx.recv().await.expect("raw response completion");
+        let EventMsg::RawResponseCompleted(completed) = event.msg else {
+            panic!("expected raw response completion, got {:?}", event.msg);
+        };
+        assert_eq!(completed.response_id, "resp-compact");
+        assert_eq!(
+            completed.usage_metadata,
+            Some(codex_protocol::ResponseUsageMetadata {
+                amount: Some("0.125".to_string()),
+                metadata: Some(serde_json::json!({ "extra": { "label": "example" } })),
+            })
+        );
         assert_eq!(
             output.token_usage,
             Some(TokenUsage {

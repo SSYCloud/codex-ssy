@@ -23,6 +23,8 @@ use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
+use codex_attachment_store::AttachmentStore;
+use codex_attachment_store::InlineAttachmentStore;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::DisabledCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
@@ -84,6 +86,7 @@ use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_git_discovery::GitRootDiscovery;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
@@ -345,6 +348,7 @@ pub(crate) struct ThreadManagerState {
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
     skills_service: Arc<HostSkillsService>,
@@ -353,6 +357,7 @@ pub(crate) struct ThreadManagerState {
     code_mode_session_provider: Arc<dyn CodeModeSessionProvider>,
     extensions: Arc<ExtensionRegistry<Config>>,
     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+    image_store: Arc<dyn AttachmentStore>,
     thread_store: Arc<dyn ThreadStore>,
     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
@@ -412,6 +417,11 @@ pub fn thread_store_from_config(
     }
 }
 
+/// Constructs the default image store that preserves inline images.
+pub fn passthrough_image_store() -> Arc<dyn AttachmentStore> {
+    Arc::new(InlineAttachmentStore)
+}
+
 /// Construct the default SQLite-backed agent graph store when local state is available.
 pub fn local_agent_graph_store_from_state_db(
     state_db: Option<&StateDbHandle>,
@@ -433,6 +443,7 @@ impl ThreadManager {
         extensions: Arc<ExtensionRegistry<Config>>,
         user_instructions_provider: Arc<dyn UserInstructionsProvider>,
         analytics_events_client: Option<AnalyticsEventsClient>,
+        image_store: Arc<dyn AttachmentStore>,
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
         installation_id: String,
@@ -472,6 +483,7 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -480,6 +492,7 @@ impl ThreadManager {
                 code_mode_session_provider,
                 extensions,
                 user_instructions_provider,
+                image_store,
                 thread_store,
                 agent_graph_store,
                 attestation_provider,
@@ -619,6 +632,7 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -629,6 +643,7 @@ impl ThreadManager {
                 user_instructions_provider: Arc::new(
                     crate::test_support::EmptyUserInstructionsProvider,
                 ),
+                image_store: passthrough_image_store(),
                 thread_store,
                 agent_graph_store,
                 attestation_provider: None,
@@ -666,6 +681,10 @@ impl ThreadManager {
 
     pub fn environment_manager(&self) -> Arc<EnvironmentManager> {
         self.state.environment_manager.clone()
+    }
+
+    pub fn image_store(&self) -> Arc<dyn AttachmentStore> {
+        Arc::clone(&self.state.image_store)
     }
 
     /// Starts the local rollout migration path after a runtime feature enablement.
@@ -777,6 +796,10 @@ impl ThreadManager {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn git_root_discovery(&self) -> Arc<GitRootDiscovery> {
+        Arc::clone(&self.state.git_root_discovery)
     }
 
     pub fn get_models_manager(&self) -> SharedModelsManager {
@@ -1972,13 +1995,14 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+        let (session, io) = Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
+            git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
@@ -2012,7 +2036,7 @@ impl ThreadManagerState {
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
-        }))
+        })
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot
         // block startup while waiting for form input.

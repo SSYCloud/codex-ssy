@@ -13,7 +13,6 @@ use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::CapabilityRootLocation;
@@ -211,6 +210,7 @@ fn format_labeled_requests_snapshot(
 }
 
 fn enable_deferred_tool_world_state_without_agents(config: &mut Config) {
+    config.update_plan_enabled = true;
     config.agents_enabled = false;
     config
         .features
@@ -1002,7 +1002,7 @@ async fn initially_empty_deferred_tool_world_state_is_not_rendered_or_persisted(
     let world_states = tokio::fs::read_to_string(rollout_path)
         .await?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -1045,7 +1045,7 @@ async fn deferred_tool_world_state_survives_resume_without_duplicate_updates() -
     let persisted_tools = tokio::fs::read_to_string(&rollout_path)
         .await?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<serde_json::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|line| match line.item {
@@ -1148,6 +1148,7 @@ async fn apps_guidance_and_deferred_namespace_appear_after_recovery_within_a_tur
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config
                 .features
                 .enable(Feature::DefaultModeRequestUserInput)

@@ -41,10 +41,6 @@ impl App {
             return;
         }
         if !self.chat_widget.can_retry_safety_buffered_turn(&turn_id) {
-            self.app_event_tx.send(AppEvent::UpdateModel(model));
-            self.app_event_tx.send(AppEvent::UpdateReasoningEffort(Some(
-                ReasoningEffortConfig::Low,
-            )));
             return;
         }
 
@@ -71,7 +67,7 @@ impl App {
             active_permission_profile.as_ref(),
             self.runtime_permission_profile_override
                 .as_ref()
-                .map(|profile| &profile.permission_profile),
+                .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
         );
         if let Err(err) = turn_permissions_overrides(permissions_override, cwd.as_path()) {
             self.chat_widget
@@ -105,6 +101,7 @@ impl App {
                         /*turn_cursor*/ None,
                         /*item_cursor*/ None,
                         /*config*/ None,
+                        /*local_settings*/ None,
                         crate::app_server_session::HistoryHydrationScope::Initial,
                     )
                     .await?;
@@ -176,6 +173,7 @@ impl App {
         self.config = retry_config.clone();
         let started = app_server
             .fork_thread_at(
+                &self.local_settings,
                 retry_config,
                 thread_id,
                 /*last_turn_id*/ None,

@@ -1,7 +1,9 @@
 use anyhow::Result;
+use codex_config::McpServerConfig;
 use codex_core::CodexThread;
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
+use codex_core::config::TokenBudgetConfig;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
@@ -9,10 +11,17 @@ use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::openai_models::ConfirmationPolicies;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::ToolMessage;
+use codex_protocol::openai_models::ToolMessages;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SafetyBufferingEvent;
@@ -23,9 +32,12 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_response_sequence;
@@ -39,6 +51,7 @@ use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -234,6 +247,7 @@ async fn settings_updates_preserve_turn_identity_and_target(target: SettingsTarg
                 effort: Some(Some(ReasoningEffort::High)),
                 summary: Some(ReasoningSummary::Detailed),
                 service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+                ..Default::default()
             };
             assert_eq!(
                 submit_turn_settings(&test.codex, "different-turn", update.clone()).await?,
@@ -331,6 +345,395 @@ async fn settings_updates_preserve_turn_identity_and_target(target: SettingsTarg
     );
     assert_eq!(requests[2].header(TURN_STATE_HEADER), None);
 
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TokenBudgetScenario {
+    ModelDefaults,
+    ExplicitDefaultTemplate,
+    ReloadPreferences,
+    DestinationWindowOnly,
+    InitialWindowOnly,
+    DestinationWithoutGuidance,
+}
+
+#[test_case(TokenBudgetScenario::ModelDefaults)]
+#[test_case(TokenBudgetScenario::ExplicitDefaultTemplate)]
+#[test_case(TokenBudgetScenario::ReloadPreferences)]
+#[test_case(TokenBudgetScenario::DestinationWindowOnly)]
+#[test_case(TokenBudgetScenario::InitialWindowOnly)]
+#[test_case(TokenBudgetScenario::DestinationWithoutGuidance)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_model_switch_resolves_token_budget_from_original_preferences(
+    scenario: TokenBudgetScenario,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let explicit_default_template =
+        matches!(scenario, TokenBudgetScenario::ExplicitDefaultTemplate);
+    let reload_user_config = matches!(scenario, TokenBudgetScenario::ReloadPreferences);
+    let context_window_model = match scenario {
+        TokenBudgetScenario::DestinationWindowOnly => Some(MODEL_B),
+        TokenBudgetScenario::InitialWindowOnly => Some(MODEL_A),
+        TokenBudgetScenario::ModelDefaults
+        | TokenBudgetScenario::ExplicitDefaultTemplate
+        | TokenBudgetScenario::ReloadPreferences
+        | TokenBudgetScenario::DestinationWithoutGuidance => None,
+    };
+    let destination_has_guidance =
+        !matches!(scenario, TokenBudgetScenario::DestinationWithoutGuidance);
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            paused_response("resp-1", "pause-before-model-budget-switch"),
+            paused_response("resp-2", "pause-after-model-budget-switch"),
+            sse_completed("resp-3"),
+        ],
+    )
+    .await;
+    let test = step_settings_test()
+        .with_pre_build_hook(move |home| {
+            let config = if explicit_default_template {
+                let default_template = TokenBudgetConfig::default().reminder_message_template;
+                format!(
+                    "[features.token_budget]\nenabled = true\nreminder_message_template = {default_template:?}\n"
+                )
+            } else {
+                "[features.token_budget]\nenabled = true\n".to_string()
+            };
+            std::fs::write(home.join("config.toml"), config)
+                .expect("write token-budget preferences");
+        })
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("enable token-budget feature");
+            if context_window_model.is_some() {
+                config.model_context_window = None;
+            }
+            for model in &mut config
+                .model_catalog
+                .as_mut()
+                .expect("controlled model catalog")
+                .models
+            {
+                let slug = model.slug.clone();
+                let initial_model = slug == MODEL_A;
+                if let Some(context_window_model) = context_window_model {
+                    model.context_window = (slug == context_window_model).then_some(128_000);
+                    model.max_context_window = None;
+                }
+                model
+                    .model_messages
+                    .as_mut()
+                    .expect("model messages")
+                    .token_budget = (initial_model || destination_has_guidance).then(|| ModelTokenBudgetConfig {
+                    enabled: false,
+                    use_history_notes_extension: false,
+                    reminder_threshold_tokens: if initial_model { 8_000 } else { 2_000 },
+                    reminder_message_template: format!(
+                        "Reminder for {slug}: {{n_remaining}} tokens remain."
+                    ),
+                    guidance_message: format!("Use {slug} token-budget guidance."),
+                    auto_compact_fallback_prompt: format!("Save {slug} state before rollover."),
+                    auto_compact_fallback_buffer_tokens: if initial_model {
+                        16_000
+                    } else {
+                        4_000
+                    },
+                });
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let request = start_paused_turn(&test.codex).await?;
+
+    if reload_user_config {
+        std::fs::write(
+            test.codex_home_path().join("config.toml"),
+            "[features.token_budget]\nenabled = true\nreminder_message_template = \"Reloaded reminder\"\n",
+        )?;
+        test.codex.submit(Op::ReloadUserConfig).await?;
+    }
+
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &request.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied
+    );
+    answer_paused_turn(&test.codex, &request.turn_id).await?;
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+    answer_paused_turn(&test.codex, &request.turn_id).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("settings activation failed: {}", error.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let initial_guidance = format!("Use {MODEL_A} token-budget guidance.");
+    let initial_guidance_expected =
+        !explicit_default_template && context_window_model != Some(MODEL_B);
+    assert_eq!(
+        requests[0].body_contains_text(&initial_guidance),
+        initial_guidance_expected
+    );
+    let mut expected_guidance = Vec::new();
+    if initial_guidance_expected {
+        expected_guidance.push(format!(
+            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{initial_guidance}\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        ));
+    }
+    if !explicit_default_template
+        && destination_has_guidance
+        && context_window_model != Some(MODEL_A)
+    {
+        let replacement_notice = if initial_guidance_expected {
+            "This context-window guidance replaces all previously provided context-window guidance.\n\n"
+        } else {
+            ""
+        };
+        expected_guidance.push(format!(
+            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{replacement_notice}Use {MODEL_B} token-budget guidance.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        ));
+    } else if initial_guidance_expected {
+        expected_guidance.push(format!(
+            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nThe previously provided context-window guidance no longer applies.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        ));
+    }
+    for request in &requests[1..] {
+        let guidance = request
+            .message_input_texts("developer")
+            .into_iter()
+            .filter(|text| text.starts_with(CONTEXT_WINDOW_GUIDANCE_OPEN_TAG))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            guidance, expected_guidance,
+            "preserve history and append the guidance transition only once"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_confirmation_policy_follows_step_model_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const BROWSER_POLICY_A: &str = "  # Browser policy A\r\n{literal}\n";
+    const BROWSER_POLICY_B: &str = "\t# Browser policy B\n<raw> & café\r\n ";
+    const COMPUTER_POLICY_A: &str = "\t# Native policy A\n{{literal}}\r\n";
+    const COMPUTER_POLICY_B: &str = "  # Native policy B\r\n<computer> ${native}\n ";
+    const BROWSER_ONLY_MODEL: &str = "policy-browser-only";
+    const COMPUTER_ONLY_MODEL: &str = "policy-computer-only";
+    let server = start_mock_server().await;
+    AppsTestServer::mount(&server).await?;
+    let policy_call = |response_id: &str, call_id: &str| {
+        sse(vec![
+            ev_response_created(response_id),
+            ev_function_call_with_namespace(
+                call_id,
+                "mcp__node_repl",
+                "calendar_list_events",
+                "{}",
+            ),
+            ev_completed(response_id),
+        ])
+    };
+    mount_sse_sequence(
+        &server,
+        vec![
+            policy_call("resp-1", "policy-a"),
+            sse_completed("resp-2"),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_function_call_with_namespace(
+                    "policy-a-pending",
+                    "mcp__node_repl",
+                    "calendar_create_event",
+                    &json!({
+                        "title": "Policy snapshot test",
+                        "starts_at": "2026-08-26T12:00:00Z",
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-3"),
+            ]),
+            policy_call("resp-4", "policy-b"),
+            sse_completed("resp-5"),
+            policy_call("resp-6", "browser-only"),
+            sse_completed("resp-7"),
+            policy_call("resp-8", "computer-only"),
+            sse_completed("resp-9"),
+            policy_call("resp-10", "no-policy"),
+            sse_completed("resp-11"),
+        ],
+    )
+    .await;
+    let mcp_url = format!("{}/api/codex/ps/mcp", server.uri());
+    let test = step_settings_test()
+        .with_config(move |config| {
+            config
+                .features
+                .disable(Feature::ToolCallMcpElicitation)
+                .expect("disable MCP elicitation for the approval barrier");
+            let models = &mut config.model_catalog.as_mut().expect("test models").models;
+            for slug in [BROWSER_ONLY_MODEL, COMPUTER_ONLY_MODEL] {
+                let mut model = models[0].clone();
+                model.slug = slug.to_string();
+                models.push(model);
+            }
+            for model in models {
+                let messages = model
+                    .model_messages
+                    .as_mut()
+                    .expect("bundled model messages");
+                messages.confirmation_policies = match model.slug.as_str() {
+                    MODEL_A => Some(ConfirmationPolicies {
+                        browser_use: Some(BROWSER_POLICY_A.to_string()),
+                        computer_use: Some(COMPUTER_POLICY_A.to_string()),
+                    }),
+                    MODEL_B => Some(ConfirmationPolicies {
+                        browser_use: Some(BROWSER_POLICY_B.to_string()),
+                        computer_use: Some(COMPUTER_POLICY_B.to_string()),
+                    }),
+                    BROWSER_ONLY_MODEL => Some(ConfirmationPolicies {
+                        browser_use: Some(BROWSER_POLICY_B.to_string()),
+                        computer_use: None,
+                    }),
+                    COMPUTER_ONLY_MODEL => Some(ConfirmationPolicies {
+                        browser_use: None,
+                        computer_use: Some(COMPUTER_POLICY_B.to_string()),
+                    }),
+                    MODEL_C => None,
+                    _ => unreachable!("unexpected test model"),
+                };
+            }
+            let node_repl: McpServerConfig = serde_json::from_value(json!({
+                "url": mcp_url,
+                "tools": {
+                    "calendar_create_event": {
+                        "approval_mode": "prompt",
+                    },
+                },
+            }))
+            .expect("valid test MCP server");
+            config
+                .mcp_servers
+                .set(HashMap::from([("node_repl".to_string(), node_repl)]))
+                .expect("configure test MCP server");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "node_repl").await?;
+    test.submit_text_turn("call the tool with model A").await?;
+
+    let request = start_paused_turn(&test.codex).await?;
+    assert_eq!(request.call_id, "policy-a-pending");
+    // The pending call must retain model A's policies after this settings update.
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &request.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied,
+    );
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id.clone(),
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    request.questions[0].id.clone(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Allow".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    for model in [BROWSER_ONLY_MODEL, COMPUTER_ONLY_MODEL, MODEL_C] {
+        core_test_support::submit_thread_settings(
+            &test.codex,
+            ThreadSettingsOverrides {
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        test.submit_text_turn("call the tool").await?;
+    }
+
+    assert_eq!(
+        recorded_apps_tool_calls(&server)
+            .await
+            .into_iter()
+            .map(|call| {
+                let meta = &call["params"]["_meta"];
+                (
+                    meta["callId"].clone(),
+                    meta["openai/confirmation_policies"].clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                json!("policy-a"),
+                json!({
+                    "browser_use": BROWSER_POLICY_A,
+                    "computer_use": COMPUTER_POLICY_A,
+                })
+            ),
+            (
+                json!("policy-a-pending"),
+                json!({
+                    "browser_use": BROWSER_POLICY_A,
+                    "computer_use": COMPUTER_POLICY_A,
+                })
+            ),
+            (
+                json!("policy-b"),
+                json!({
+                    "browser_use": BROWSER_POLICY_B,
+                    "computer_use": COMPUTER_POLICY_B,
+                })
+            ),
+            (
+                json!("browser-only"),
+                json!({"browser_use": BROWSER_POLICY_B})
+            ),
+            (
+                json!("computer-only"),
+                json!({"computer_use": COMPUTER_POLICY_B})
+            ),
+            (json!("no-policy"), json!({})),
+        ],
+    );
     Ok(())
 }
 
@@ -727,6 +1130,175 @@ async fn model_activation_uses_destination_metadata_defaults(
         vec![request.turn_id; 3],
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_async_description_follows_mid_turn_model_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            paused_response("resp-1", "pause-before-async-message-model-change"),
+            sse_completed("resp-2"),
+        ],
+    )
+    .await;
+    let test = step_settings_test()
+        .with_config(|config| {
+            for model in &mut config
+                .model_catalog
+                .as_mut()
+                .expect("controlled model catalog")
+                .models
+            {
+                model
+                    .experimental_supported_tools
+                    .push("send_user_message_async".to_string());
+                model
+                    .model_messages
+                    .as_mut()
+                    .expect("model instruction metadata")
+                    .tools = Some(ToolMessages {
+                    send_user_message_async: Some(ToolMessage {
+                        description: Some(format!("Async message description for {}.", model.slug)),
+                    }),
+                });
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let paused = start_paused_turn(&test.codex).await?;
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &paused.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            }
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied
+    );
+    answer_paused_turn(&test.codex, &paused.turn_id).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("model activation failed: {}", error.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    assert_eq!(
+        response_mock
+            .requests()
+            .iter()
+            .map(|request| {
+                let body = request.body_json();
+                let tool = body["tools"]
+                    .as_array()
+                    .expect("request tools")
+                    .iter()
+                    .find(|tool| tool["name"] == "request_user_input_async")
+                    .expect("async message tool");
+                json!({"model": body["model"], "description": tool["description"]})
+            })
+            .collect::<Vec<_>>(),
+        [MODEL_A, MODEL_B]
+            .map(|model| json!({
+                "model": model,
+                "description": format!("Async message description for {model}."),
+            }))
+            .to_vec(),
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_instructions_follow_mid_turn_model_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            paused_response("resp-1", "pause-before-persistent-model-change"),
+            sse_completed("resp-2"),
+        ],
+    )
+    .await;
+    let test = step_settings_test()
+        .with_config(|config| {
+            config.model_reasoning_effort = Some(ReasoningEffort::Persistent);
+            for model in &mut config
+                .model_catalog
+                .as_mut()
+                .expect("controlled model catalog")
+                .models
+            {
+                model
+                    .supported_reasoning_levels
+                    .push(ReasoningEffortPreset {
+                        effort: ReasoningEffort::Persistent,
+                        description: ReasoningEffort::Persistent.to_string(),
+                    });
+                model
+                    .model_messages
+                    .as_mut()
+                    .expect("model instruction metadata")
+                    .persistent_instructions =
+                    Some(format!("Persistent instructions for {}.", model.slug));
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let paused = start_paused_turn(&test.codex).await?;
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &paused.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            }
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied
+    );
+    answer_paused_turn(&test.codex, &paused.turn_id).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("model activation failed: {}", error.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let initial =
+        format!("<persistent_mode>\nPersistent instructions for {MODEL_A}.\n</persistent_mode>");
+    let update = format!(
+        "<persistent_mode>\nThese persistent-mode instructions replace all previously provided persistent-mode instructions.\n\nPersistent instructions for {MODEL_B}.\n</persistent_mode>"
+    );
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| {
+                let instructions = request
+                    .message_input_texts("developer")
+                    .into_iter()
+                    .filter(|text| text.starts_with("<persistent_mode>"))
+                    .collect::<Vec<_>>();
+                json!({"model": request.body_json()["model"], "instructions": instructions})
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            json!({"model": MODEL_A, "instructions": [initial]}),
+            json!({"model": MODEL_B, "instructions": [initial, update]}),
+        ]
+    );
     Ok(())
 }
 

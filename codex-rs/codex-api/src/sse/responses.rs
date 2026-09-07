@@ -8,6 +8,7 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use codex_protocol::protocol::ModelVerification;
@@ -118,6 +119,7 @@ struct ResponseCompleted {
     id: String,
     #[serde(default)]
     usage: Option<ResponseCompletedUsage>,
+    usage_metadata: Option<ResponseUsageMetadata>,
     #[serde(default)]
     end_turn: Option<bool>,
 }
@@ -404,8 +406,12 @@ pub fn process_responses_event(
             }
         }
         "response.created" => {
-            if event.response.is_some() {
-                return Ok(Some(ResponseEvent::Created {}));
+            if let Some(response) = event.response {
+                let response_id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -476,11 +482,19 @@ pub fn process_responses_event(
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                let metadata = resp_val
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .cloned();
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
+                        if let Some(metadata) = metadata {
+                            resp.usage_metadata.get_or_insert_default().metadata = Some(metadata);
+                        }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
+                            usage_metadata: resp.usage_metadata,
                             end_turn: resp.end_turn,
                         }));
                     }
@@ -864,10 +878,12 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                usage_metadata,
                 end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(usage_metadata.is_none());
                 assert!(end_turn.is_none());
             }
             other => panic!("unexpected third event: {other:?}"),
@@ -1060,10 +1076,12 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                usage_metadata,
                 end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(usage_metadata.is_none());
                 assert!(end_turn.is_none());
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1382,7 +1400,7 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created)
+            matches!(ev, ResponseEvent::Created { .. })
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
@@ -1564,12 +1582,13 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 2);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::Completed {
                 response_id,
                 token_usage: None,
+                usage_metadata: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1601,12 +1620,16 @@ mod tests {
             &events[0],
             ResponseEvent::ServerModel(model) if model == CYBER_RESTRICTED_MODEL_FOR_TESTS
         );
-        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::Created { response_id: Some(id) } if id == "resp-1"
+        );
         assert_matches!(
             &events[2],
             ResponseEvent::Completed {
                 response_id,
                 token_usage: None,
+                usage_metadata: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1642,6 +1665,7 @@ mod tests {
             ResponseEvent::Completed {
                 response_id,
                 token_usage: None,
+                usage_metadata: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1677,6 +1701,7 @@ mod tests {
             ResponseEvent::Completed {
                 response_id,
                 token_usage: None,
+                usage_metadata: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1720,7 +1745,7 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 7);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::SafetyBuffering(buffering)

@@ -32,6 +32,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_skills::SkillError;
+use codex_utils_git_discovery::GitRootDiscovery;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -44,6 +45,9 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    /// Orders accepted settings commits and their persisted events with compaction checkpoints.
+    /// Keep this separate from `state` so storage I/O does not block runtime state access.
+    pub(super) thread_settings_persistence: Semaphore,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -61,6 +65,7 @@ pub(crate) struct Session {
     pub(super) mcp_prewarm_shutdown: CancellationToken,
     pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
+    pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
@@ -245,6 +250,13 @@ impl SessionConfiguration {
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
             permission_profile: self.effective_permission_profile(&environment_selections),
+            full_access: codex_protocol::protocol::has_full_access(
+                self.step_settings.approval_policy.value(),
+                &self.permission_profile(),
+                environment_selections
+                    .iter()
+                    .map(|environment| &environment.config),
+            ),
             active_permission_profile: permission_profile.active_permission_profile(),
             environments: TurnEnvironmentSelections::new(
                 self.legacy_fallback_cwd.clone(),
@@ -351,10 +363,8 @@ impl SessionConfiguration {
         current_environments: &[TurnEnvironmentSelection],
     ) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
-        let current_sandbox_policy = self.sandbox_policy(current_environments);
         let current_file_system_sandbox_policy =
             self.file_system_sandbox_policy(current_environments);
-        let current_network_sandbox_policy = self.network_sandbox_policy();
         let file_system_policy_has_rebindable_project_root_write =
             current_file_system_sandbox_policy
                 .entries
@@ -437,35 +447,37 @@ impl SessionConfiguration {
                         network_sandbox_policy,
                     ),
                 )?;
-        } else if cwd_changed
-            && file_system_policy_has_rebindable_project_root_write
-            && current_file_system_sandbox_policy.is_semantically_equivalent_to(
+        } else if cwd_changed && file_system_policy_has_rebindable_project_root_write {
+            // Compatibility projection can resolve filesystem paths. Only compute it
+            // when a cwd-bound legacy policy might need rebinding.
+            let current_sandbox_policy = self.sandbox_policy(current_environments);
+            if current_file_system_sandbox_policy.is_semantically_equivalent_to(
                 &FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
                     &current_sandbox_policy,
                     self.cwd(),
                     &current_file_system_sandbox_policy,
                 ),
                 self.cwd(),
-            )
-        {
-            // Preserve richer split policies across cwd-only updates; only
-            // rederive when the session is already using a structurally
-            // cwd-bound legacy bridge.
-            let file_system_sandbox_policy =
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                    &current_sandbox_policy,
-                    next_configuration.cwd(),
-                    &current_file_system_sandbox_policy,
-                );
-            next_configuration
-                .permission_profile_state
-                .set_legacy_permission_profile(
-                    PermissionProfile::from_runtime_permissions_with_enforcement(
-                        SandboxEnforcement::from_legacy_sandbox_policy(&current_sandbox_policy),
-                        &file_system_sandbox_policy,
-                        current_network_sandbox_policy,
-                    ),
-                )?;
+            ) {
+                // Preserve richer split policies across cwd-only updates; only
+                // rederive when the session is already using a structurally
+                // cwd-bound legacy bridge.
+                let file_system_sandbox_policy =
+                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
+                        &current_sandbox_policy,
+                        next_configuration.cwd(),
+                        &current_file_system_sandbox_policy,
+                    );
+                next_configuration
+                    .permission_profile_state
+                    .set_legacy_permission_profile(
+                        PermissionProfile::from_runtime_permissions_with_enforcement(
+                            SandboxEnforcement::from_legacy_sandbox_policy(&current_sandbox_policy),
+                            &file_system_sandbox_policy,
+                            self.network_sandbox_policy(),
+                        ),
+                    )?;
+            }
         }
         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
             next_configuration.app_server_client_name = Some(app_server_client_name);
@@ -609,6 +621,12 @@ impl Session {
         CodexResponsesMetadata {
             window_number: Some(window_number),
             context_window_id: Some(context_window_id),
+            history_ingest_requested: turn_context
+                .config
+                .token_budget
+                .as_ref()
+                .is_some_and(|config| config.use_history_notes_extension)
+                .then_some(true),
             forked_from_ordinal_exclusive: self
                 .forked_from_ordinal_exclusive
                 .filter(|_| responses_metadata.forked_from_thread_id.is_some()),
@@ -626,6 +644,7 @@ impl Session {
         installation_id: String,
         auth_manager: Arc<AuthManager>,
         models_manager: SharedModelsManager,
+        git_root_discovery: Arc<GitRootDiscovery>,
         model_info: ModelInfo,
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
@@ -715,6 +734,15 @@ impl Session {
             .parent_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id());
         session_configuration.parent_thread_id = parent_thread_id;
+        if parent_thread_id.is_none() {
+            agent_control.set_root_service_tier(
+                session_configuration
+                    .step_settings
+                    .service_tier
+                    .clone()
+                    .or_else(|| config.service_tier.clone()),
+            );
+        }
         let is_paginated_subagent = matches!(
             session_configuration.history_mode,
             ThreadHistoryMode::Paginated
@@ -752,11 +780,12 @@ impl Session {
             }
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         };
-        // Legacy subagent rollouts synthesize session_id from their own thread id.
+        // Legacy subagent rollouts synthesized session_id from their own thread ID.
         let resumed_session_id = resumed_session_id.filter(|session_id| {
             !session_configuration.session_source.is_non_root_agent()
                 || *session_id != SessionId::from(thread_id)
         });
+        // session_id is equal to the root thread's ID.
         let session_id = resumed_session_id.unwrap_or_else(|| {
             if session_configuration.session_source.is_non_root_agent() {
                 agent_control.session_id()
@@ -803,11 +832,18 @@ impl Session {
         thread_extension_init.insert(codex_extension_api::ThreadOriginator(
             session_configuration.originator.clone(),
         ));
+        // Publish the already resolved model before extensions make startup decisions.
+        // Turn construction refreshes this attachment when the selected model changes.
+        thread_extension_init.insert(model_info);
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
             thread_id.to_string(),
             thread_extension_init,
         );
+        // Select the answer path once, before extensions or tool handlers observe the thread.
+        thread_extension_data.insert(crate::context::GuardianReviewEvidence::from_features(
+            &config.features,
+        ));
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
@@ -919,6 +955,7 @@ impl Session {
 
         let mut mcp_auth_changes = auth_manager.auth_change_receiver();
         let auth_manager_clone = Arc::clone(&auth_manager);
+        let plugins_manager_for_prewarm = Arc::clone(&plugins_manager);
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
         let mcp_thread_init_for_startup = &mcp_thread_init;
@@ -932,6 +969,20 @@ impl Session {
             .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
         let auth_and_mcp_fut = async move {
             let auth = auth_manager_clone.auth().await;
+            if config_for_mcp.features.plugin_recommendations_enabled() {
+                let plugins_config = config_for_mcp.plugins_config_input();
+                let auth_for_prewarm = auth.clone();
+                // Fetch the catalog while MCP and plugin/skill initialization continue.
+                // Context construction still handles filtering and prompt insertion.
+                tokio::spawn(async move {
+                    plugins_manager_for_prewarm
+                        .recommended_plugins_mode_for_config(
+                            &plugins_config,
+                            auth_for_prewarm.as_ref(),
+                        )
+                        .await;
+                });
+            }
             let mcp_projection = mcp_manager_for_mcp
                 .runtime_config_for_step(
                     &config_for_mcp,
@@ -1214,6 +1265,9 @@ impl Session {
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
             );
+            if config.features.enabled(Feature::GuardianThreadContext) {
+                state.history.enable_user_message_retention();
+            }
             state.base_instructions_provenance = base_instructions_provenance.clone();
             let managed_network_requirements_configured = config
                 .config_layer_stack
@@ -1324,6 +1378,8 @@ impl Session {
                     | RolloutItem::TurnContext(_)
                     | RolloutItem::WorldState(_)
                     | RolloutItem::RealtimeItem(_)
+                    | RolloutItem::TokenUsageRecord(_)
+                    | RolloutItem::RetainedContext(_)
                     | RolloutItem::SecurityRiskScore(_) => {}
                 }
             }
@@ -1375,6 +1431,7 @@ impl Session {
                 .with_legacy_custom_ca_fallback(),
                 session_telemetry,
                 models_manager: Arc::clone(&models_manager),
+                git_root_discovery,
                 tool_approvals: Mutex::new(ApprovalStore::default()),
                 guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
                 runtime_handle: tokio::runtime::Handle::current(),
@@ -1422,16 +1479,18 @@ impl Session {
                     config.http_client_factory(),
                 )
                 .with_free_guardian_enabled(config.free_guardian_enabled())
-                .with_prompt_cache_key_override(
+                .with_session_context(
                     crate::guardian::prompt_cache_key_override_for_review_session(
                         &session_configuration.session_source,
                         session_configuration.parent_thread_id,
                     ),
+                    tx_event.clone(),
                 ),
-                executed_tool_calls,
+                executed_tool_calls: executed_tool_calls.clone(),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(
                     Arc::clone(&code_mode_session_provider),
                     &config.code_mode,
+                    executed_tool_calls,
                 ),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
@@ -1443,6 +1502,7 @@ impl Session {
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),
+                thread_settings_persistence: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 windows_sandbox_proxy_settings_mode,
@@ -1454,6 +1514,9 @@ impl Session {
                 mcp_prewarm_shutdown: CancellationToken::new(),
                 mcp_prewarm_task: std::sync::Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
+                realtime_history: (session_configuration.history_mode == ThreadHistoryMode::Paginated
+                    && services.live_thread.is_some())
+                .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
                 input_queue: InputQueue::new(),
@@ -1543,7 +1606,7 @@ impl Session {
             )
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+            sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await.text)
                 .await;
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,

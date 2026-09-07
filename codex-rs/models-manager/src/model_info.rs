@@ -51,6 +51,8 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
     if let Some(base_instructions) = &config.base_instructions {
         let model_messages = model.model_messages.get_or_insert(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
@@ -59,6 +61,7 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         });
         model_messages.instructions_template = Some(base_instructions.clone());
@@ -175,19 +178,24 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: true, // this is the fallback model metadata
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
     }
 }
 
 fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some(format!(
                 "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
             )),
@@ -202,9 +210,12 @@ fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         },
         _ => ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
             instructions_variables: None,
             approvals: None,
@@ -213,6 +224,7 @@ fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         },
     }

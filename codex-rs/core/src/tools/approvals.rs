@@ -43,6 +43,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,6 +86,8 @@ pub(crate) enum ApprovalAction {
         input: String,
         cwd: PathUri,
         tty: bool,
+        sandbox_permissions: SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     },
     #[cfg(unix)]
     Execve {
@@ -171,6 +174,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             } => PermissionRequestPayload {
                 tool_name: HookToolName::new("write_stdin"),
                 tool_input: serde_json::json!({
@@ -181,6 +186,8 @@ impl ApprovalAction {
                     "environment_id": environment_id,
                     "cwd": cwd,
                     "tty": tty,
+                    "sandbox_permissions": sandbox_permissions,
+                    "additional_permissions": additional_permissions,
                 }),
             },
             #[cfg(unix)]
@@ -266,7 +273,10 @@ impl ApprovalAction {
         }
     }
 
-    fn into_guardian_request(self) -> std::io::Result<crate::guardian::GuardianApprovalRequest> {
+    pub(crate) fn into_guardian_request(
+        self,
+        exec_command_cwd_convention: Option<PathConvention>,
+    ) -> std::io::Result<crate::guardian::GuardianApprovalRequest> {
         Ok(match self {
             Self::ExecCommand {
                 id,
@@ -280,8 +290,16 @@ impl ApprovalAction {
                 ..
             } => crate::guardian::GuardianApprovalRequest::ExecCommand {
                 id,
+                environment_id,
                 command,
-                cwd: guardian_cwd(&environment_id, cwd)?,
+                guardian_cwd: codex_utils_path_uri::LegacyAppPathString::from_path_uri(
+                    &cwd,
+                    exec_command_cwd_convention.ok_or_else(|| {
+                        std::io::Error::other("missing exec command cwd convention")
+                    })?,
+                )
+                .map_err(std::io::Error::other)?,
+                cwd,
                 sandbox_permissions,
                 additional_permissions,
                 justification,
@@ -295,6 +313,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             } => crate::guardian::GuardianApprovalRequest::WriteStdin {
                 id,
                 approval_id,
@@ -303,6 +323,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             },
             #[cfg(unix)]
             Self::Execve {
@@ -323,18 +345,14 @@ impl ApprovalAction {
             },
             Self::ApplyPatch {
                 id,
-                environment_id,
                 cwd,
                 files,
                 patch,
                 ..
             } => crate::guardian::GuardianApprovalRequest::ApplyPatch {
                 id,
-                cwd: guardian_cwd(&environment_id, cwd)?,
-                files: files
-                    .into_iter()
-                    .map(|path| path.to_abs_path())
-                    .collect::<std::io::Result<Vec<_>>>()?,
+                cwd,
+                files,
                 patch,
             },
             Self::McpToolCall {
@@ -393,28 +411,6 @@ impl ApprovalAction {
                 permissions,
             },
         })
-    }
-}
-
-fn guardian_cwd(environment_id: &str, cwd: PathUri) -> std::io::Result<AbsolutePathBuf> {
-    match cwd.to_abs_path() {
-        Ok(cwd) => Ok(cwd),
-        Err(err) if environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID => Err(err),
-        Err(_) => {
-            let cwd_display = cwd.to_string();
-            let path = cwd.to_url().to_file_path().map_err(|()| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("local cwd URI `{cwd_display}` is not a host-native path"),
-                )
-            })?;
-            AbsolutePathBuf::from_absolute_path_checked(path).map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("local cwd URI `{cwd_display}` is not absolute: {err}"),
-                )
-            })
-        }
     }
 }
 
@@ -485,10 +481,11 @@ impl Session {
         action: ApprovalAction,
         ctx: ApprovalContext,
     ) -> Result<ReviewDecision, ToolError> {
-        // Stdin is a fresh sandbox approval, not an exec-policy cache hit. Strict
-        // review can route Never to Guardian, but granular restrictions still apply.
+        // Stdin that exceeds current permissions needs a fresh sandbox approval.
+        // Strict review of ordinary input follows the same routing as ordinary exec.
         let policy = ctx.review_context.turn().approval_policy();
-        if matches!(&action, ApprovalAction::WriteStdin { .. })
+        if matches!(&action, ApprovalAction::WriteStdin { sandbox_permissions, .. }
+            if sandbox_permissions.requests_sandbox_override())
             && !(ctx.strict_auto_review && matches!(policy, AskForApproval::Never))
             && let Some(reason) =
                 prompt_is_rejected_by_policy(policy, /*prompt_is_rule*/ false)
@@ -607,7 +604,31 @@ impl Session {
         }
         let is_network_approval = matches!(&action, ApprovalAction::NetworkAccess { .. });
         let review_id = new_guardian_review_id();
-        let action = match action.into_guardian_request() {
+        let exec_command_cwd_convention = match &action {
+            ApprovalAction::ExecCommand {
+                environment_id,
+                cwd,
+                ..
+            } => Some(
+                match ctx
+                    .review_context
+                    .environments()
+                    .turn_environments()
+                    .find(|environment| environment.selection.environment_id == *environment_id)
+                    .and_then(|environment| environment.executor_platform_os.as_deref())
+                {
+                    Some("windows") => PathConvention::Windows,
+                    Some(_) => PathConvention::Posix,
+                    // Legacy executors did not report their OS. Preserve the
+                    // previous spelling-based behavior for those executors.
+                    None => cwd
+                        .infer_path_convention()
+                        .unwrap_or_else(PathConvention::native),
+                },
+            ),
+            _ => None,
+        };
+        let action = match action.into_guardian_request(exec_command_cwd_convention) {
             Ok(action) => action,
             Err(err) => {
                 tracing::error!(%err, "failed to build automatic approval action");
@@ -631,6 +652,7 @@ impl Session {
                     plugin_attribution_override: None,
                     approval_request_source: GuardianApprovalRequestSource::MainTurn,
                     external_cancel: Some(cancellation_token.clone()),
+                    require_synchronous_review: false,
                 },
             );
             review.await.unwrap_or_else(|_| {
@@ -653,6 +675,7 @@ impl Session {
                         plugin_attribution_override: None,
                         approval_request_source: GuardianApprovalRequestSource::MainTurn,
                         external_cancel: Some(review_cancel),
+                        require_synchronous_review: false,
                     },
                 )
                 .await
@@ -693,15 +716,6 @@ impl Session {
                 proposed_execpolicy_amendment,
                 ..
             } => {
-                let cwd = match guardian_cwd(environment_id, cwd.clone()) {
-                    Ok(cwd) => cwd,
-                    Err(err) => {
-                        tracing::error!(%err, "failed to resolve approval command cwd");
-                        return ReviewDecision::denied(format!(
-                            "failed to resolve approval command cwd: {err}"
-                        ));
-                    }
-                };
                 let tool_name = "unified_exec";
                 let reason = ctx
                     .retry_reason
@@ -728,7 +742,7 @@ impl Session {
                         /*approval_id*/ None,
                         Some(environment_id.clone()),
                         command.clone(),
-                        cwd.into(),
+                        cwd.clone(),
                         reason,
                         ctx.network_approval_context.clone(),
                         proposed_execpolicy_amendment.clone(),
@@ -747,6 +761,7 @@ impl Session {
                 process_id,
                 input,
                 cwd,
+                additional_permissions,
                 ..
             } => {
                 self.request_command_approval(
@@ -765,7 +780,7 @@ impl Session {
                     ctx.approval_reason.clone(),
                     /*network_approval_context*/ None,
                     /*proposed_execpolicy_amendment*/ None,
-                    /*additional_permissions*/ None,
+                    additional_permissions.clone(),
                     Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                     /*plugin_attribution_override*/ None,
                 )

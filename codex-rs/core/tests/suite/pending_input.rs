@@ -12,7 +12,6 @@ use codex_extension_items::ExtensionItem;
 use codex_extension_items::sleep::SleepItem;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::CollaborationMode;
@@ -87,12 +86,14 @@ async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyho
             responses::user_message_item("automatic response item"),
         )))
         .await?;
-    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+    let StartIfIdleSubmission::Started { turn_id } = submission else {
+        panic!("automatic input should start a turn");
+    };
     wait_for_turn_complete(test.codex.as_ref()).await;
 
     let request = response.single_request();
     let request_body = request.body_json();
-    responses::assert_root_turn(&request_body, /*expected*/ None)?;
+    responses::assert_root_turn(&request_body, Some(&turn_id))?;
     responses::assert_parent_turn(&request_body, /*expected*/ None)?;
     let user_messages = request.message_input_texts("user");
     assert!(
@@ -316,6 +317,7 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
 
 async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
     test_codex()
+        .with_config(|config| config.update_plan_enabled = true)
         .with_model("gpt-5.4")
         .build_with_streaming_server(server)
         .await
@@ -720,7 +722,7 @@ async fn any_new_input_interrupts_sleep() {
         .expect("read rollout");
     let persisted_sleep_items = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .filter_map(|line| match line.item {
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match event.item {
                 TurnItem::Extension(ExtensionItem::Sleep(item)) => Some(item),
@@ -1043,6 +1045,7 @@ async fn queued_inter_agent_mail_does_not_restart_after_final_answer() {
 async fn injected_response_item_reopens_turn_after_final_answer() {
     const INITIAL_PROMPT: &str = "first prompt";
     const INJECTED_CONTEXT: &str = "late injected context";
+    const EXTERNAL_CONTEXT: &str = "external injected context";
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -1083,18 +1086,35 @@ async fn injected_response_item_reopens_turn_after_final_answer() {
             .await
             .is_ok()
     );
+    codex
+        .inject_response_items(vec![responses::user_message_item(EXTERNAL_CONTEXT)])
+        .await
+        .expect("external context should be injected");
     let _ = gate_completed_tx.send(());
 
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
+    let first: Value = from_slice(&requests[0]).expect("parse first request");
+    let first_turn_id = first["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("first request should include its turn ID");
+    responses::assert_root_turn(&first, Some(first_turn_id))
+        .expect("initial root should be trusted");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
+    responses::assert_root_turn(&second, Some(first_turn_id))
+        .expect("external injection should preserve the active turn root");
     let relevant_user_input = message_input_texts(&second, "user")
         .into_iter()
-        .filter(|text| text == INITIAL_PROMPT || text == INJECTED_CONTEXT)
+        .filter(|text| {
+            text == INITIAL_PROMPT || text == INJECTED_CONTEXT || text == EXTERNAL_CONTEXT
+        })
         .collect::<Vec<_>>();
-    assert_eq!(relevant_user_input, vec![INITIAL_PROMPT, INJECTED_CONTEXT]);
+    assert_eq!(
+        relevant_user_input,
+        vec![INITIAL_PROMPT, INJECTED_CONTEXT, EXTERNAL_CONTEXT]
+    );
 
     server.shutdown().await;
 }

@@ -13,8 +13,6 @@ use crate::session::step_context::StepContext;
 use codex_history::CodexHarnessMetadata;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::CompactionTraceContext;
 use tracing::info;
@@ -24,6 +22,7 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
     pub(super) compaction_output: ResponseItem,
+    pub(super) compaction_response_id: String,
     pub(super) token_usage: Option<TokenUsage>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
     pub(super) owned_client_session: Option<ModelClientSession>,
@@ -39,7 +38,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_prompt_base_instructions().await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut history,
@@ -104,7 +103,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     };
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
-        turn_context.as_ref(),
+        step_context,
         client_session,
         &prompt,
         &responses_metadata,
@@ -120,16 +119,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         response_id,
         token_usage,
     } = compaction_output_result?;
-    // TODO: Emit this before compaction output validation so malformed completed
-    // responses still surface their raw upstream usage.
-    sess.send_event(
-        turn_context,
-        EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
-            response_id,
-            token_usage: token_usage.clone(),
-        }),
-    )
-    .await;
     let mut prompt_input = prompt.input;
     prompt_input.pop();
     Ok(RemoteCompactV2Attempt {
@@ -137,6 +126,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         prompt_input,
         prompt_input_metadata,
         compaction_output,
+        compaction_response_id: response_id,
         token_usage,
         owned_client_session,
     })

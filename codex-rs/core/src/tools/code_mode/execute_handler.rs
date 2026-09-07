@@ -88,7 +88,7 @@ impl CodeModeExecuteHandler {
                 cell_id: cell_id.to_string(),
             });
         if let Some(executed_tool_calls) = exec.session.services.executed_tool_calls.as_ref() {
-            executed_tool_calls.register_cell(&cell_id, &call_id);
+            executed_tool_calls.start_cell(&cell_id, &call_id);
         }
         let runtime_cell_id = cell_id.to_string();
         let code_cell_trace = exec
@@ -109,6 +109,9 @@ impl CodeModeExecuteHandler {
             .initial_response()
             .await
             .map_err(FunctionCallError::RespondToModel)?;
+        if let Some(code_mode_host_duration) = response.code_mode_host_duration() {
+            telemetry.record_code_mode_host_duration(code_mode_host_duration);
+        }
         // Record the raw runtime boundary. The model-visible custom-tool output
         // is produced by `handle_runtime_response` and later linked through
         // `CodeCell.output_item_ids` in the reduced trace.
@@ -131,7 +134,10 @@ impl CodeModeExecuteHandler {
                 });
         }
         exec.session.services.elicitations.wait_until_clear().await;
-        handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+        let wall_time = response
+            .code_mode_host_duration()
+            .unwrap_or_else(|| started_at.elapsed());
+        handle_runtime_response(&exec, response, args.max_output_tokens, wall_time)
             .await
             .map_err(FunctionCallError::RespondToModel)
     }
@@ -146,7 +152,10 @@ impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
         self.spec.clone()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }

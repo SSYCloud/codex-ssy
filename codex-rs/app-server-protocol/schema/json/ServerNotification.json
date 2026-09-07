@@ -522,6 +522,27 @@
         }
       ]
     },
+    "AsyncUserInputQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
     "AuthMode": {
       "description": "Authentication mode for OpenAI-backed providers.",
       "oneOf": [
@@ -582,6 +603,29 @@
           "type": "string"
         }
       ]
+    },
+    "AuthRecoveryNotification": {
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "provider",
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
     },
     "AutoReviewDecisionSource": {
       "description": "[UNSTABLE] Source that produced a terminal approval auto-review decision.",
@@ -1936,7 +1980,7 @@
               "type": "string"
             },
             "cwd": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "source": {
               "$ref": "#/definitions/GuardianCommandSource"
@@ -2029,11 +2073,11 @@
         {
           "properties": {
             "cwd": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "files": {
               "items": {
-                "$ref": "#/definitions/AbsolutePathBuf"
+                "$ref": "#/definitions/LegacyAppPathString"
               },
               "type": "array"
             },
@@ -3371,6 +3415,13 @@
             "null"
           ]
         },
+        "normalModelSlug": {
+          "description": "Normal model whose display name and reasoning options describe this quota alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planType": {
           "anyOf": [
             {
@@ -4103,12 +4154,26 @@
           "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
         },
+        "model": {
+          "description": "Current configured model when loaded, otherwise the latest persisted model. Null when unavailable. This is not per-turn execution telemetry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
         },
         "name": {
           "description": "Optional user-facing thread title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "originator": {
+          "description": "Originator recorded when the thread was created, independent of its current client or executor. Null when the recorded originator is unavailable.",
           "type": [
             "string",
             "null"
@@ -4138,6 +4203,17 @@
             "string",
             "null"
           ]
+        },
+        "reasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Current configured reasoning effort when loaded, otherwise the latest persisted effort. Null when unset or unavailable. This is not per-turn execution telemetry."
         },
         "recencyAt": {
           "description": "Unix timestamp (in seconds) used for thread recency ordering.",
@@ -4266,6 +4342,29 @@
       },
       "required": [
         "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadEnvironment": {
+      "description": "An environment selected by a loaded thread, independent of connection status.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId",
+        "runtimeWorkspaceRoots"
       ],
       "type": "object"
     },
@@ -4471,6 +4570,16 @@
                 }
               ],
               "default": null
+            },
+            "questions": {
+              "default": null,
+              "items": {
+                "$ref": "#/definitions/AsyncUserInputQuestion"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "text": {
               "type": "string"
@@ -7777,6 +7886,46 @@
         "params"
       ],
       "title": "Model/verificationNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "modelProvider/authRecoveryStarted"
+          ],
+          "title": "ModelProvider/authRecoveryStartedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AuthRecoveryNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "ModelProvider/authRecoveryStartedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "modelProvider/authRecoveryCompleted"
+          ],
+          "title": "ModelProvider/authRecoveryCompletedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AuthRecoveryNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "ModelProvider/authRecoveryCompletedNotification",
       "type": "object"
     },
     {

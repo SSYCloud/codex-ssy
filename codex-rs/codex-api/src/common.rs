@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
@@ -93,9 +94,16 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
+/// The server response currently being handled, shared with tool-review extensions.
+#[derive(Clone, Debug)]
+pub struct ResponseId(pub String);
+
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        /// Existing server response ID, when supplied by the stream.
+        response_id: Option<String>,
+    },
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
@@ -113,6 +121,7 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        usage_metadata: Option<ResponseUsageMetadata>,
         /// Did the model affirmatively end its turn? Some providers do not set this,
         /// so we rely on fallback logic when this is `None`.
         end_turn: Option<bool>,

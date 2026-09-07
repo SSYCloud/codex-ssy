@@ -24,6 +24,11 @@ fn transcript_v2_resolves_explicit_config_overrides() {
 }
 
 #[test]
+fn sleep_tool_config_rejects_unknown_mode() {
+    assert!(toml::from_str::<FeaturesToml>("[sleep_tool]\nmode = 'off'").is_err());
+}
+
+#[test]
 fn under_development_features_are_disabled_by_default() {
     for spec in crate::FEATURES {
         if matches!(spec.stage, Stage::UnderDevelopment) {
@@ -158,6 +163,43 @@ fn guardian_v2_feature_config_preserves_boolean_toggle() {
 }
 
 #[test]
+fn guardian_thread_context_resolves_nested_config_and_profile_overrides() {
+    let enabled_context = "[guardianv2]\nthread_context = true";
+    let disabled_context = "[guardianv2]\nthread_context = false";
+    for (base, profile, enabled) in [
+        ("", "", false),
+        (disabled_context, "", false),
+        (enabled_context, "", true),
+        (enabled_context, disabled_context, false),
+        (disabled_context, enabled_context, true),
+        (
+            "[guardianv2]\nenabled = false\nthread_context = true",
+            "",
+            true,
+        ),
+    ] {
+        let base = toml::from_str::<FeaturesToml>(base).expect("base features");
+        let profile = toml::from_str::<FeaturesToml>(profile).expect("profile features");
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&base),
+                ..Default::default()
+            },
+            FeatureConfigSource {
+                features: Some(&profile),
+                ..Default::default()
+            },
+            FeatureOverrides::default(),
+        );
+        let mut expected = Features::with_defaults();
+        if enabled {
+            expected.enable(Feature::GuardianThreadContext);
+        }
+        assert_eq!(features.enabled_features(), expected.enabled_features());
+    }
+}
+
+#[test]
 fn guardian_v2_feature_config_deserializes_classifier_and_transcript_settings() {
     let features: FeaturesToml = toml::from_str(
         r#"
@@ -195,6 +237,7 @@ max_recent_non_user_entries = 12
         Some(FeatureToml::Config(crate::GuardianV2ConfigToml {
             enabled: Some(true),
             free_guardian: Some(true),
+            thread_context: None,
             persist_scores: Some(true),
             classifier_instructions: Some("Review this action".to_owned()),
             review_threshold: Some(0.65),

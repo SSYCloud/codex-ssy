@@ -31,9 +31,11 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
+use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::ConnectionState;
+use crate::transport::DaemonShutdownAccess;
 use crate::transport::OutboundConnectionState;
 use crate::transport::RemoteControlPolicy;
 use crate::transport::RemoteControlStartConfig;
@@ -96,6 +98,7 @@ mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
 mod code_mode_host;
+mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
 mod config_manager;
@@ -118,10 +121,10 @@ mod mcp_refresh;
 mod message_processor;
 mod models;
 mod models_refresh_worker;
+mod notification_media;
 mod otel_reloader;
 mod outgoing_message;
-mod realtime_event_handling;
-mod realtime_history;
+mod plugin_config_reload;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
@@ -130,6 +133,7 @@ mod thread_state;
 mod thread_status;
 mod transport;
 mod turn_cost_worker;
+mod user_verification;
 
 pub use crate::code_mode_host::AppServerCodeModeHostArgs;
 pub use crate::code_mode_host::CodeModeHostTransport;
@@ -215,11 +219,16 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .map(|_| ShutdownSignal::Forceable)
+        let console_signal = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                // A detached daemon has no console; keep its local control path active.
+                std::future::pending::<()>().await;
+            }
+        };
+        console_signal.await;
+        Ok(ShutdownSignal::Forceable)
     }
 }
 
@@ -524,6 +533,7 @@ pub async fn run_main_with_transport_options(
         }
     };
     let mut config_warnings = Vec::new();
+    let mut plugin_startup_config = PluginStartupConfig::Current;
     let config = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
@@ -539,6 +549,7 @@ pub async fn run_main_with_transport_options(
 
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
+            plugin_startup_config = PluginStartupConfig::Defaults;
             config_manager.load_default_config().await.map_err(|e| {
                 std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -548,6 +559,10 @@ pub async fn run_main_with_transport_options(
         }
     };
     config.auth_config().validate()?;
+    #[cfg(target_os = "macos")]
+    let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
+        codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
+    );
     let code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>> =
         match &runtime_options.code_mode_host_transport {
             CodeModeHostTransport::Local => None,
@@ -710,6 +725,8 @@ pub async fn run_main_with_transport_options(
     }
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let transport_shutdown_token = CancellationToken::new();
+    // Remote enrollment must cancel before RPC drain without shutting down telemetry.
+    let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
@@ -733,6 +750,14 @@ pub async fn run_main_with_transport_options(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
+                if cfg!(windows)
+                    && std::env::var_os(codex_app_server_transport::DAEMON_SHUTDOWN_SOCKET_ENV)
+                        .is_some()
+                {
+                    DaemonShutdownAccess::Managed
+                } else {
+                    DaemonShutdownAccess::Disabled
+                },
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -788,7 +813,7 @@ pub async fn run_main_with_transport_options(
         state_db.clone(),
         auth_manager.clone(),
         transport_event_tx.clone(),
-        transport_shutdown_token.clone(),
+        remote_control_shutdown_token.clone(),
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
@@ -820,6 +845,11 @@ pub async fn run_main_with_transport_options(
         }
     }
     transport_accept_handles.push(remote_control_accept_handle);
+
+    // Only the standalone server measures its local home, not embedded/cloud runtimes.
+    if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+        codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
+    }
 
     let otel_reloader_handle = otel_reloader::spawn(
         otel,
@@ -912,7 +942,11 @@ pub async fn run_main_with_transport_options(
             code_mode_session_provider,
             rpc_transport: analytics_rpc_transport(&transport),
             remote_control_handle: Some(remote_control_handle.clone()),
-            plugin_startup_tasks: runtime_options.plugin_startup_tasks,
+            plugin_startup_tasks: matches!(
+                runtime_options.plugin_startup_tasks,
+                PluginStartupTasks::Start
+            )
+            .then_some(plugin_startup_config),
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
@@ -952,7 +986,7 @@ pub async fn run_main_with_transport_options(
                         let running_turn_count = *running_turn_count_rx.borrow();
                         shutdown_state.on_signal(signal, connections.len(), running_turn_count);
                     }
-                    changed = running_turn_count_rx.changed(), if graceful_signal_restart_enabled && shutdown_state.requested() => {
+                    changed = running_turn_count_rx.changed(), if shutdown_state.requested() => {
                         if changed.is_err() {
                             warn!("running-turn watcher closed during graceful restart drain");
                         }
@@ -962,6 +996,9 @@ pub async fn run_main_with_transport_options(
                             break "transport_channel_closed";
                         };
                         match event {
+                            TransportEvent::DaemonShutdown => {
+                                shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow());
+                            }
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
@@ -1021,6 +1058,8 @@ pub async fn run_main_with_transport_options(
                                     break "outbound_router_closed";
                                 }
                                 if single_client_mode && stdio_closed {
+                                    // Pending remote enrollment must stop before RPCs drain.
+                                    remote_control_shutdown_token.cancel();
                                     break "stdio_connection_closed";
                                 }
                             }

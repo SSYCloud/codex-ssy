@@ -410,6 +410,8 @@ mod tests {
             ..test_thread_session(primary_thread_id, test_path_buf("/tmp/primary"))
         };
         let read_thread = Thread {
+            originator: None,
+            environments: None,
             id: read_thread_id.to_string(),
             extra: None,
             session_id: read_thread_id.to_string(),
@@ -420,8 +422,11 @@ mod tests {
             section: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "read-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: Some(2),

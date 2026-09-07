@@ -6,7 +6,6 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -367,7 +366,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let entry: RolloutLine = serde_json::from_str(line)?;
+        let entry = codex_rollout::parse_rollout_line(line)?;
         if let RolloutItem::Compacted(compacted) = entry.item
             && let Some(items) = compacted.replacement_history
         {
@@ -506,9 +505,17 @@ fn format_labeled_requests_snapshot(
     )
 }
 
+#[test_case::test_case(false, false; "checklist disabled")]
+#[test_case::test_case(true, false; "checklist enabled")]
+#[test_case::test_case(false, true; "custom instructions with checklist disabled")]
+#[test_case::test_case(true, true; "custom instructions with checklist enabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn summarize_context_three_requests_and_instructions() {
-    skip_if_no_network!();
+async fn summarize_context_three_requests_and_instructions(
+    enable_plan: bool,
+    custom_instructions: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const CUSTOM_INSTRUCTIONS: &str = "## Plan tool\nNever deploy without explicit approval.\n";
 
     // Set up a mock server that we can inspect after the run.
     let server = start_mock_server().await;
@@ -535,11 +542,16 @@ async fn summarize_context_three_requests_and_instructions() {
     // Build config pointing to the mock server and spawn Codex.
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
+        config.model = Some("gpt-5.2".to_string());
+        config.update_plan_enabled = enable_plan;
+        if custom_instructions {
+            config.base_instructions = Some(CUSTOM_INSTRUCTIONS.to_string());
+        }
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
     });
-    let test = builder.build(&server).await.unwrap();
+    let test = builder.build(&server).await?;
     let codex = test.codex.clone();
     let rollout_path = test.session_configured.rollout_path.expect("rollout path");
 
@@ -555,12 +567,11 @@ async fn summarize_context_three_requests_and_instructions() {
                 text_elements: Vec::new(),
             },
         ]))
-        .await
-        .unwrap();
+        .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // 2) Summarize – second hit should include the summarization prompt.
-    codex.submit(Op::Compact).await.unwrap();
+    codex.submit(Op::Compact).await?;
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact");
@@ -574,45 +585,51 @@ async fn summarize_context_three_requests_and_instructions() {
             text: THIRD_USER_MSG.into(),
             text_elements: Vec::new(),
         }]))
-        .await
-        .unwrap();
+        .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Inspect the three captured requests.
     let requests = request_log.requests();
     assert_eq!(requests.len(), 3, "expected exactly three requests");
-    let body1 = requests[0].body_json();
     let body2 = requests[1].body_json();
     let body3 = requests[2].body_json();
 
     // Manual compact should keep the baseline developer instructions.
-    let instr1 = body1.get("instructions").and_then(|v| v.as_str()).unwrap();
-    let instr2 = body2.get("instructions").and_then(|v| v.as_str()).unwrap();
+    let instr1 = requests[0].instructions_text();
+    let instr2 = requests[1].instructions_text();
+    if custom_instructions {
+        assert_eq!(instr1, CUSTOM_INSTRUCTIONS);
+    } else {
+        assert_eq!(instr1.contains("update_plan"), enable_plan);
+    }
     assert_eq!(
         instr1, instr2,
         "manual compact should keep the standard developer instructions"
     );
+    assert_eq!(requests[2].instructions_text(), instr1);
 
     // The summarization request should include the injected user input marker.
     let body2_str = body2.to_string();
-    let input2 = body2.get("input").and_then(|v| v.as_array()).unwrap();
+    let input2 = body2["input"].as_array().expect("compaction input array");
     let has_compact_prompt = body_contains_text(&body2_str, SUMMARIZATION_PROMPT);
     assert!(
         has_compact_prompt,
         "compaction request should include the summarize trigger"
     );
     // The last item is the user message created from the injected input.
-    let last2 = input2.last().unwrap();
-    assert_eq!(last2.get("type").unwrap().as_str().unwrap(), "message");
-    assert_eq!(last2.get("role").unwrap().as_str().unwrap(), "user");
-    let text2 = last2["content"][0]["text"].as_str().unwrap();
+    let last2 = input2.last().expect("summarization prompt");
+    assert_eq!(last2["type"], "message");
+    assert_eq!(last2["role"], "user");
+    let text2 = last2["content"][0]["text"]
+        .as_str()
+        .expect("summarization prompt text");
     assert_eq!(
         text2, SUMMARIZATION_PROMPT,
         "expected summarize trigger, got `{text2}`"
     );
 
     // Third request must contain the refreshed instructions, compacted user history, and new user message.
-    let input3 = body3.get("input").and_then(|v| v.as_array()).unwrap();
+    let input3 = body3["input"].as_array().expect("follow-up input array");
 
     assert!(
         input3.len() >= 3,
@@ -670,7 +687,7 @@ async fn summarize_context_three_requests_and_instructions() {
     );
 
     // Shut down Codex to flush rollout entries before inspecting the file.
-    codex.submit(Op::Shutdown).await.unwrap();
+    codex.submit(Op::Shutdown).await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
     let replacement_history = replacement_history_from_rollout(&rollout_path)
@@ -705,7 +722,7 @@ async fn summarize_context_three_requests_and_instructions() {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {
@@ -750,6 +767,7 @@ async fn summarize_context_three_requests_and_instructions() {
         saw_compacted_summary,
         "expected a Compacted entry containing the summarizer output"
     );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -970,7 +988,7 @@ async fn manual_compact_uses_custom_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_emits_api_and_local_token_usage_events() {
+async fn manual_compact_records_durable_and_local_token_usage() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -989,7 +1007,9 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let codex = test.codex;
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
     codex.submit(Op::Compact).await.unwrap();
@@ -1024,6 +1044,36 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     assert!(
         last > 0,
         "second TokenCount should reflect a non-zero estimated context size after compaction"
+    );
+    let rollout_items = fs::read_to_string(rollout_path)
+        .expect("read rollout")
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .map(|line| line.item)
+        .collect::<Vec<_>>();
+    let records = rollout_items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::TokenUsageRecord(record) => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].response_id, "r1");
+    assert_eq!(records[0].usage.total_tokens, 0);
+    let compacted = rollout_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .expect("compaction checkpoint");
+    assert_eq!(
+        (
+            compacted.compaction_response_id.as_deref(),
+            compacted.latest_token_usage_record.as_ref(),
+        ),
+        (Some("r1"), records.first().copied())
     );
 }
 
@@ -2137,6 +2187,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
         });
@@ -2666,9 +2717,11 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     let mut previous_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
     previous_model_info.slug = previous_model_family.to_string();
+    previous_model_info.use_responses_lite = true;
     let mut next_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
     next_model_info.slug = next_model.to_string();
+    next_model_info.use_responses_lite = false;
 
     let models_mock = mount_models_once(
         &server,
@@ -2710,6 +2763,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
         .with_model(retired_model)
         .with_config(move |config| {
             config.model_provider = model_provider;
+            config.tool_registry.turn_metadata_includes_tool_info = true;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteCompactionV2);
         });
@@ -2755,6 +2809,25 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     );
     assert_eq!(requests[2].body_json()["model"].as_str(), Some(next_model));
     assert_eq!(requests[3].body_json()["model"].as_str(), Some(next_model));
+
+    // Preparing the non-Lite fallback must not clear the previous model's inventory
+    // before its compaction attempt is sent.
+    let [first_metadata, compact_metadata] = [&requests[0], &requests[1]].map(|request| {
+        serde_json::from_str::<Value>(
+            request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("request should include turn metadata"),
+        )
+        .expect("turn metadata should be valid JSON")
+    });
+    let inventory = first_metadata["tool_namespaces_info"]
+        .as_object()
+        .expect("Responses Lite request should include tool inventory");
+    assert!(!inventory.is_empty());
+    assert_eq!(
+        compact_metadata["tool_namespaces_info"],
+        first_metadata["tool_namespaces_info"],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3356,7 +3429,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     let rollout = fs::read_to_string(&rollout_path).expect("read rollout");
     let persisted_comp_hash = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .find_map(|line| match line.item {
             RolloutItem::TurnContext(context) => context.comp_hash,
             _ => None,
@@ -3624,6 +3697,7 @@ async fn auto_compact_persists_rollout_entries() {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let expected_settings = codex.thread_settings_snapshot().await;
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
@@ -3631,19 +3705,26 @@ async fn auto_compact_persists_rollout_entries() {
     let text = std::fs::read_to_string(&rollout_path).expect("failed to read rollout file");
 
     let mut turn_context_count = 0usize;
+    let mut saw_compaction = false;
+    let mut checkpoint = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {
             RolloutItem::TurnContext(_) => {
                 turn_context_count += 1;
             }
-            RolloutItem::Compacted(_) => {}
+            RolloutItem::Compacted(_) => saw_compaction = true,
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(applied))
+                if saw_compaction && checkpoint.is_none() =>
+            {
+                checkpoint = Some((applied.thread_id, applied.thread_settings));
+            }
             _ => {}
         }
     }
@@ -3651,6 +3732,10 @@ async fn auto_compact_persists_rollout_entries() {
     assert_eq!(
         turn_context_count, 3,
         "rollout should contain one TurnContext entry per real user turn"
+    );
+    assert_eq!(
+        checkpoint,
+        Some((Some(session_configured.thread_id), expected_settings))
     );
 }
 
@@ -3875,6 +3960,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     let model_provider = non_openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
+        config.update_plan_enabled = true;
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
@@ -4198,6 +4284,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     let model_provider = non_openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
+        config.update_plan_enabled = true;
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_context_window = Some(context_window);
@@ -4797,6 +4884,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     let model_provider = non_openai_model_provider(&server);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(200);
@@ -4912,6 +5000,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteModels);
@@ -5009,6 +5098,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     model_provider.stream_max_retries = Some(0);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(200);
@@ -5083,6 +5173,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
     let model_provider = non_openai_model_provider(&server);
     let codex = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
         })

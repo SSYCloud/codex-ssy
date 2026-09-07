@@ -189,7 +189,9 @@ fn archived_status_preserves_directory_filter_and_hides_archive_shortcut() {
     assert_eq!(state.status, SessionStatus::Archived);
     let params = super::super::thread_list_params(
         /*cursor*/ None,
-        Some(std::path::Path::new("/tmp/project")),
+        Some(codex_app_server_protocol::ThreadListCwdFilter::One(
+            "/tmp/project".to_string(),
+        )),
         SessionStatus::Archived,
         ProviderFilter::Any,
         ThreadSortKey::UpdatedAt,

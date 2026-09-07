@@ -504,6 +504,8 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         default_service_tier: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some("base instructions".to_string()),
             instructions_variables: None,
             approvals: None,
@@ -512,6 +514,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
             permissions: None,
             multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
             guardian_v2: None,
         }),
         include_skills_usage_instructions: false,
@@ -535,12 +538,15 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
     }
 }
