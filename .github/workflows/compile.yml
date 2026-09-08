@@ -186,11 +186,12 @@ jobs:
 
   # Publish every target that produced binaries to a GitHub Release. Failed
   # targets simply never uploaded an artifact, so they are ignored here.
-  # Only runs for manual workflow_dispatch runs so ordinary pushes/PRs don't
-  # create a release.
+  # Runs on push and manual dispatch (rolling `nightly` by default, or the
+  # release_tag input). Skipped on pull_request, where the token cannot create
+  # a release and where we don't want to publish PR builds.
   publish:
     name: Publish binaries to GitHub Release
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
     needs: cross-compile
     runs-on: ubuntu-24.04
     permissions:
