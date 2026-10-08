@@ -4,6 +4,7 @@
 use super::*;
 use crate::app_server_session::turn_permissions_overrides;
 use crate::chatwidget::MisalignmentReview;
+use crate::chatwidget::MisalignmentTurnSource;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -113,13 +114,33 @@ impl App {
         let Some(message) = review.continuation_message() else {
             return;
         };
+        let enabled = self.chat_widget.daybreak_enabled
+            && !self.chat_widget.side_conversation_active()
+            && !self.side_threads.contains_key(&review.thread_id);
+        let eligible_account = self.chat_widget.daybreak_turn_eligible(enabled);
+        let cyber_access_program = match crate::daybreak::program_for_turn(
+            &self.chat_widget.model_catalog().models,
+            self.chat_widget.current_model(),
+            eligible_account,
+            enabled,
+        ) {
+            Ok(program) => program,
+            Err(message) => {
+                self.chat_widget.add_error_message(message);
+                return;
+            }
+        };
         let config = self.chat_widget.config_ref();
-        let permissions_override = Self::turn_permissions_override_from_config(
-            config,
-            config.permissions.active_permission_profile().as_ref(),
+        let explicit_profile =
             self.runtime_permission_profile_override
                 .as_ref()
-                .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
+                .filter(|profile| {
+                    profile.turn_override == RuntimePermissionProfileTurnOverride::LegacySandbox
+                });
+        let permissions_override = Self::turn_permissions_override_from_config(
+            config,
+            explicit_profile.and_then(|profile| profile.active_permission_profile.as_ref()),
+            explicit_profile.and_then(RuntimePermissionProfileOverride::turn_permission_profile),
         );
         let Ok((sandbox_policy, permissions)) =
             turn_permissions_overrides(permissions_override, config.cwd.as_path())
@@ -144,6 +165,7 @@ impl App {
                     approvals_reviewer: Some(config.approvals_reviewer.into()),
                     sandbox_policy,
                     permissions,
+                    cyber_access_program: cyber_access_program.map(Into::into),
                     input: vec![UserInput::Text {
                         text: message.to_string(),
                         text_elements: Vec::new(),
@@ -161,6 +183,10 @@ impl App {
             Ok(response) => {
                 let store = &self.ensure_thread_channel(review.thread_id).store;
                 store.lock().await.active_turn_id = Some(response.turn.id.clone());
+                self.chat_widget.clear_misalignment_for_new_turn(
+                    &response.turn.id,
+                    MisalignmentTurnSource::AcknowledgedContinuation,
+                );
                 self.chat_widget.handle_server_notification(
                     ServerNotification::TurnStarted(
                         codex_app_server_protocol::TurnStartedNotification {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::apply_patch;
 use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::function_tool::FunctionCallError;
+use crate::safety::PatchPolicyMatcher;
 use crate::safety::PatchSandboxRoute;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -37,21 +39,19 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
+use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
-use codex_apply_patch::ApplyPatchFileUpdateMode;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions_with_context;
 use codex_tools::ToolName;
@@ -59,18 +59,6 @@ use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
-
-fn apply_patch_file_update_mode(turn: &TurnContext) -> ApplyPatchFileUpdateMode {
-    if turn
-        .config
-        .features
-        .enabled(Feature::ApplyPatchPreserveLineEndings)
-    {
-        ApplyPatchFileUpdateMode::PreserveLineEndings
-    } else {
-        ApplyPatchFileUpdateMode::NormalizeToLf
-    }
-}
 
 /// Handles freeform `apply_patch` requests and routes verified patches to the
 /// selected environment filesystem.
@@ -237,46 +225,52 @@ fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<PathUri> {
 
 fn write_permissions_for_paths(
     file_paths: &[PathUri],
-    file_system_sandbox_policy: &codex_protocol::permissions::FileSystemSandboxPolicy,
-    context: &FileSystemSandboxPolicyContext<'_>,
-    sandbox_route: PatchSandboxRoute,
-) -> Option<AdditionalPermissionProfile> {
-    let mut write_paths = file_paths
-        .iter()
+    matching: &PatchPolicyMatcher<'_>,
+) -> io::Result<Option<AdditionalPermissionProfile>> {
+    let sandbox_route = matching.sandbox_route;
+    let context = &matching.context;
+    let mut write_paths = Vec::new();
+    for path in file_paths {
         // Skip already-writable targets before deriving parent permissions.
         // Otherwise, a writable directory could grant access to its parent.
-        .filter(|path| !file_system_sandbox_policy.can_write_path(path, context))
-        .map(|path| {
-            path.parent()
-                .or_else(|| match sandbox_route {
-                    PatchSandboxRoute::Platform(_) => {
-                        // Host path rules can recover parents of opaque local paths.
-                        // `to_abs_path` verifies that the target round-trips losslessly.
-                        path.to_abs_path().ok()?.parent().map(PathUri::from)
-                    }
-                    PatchSandboxRoute::ExecutorManaged => None,
-                })
-                .unwrap_or_else(|| path.clone())
-        })
-        .filter(|path| !file_system_sandbox_policy.can_write_path(path, context))
-        .collect::<Vec<_>>();
+        if matching.can_write_path(path)? {
+            continue;
+        }
+        let parent = path
+            .parent()
+            .or_else(|| match sandbox_route {
+                PatchSandboxRoute::Platform(_) => {
+                    // Host path rules can recover parents of opaque local paths.
+                    // `to_abs_path` verifies that the target round-trips losslessly.
+                    path.to_abs_path().ok()?.parent().map(PathUri::from)
+                }
+                PatchSandboxRoute::ExecutorManaged => None,
+            })
+            .unwrap_or_else(|| path.clone());
+        if !matching.can_write_path(&parent)? {
+            write_paths.push(parent);
+        }
+    }
     write_paths.sort_by_key(PathUri::to_string);
     write_paths.dedup();
 
-    let permissions = (!write_paths.is_empty()).then_some(AdditionalPermissionProfile {
+    if write_paths.is_empty() {
+        return Ok(None);
+    }
+    let permissions = AdditionalPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_path_uris(
             Some(vec![]),
             Some(write_paths),
         )),
         ..Default::default()
-    })?;
+    };
 
-    match sandbox_route {
+    Ok(match sandbox_route {
         PatchSandboxRoute::Platform(_) => normalize_additional_permissions(permissions).ok(),
         PatchSandboxRoute::ExecutorManaged => {
             normalize_additional_permissions_with_context(permissions, context).ok()
         }
-    }
+    })
 }
 
 /// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
@@ -285,57 +279,6 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
         ToolPayload::Custom { input } => Some(input.clone()),
         _ => None,
     }
-}
-
-async fn effective_patch_permissions(
-    session: &Session,
-    environment: &TurnEnvironment,
-    action: &ApplyPatchAction,
-    context: &FileSystemSandboxPolicyContext<'_>,
-    sandbox_route: PatchSandboxRoute,
-) -> (
-    Vec<PathUri>,
-    crate::tools::handlers::EffectiveAdditionalPermissions,
-    codex_protocol::permissions::FileSystemSandboxPolicy,
-) {
-    let environment_id = environment.selection.environment_id.as_str();
-    let file_paths = file_paths_for_action(action);
-    let granted_permissions = merge_permission_profiles(
-        session
-            .granted_session_permissions(environment_id)
-            .await
-            .as_ref(),
-        session
-            .granted_turn_permissions(environment_id)
-            .await
-            .as_ref(),
-    );
-    let base_file_system_sandbox_policy = environment
-        .permission_profile()
-        .file_system_sandbox_policy();
-    let file_system_sandbox_policy = effective_file_system_sandbox_policy(
-        &base_file_system_sandbox_policy,
-        granted_permissions.as_ref(),
-    );
-    let effective_additional_permissions = apply_granted_turn_permissions(
-        session,
-        environment,
-        context.cwd,
-        crate::sandboxing::SandboxPermissions::UseDefault,
-        write_permissions_for_paths(
-            &file_paths,
-            &file_system_sandbox_policy,
-            context,
-            sandbox_route,
-        ),
-    )
-    .await;
-
-    (
-        file_paths,
-        effective_additional_permissions,
-        file_system_sandbox_policy,
-    )
 }
 
 impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
@@ -362,7 +305,6 @@ impl ApplyPatchHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             cancellation_token,
             tracker,
@@ -389,21 +331,16 @@ impl ApplyPatchHandler {
             require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
 
         // Verify the parsed patch against the selected environment filesystem.
-        let Some(turn_environment) = resolve_tool_environment(
-            &step_context.environments,
+        let turn_environment = resolve_tool_environment(
+            &step_context,
             selected_environment_id.as_deref(),
-        )?
-        else {
-            return Err(FunctionCallError::RespondToModel(
-                "apply_patch is unavailable in this session".to_string(),
-            ));
-        };
+            "apply_patch is unavailable in this session",
+        )?;
         let fs = turn_environment.environment.get_filesystem();
         let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
-        match codex_apply_patch::verify_apply_patch_args_with_mode(
+        match codex_apply_patch::verify_apply_patch_args(
             args,
             turn_environment.cwd(),
-            apply_patch_file_update_mode(&turn),
             fs.as_ref(),
             Some(&sandbox),
         )
@@ -508,16 +445,9 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
-    let turn = &step_context.turn;
     let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
-    match codex_apply_patch::maybe_parse_apply_patch_verified_with_mode(
-        command,
-        cwd,
-        apply_patch_file_update_mode(turn),
-        fs,
-        Some(&sandbox),
-    )
-    .await
+    match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, Some(&sandbox))
+        .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             let tool_ctx = ToolCtx {
@@ -552,32 +482,50 @@ async fn execute_verified_patch(
 ) -> Result<String, FunctionCallError> {
     let cwd = action.cwd.clone();
     let sandbox_context = turn_environment.sandbox_context(/*additional_permissions*/ None);
-    let Some(policy_context) = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd)
-    else {
-        return Err(FunctionCallError::RespondToModel(
-            "apply_patch requires an executor cwd".to_string(),
-        ));
-    };
+    let policy_context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd);
     let sandbox_route = if turn_environment.environment.is_remote() {
         PatchSandboxRoute::ExecutorManaged
     } else {
-        PatchSandboxRoute::Platform(turn_environment.config().windows_sandbox_level)
+        PatchSandboxRoute::Platform(windows_sandbox_level_for_legacy_checks(
+            turn_environment.config().windows_sandbox_type,
+            turn_environment.config().windows_sandbox_level,
+        ))
     };
-    let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
-        effective_patch_permissions(
-            tool_ctx.session.as_ref(),
-            &turn_environment,
-            &action,
-            &policy_context,
-            sandbox_route,
-        )
-        .await;
+    let environment_id = turn_environment.selection.environment_id.as_str();
+    let file_paths = file_paths_for_action(&action);
+    let granted_permissions = tool_ctx
+        .step_context
+        .turn
+        .granted_permissions(environment_id);
+    let base_file_system_sandbox_policy = turn_environment
+        .permission_profile()
+        .file_system_sandbox_policy();
+    let file_system_sandbox_policy = effective_file_system_sandbox_policy(
+        &base_file_system_sandbox_policy,
+        granted_permissions.as_ref(),
+    );
+    let matching = sandbox_route
+        .prepare_matching(&file_system_sandbox_policy, &policy_context)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to prepare patch permissions: {error}"
+            ))
+        })?;
+    let additional_permissions =
+        write_permissions_for_paths(&file_paths, &matching).map_err(|error| {
+            FunctionCallError::RespondToModel(format!("failed to check patch permissions: {error}"))
+        })?;
+    let effective_additional_permissions = apply_granted_turn_permissions(
+        &tool_ctx.step_context,
+        &turn_environment,
+        &cwd,
+        crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions,
+    );
     let apply = apply_patch::prepare_apply_patch(
         &tool_ctx.step_context,
         &turn_environment,
-        &file_system_sandbox_policy,
-        &policy_context,
-        sandbox_route,
+        &matching,
         action,
     )?;
     let changes = convert_apply_patch_to_protocol(&apply.action);
@@ -589,6 +537,7 @@ async fn execute_verified_patch(
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
         tool_ctx.step_context.turn.as_ref(),
+        &tool_ctx.step_context.settings.model_info,
         &tool_ctx.call_id,
         tracker,
     );
@@ -616,6 +565,7 @@ async fn execute_verified_patch(
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
         tool_ctx.step_context.turn.as_ref(),
+        &tool_ctx.step_context.settings.model_info,
         &tool_ctx.call_id,
         tracker,
     );

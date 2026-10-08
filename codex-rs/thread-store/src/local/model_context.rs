@@ -1,4 +1,7 @@
+//! Reconstructs model context and preserves source runtime metadata across fork cutoffs.
+
 use std::io;
+use std::path::Path;
 
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
@@ -24,11 +27,9 @@ mod tests;
 
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
-/// Paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
-/// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. When no
-/// bounded cutoff is available, the scan continues to the beginning and returns the complete
-/// replay it already accumulated.
+/// Paginated JSONL rollouts use a reverse scan. It stops at the newest `CompactedItem` with both
+/// replacement history and a window number, and returns that compaction plus its newer suffix. If
+/// the newest compaction lacks either field, the scan continues to the beginning of the rollout.
 ///
 /// Compressed segments are decoded before applying their original JSONL offsets. Legacy rollouts
 /// keep the existing full-history path.
@@ -48,31 +49,44 @@ pub(super) async fn load_latest_model_context(
                 message: format!("no rollout found for thread id {}", params.thread_id),
             })?;
 
-    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+    load_from_rollout_path(store, params.thread_id, &path).await
+}
+
+pub(super) async fn load_from_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    path: &Path,
+) -> ThreadStoreResult<StoredModelContext> {
+    let before = super::history_revision::read(path).await;
+    let session_meta = codex_rollout::read_session_meta_line(path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to read session metadata {}: {err}", path.display()),
         })?;
-    if session_meta.meta.id != params.thread_id {
+    if session_meta.meta.id != thread_id {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!(
                 "rollout at {} belongs to thread {}, not {}",
                 path.display(),
                 session_meta.meta.id,
-                params.thread_id
+                thread_id
             ),
         });
     }
 
     let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated) {
-        let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+        let lineage = store
+            .resolve_rollout_lineage(thread_id, Some(path.to_path_buf()))
+            .await?;
         scan_model_context_from_lineage(lineage, session_meta).await?
     } else {
-        read_thread::load_history_items(path.as_path()).await?
+        read_thread::load_history_items(path).await?
     };
 
+    let after = super::history_revision::read(path).await;
     Ok(StoredModelContext {
-        thread_id: params.thread_id,
+        revision: before.filter(|revision| Some(revision) == after.as_ref()),
+        thread_id,
         items,
     })
 }
@@ -89,7 +103,7 @@ pub(super) async fn load_for_fork(
         .ok_or_else(|| ThreadStoreError::Internal {
             message: "fork lineage has no source segment".to_string(),
         })?;
-    let session_meta = codex_rollout::read_session_meta_line(source_path)
+    let mut session_meta = codex_rollout::read_session_meta_line(source_path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!(
@@ -97,6 +111,41 @@ pub(super) async fn load_for_fork(
                 source_path.display()
             ),
         })?;
+    if session_meta.meta.multi_agent_version.is_none() {
+        // Recover only the runtime version before applying the fork cutoff. Stop at the
+        // newest version-bearing context instead of retaining the source's full replay.
+        let source_lineage = lineage.clone();
+        session_meta.meta.multi_agent_version = tokio::task::spawn_blocking(move || {
+            for segment in source_lineage.segments().iter().rev() {
+                let file =
+                    codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+                let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
+                    Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+                    None => ReverseJsonlScanner::new(file)?,
+                };
+                while let Some(outcome) = scanner.scan_next_rollout_line()? {
+                    let ScanOutcome::Parsed(line) = outcome else {
+                        continue;
+                    };
+                    if let Some(version) = codex_rollout::resume_multi_agent_version(&line.item) {
+                        return Ok(Some(version));
+                    }
+                    // Ancestor metadata does not describe the immediate source's runtime.
+                    if matches!(line.item, RolloutItem::SessionMeta(_)) {
+                        break;
+                    }
+                }
+            }
+            Ok::<_, io::Error>(None)
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to join fork runtime version scan: {err}"),
+        })?
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read fork runtime version: {err}"),
+        })?;
+    }
     match history_base {
         Some(history_base) => {
             let lineage = lineage.truncate_at(history_base).await?;
@@ -152,10 +201,7 @@ fn scan_model_context_from_lineage_blocking(
         }
     }
 
-    let canonical_meta = session_meta.clone();
-    let mut items = scan.finish(session_meta);
-    if !matches!(items.first(), Some(RolloutItem::SessionMeta(_))) {
-        items.insert(0, RolloutItem::SessionMeta(canonical_meta));
-    }
+    let mut items = scan.finish();
+    items.insert(0, RolloutItem::SessionMeta(session_meta));
     Ok(items)
 }

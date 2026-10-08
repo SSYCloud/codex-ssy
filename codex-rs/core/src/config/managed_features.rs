@@ -50,7 +50,9 @@ impl ManagedFeatures {
         )
     }
 
-    pub(crate) fn from_configured_with_warnings(
+    /// Applies managed feature requirements and dependency normalization to
+    /// configured features, collecting warnings for unsupported requirements.
+    pub fn from_configured_with_warnings(
         configured_features: Features,
         feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
         startup_warnings: &mut Vec<String>,
@@ -114,6 +116,28 @@ impl ManagedFeatures {
         let mut next = self.get().clone();
         next.set_enabled(feature, enabled);
         self.set(next)
+    }
+
+    /// Refresh ordinary MCP feature values and pins without changing session-static features.
+    pub(crate) fn refresh_mcp_features(&mut self, next: &Self) -> ConstraintResult<()> {
+        let mut refreshed = self.clone();
+        let mut values = self.get().clone();
+        for feature in [
+            Feature::EnableMcpApps,
+            Feature::SecretAuthStorage,
+            Feature::McpOAuthRefreshCoordination,
+        ] {
+            values.set_enabled(feature, next.enabled(feature));
+            if let Some(enabled) = next.pinned_features.get(&feature) {
+                refreshed.pinned_features.insert(feature, *enabled);
+            } else {
+                refreshed.pinned_features.remove(&feature);
+            }
+        }
+        refreshed.value.source = next.value.source.clone().or(refreshed.value.source);
+        refreshed.set(values)?;
+        *self = refreshed;
+        Ok(())
     }
 
     pub fn enable(&mut self, feature: Feature) -> ConstraintResult<()> {
@@ -216,6 +240,18 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
+        if key == Feature::Personality.key() {
+            continue;
+        }
+        if key == Feature::GuardianThreadContext.key() {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; thread-owned Guardian context is always enabled."
+                ),
+            );
+            continue;
+        }
         if key == "auto_review" {
             pinned_features.insert(Feature::GuardianApproval, enabled);
             continue;

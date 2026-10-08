@@ -1,6 +1,7 @@
 use super::shared::v2_enum_from_core;
 use crate::JsonSchema;
 use crate::TS;
+use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::approvals::ElicitationRequest as CoreElicitationRequest;
 use codex_protocol::items::McpToolCallError as CoreMcpToolCallError;
 use codex_protocol::mcp::CallToolResult as CoreMcpCallToolResult;
@@ -59,6 +60,9 @@ pub struct ListMcpServerStatusParams {
     pub detail: Option<McpServerStatusDetail>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.
+    #[ts(optional = nullable)]
+    pub server_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -77,7 +81,12 @@ pub struct McpServerStatus {
     /// Current thread-runtime connection state; null when unavailable or the configuration changed.
     pub runtime_status: Option<McpServerConnectionStatus>,
     pub plugin_id: Option<String>,
+    /// HTTP origin of the effective configured endpoint, including plugin servers.
+    /// Excludes credentials, path, query, and fragment; null for non-HTTP transports.
+    pub http_origin: Option<String>,
     pub server_info: Option<McpServerInfo>,
+    /// Capabilities advertised by the initialized MCP server; null when unavailable.
+    pub server_capabilities: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
     /// Tool discovery failed and no catalog was returned.
     /// Null when a catalog is returned, including cached or empty catalogs.
@@ -110,6 +119,24 @@ pub struct McpResourceReadParams {
     pub uri: String,
     #[ts(optional = nullable)]
     pub connector_id: Option<String>,
+    /// Explicit hosted app/account. Omit to retain legacy resource discovery.
+    #[ts(optional = nullable)]
+    pub target: Option<McpResourceReadTarget>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpResourceReadTarget {
+    pub connector_id: String,
+    /// Null explicitly requests no-auth access, subject to the app's resource policy.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    #[ts(type = "string | null")]
+    pub link_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -294,6 +321,11 @@ pub enum McpServerOauthClientRegistration {
 #[ts(export_to = "v2/")]
 pub struct McpServerOauthLoginResponse {
     pub authorization_url: String,
+    /// Identifies this login attempt across the response and completion notification.
+    /// Older servers omit this field; current servers always return it.
+    #[serde(default)]
+    #[ts(optional)]
+    pub login_id: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -311,6 +343,9 @@ pub struct McpToolCallProgressNotification {
 pub struct McpServerOauthLoginCompletedNotification {
     pub name: String,
     pub thread_id: Option<String>,
+    /// Identifies the explicit login attempt. Older servers omit this field.
+    #[ts(optional, as = "Option<Option<String>>")]
+    pub login_id: Option<String>,
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -379,7 +414,7 @@ impl From<rmcp::model::ElicitationAction> for McpServerElicitationAction {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpServerElicitationRequestParams {
@@ -393,6 +428,7 @@ pub struct McpServerElicitationRequestParams {
     pub turn_id: Option<String>,
     pub server_name: String,
     #[serde(flatten)]
+    #[experimental(nested)]
     pub request: McpServerElicitationRequest,
     // TODO: When core can correlate an elicitation with an MCP tool call, expose the associated
     // McpToolCall item id here as an optional field. The current core event does not carry that
@@ -744,11 +780,23 @@ pub struct McpElicitationConstOption {
     pub title: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 #[ts(tag = "mode")]
 #[ts(export_to = "v2/")]
 pub enum McpServerElicitationRequest {
+    /// A device-authenticated approval; accepted responses contain the proof in `content`.
+    #[experimental("mcpServer/elicitation/request.userVerification")]
+    #[serde(rename = "openai/userVerification", rename_all = "camelCase")]
+    #[ts(rename = "openai/userVerification", rename_all = "camelCase")]
+    UserVerification {
+        #[serde(rename = "_meta")]
+        #[ts(rename = "_meta")]
+        meta: Option<JsonValue>,
+        title: String,
+        description: String,
+        challenge: String,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Form {
@@ -794,6 +842,17 @@ impl TryFrom<CoreElicitationRequest> for McpServerElicitationRequest {
 
     fn try_from(value: CoreElicitationRequest) -> Result<Self, Self::Error> {
         match value {
+            CoreElicitationRequest::UserVerification {
+                meta,
+                title,
+                description,
+                challenge,
+            } => Ok(Self::UserVerification {
+                meta,
+                title,
+                description,
+                challenge,
+            }),
             CoreElicitationRequest::Form {
                 meta,
                 message,

@@ -5,6 +5,7 @@ use crate::session::step_context::StepContext;
 #[cfg(test)]
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 #[cfg(test)]
@@ -12,9 +13,13 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
 #[cfg(test)]
 use crate::tools::spec_plan::finalize_tool_router;
+use codex_otel::SessionTelemetry;
+use codex_otel::TOOL_REGISTRATIONS_METRIC;
+use codex_otel::TOOL_REGISTRATIONS_METRIC_BUCKETS;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 #[cfg(test)]
@@ -27,11 +32,17 @@ use codex_tools::ToolSpec;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub use crate::tools::context::ToolCallSource;
+
+const EXPOSURE_DIRECT: &str = "direct";
+const EXPOSURE_DIRECT_MODEL_ONLY: &str = "direct_model_only";
+const EXPOSURE_DEFERRED: &str = "deferred";
+const EXPOSURE_DEFERRED_MODEL_ONLY: &str = "deferred_model_only";
+const EXPOSURE_CODE_MODE_ONLY: &str = "code_mode_only";
+const EXPOSURE_HIDDEN: &str = "hidden";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
@@ -148,8 +159,6 @@ impl ToolRouter {
     }
 
     /// The normalized nested identities chosen after exclusions and collisions.
-    // Consumed by the follow-up cell-origin migration.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn code_mode_tool_names(&self) -> &BTreeMap<String, ToolName> {
         &self.code_mode_tool_names
     }
@@ -160,7 +169,6 @@ impl ToolRouter {
     }
 
     /// Whether the model can both start and interact with a terminal process.
-    // Consumed by the follow-up live tool-plan selection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_terminal_controls(&self) -> bool {
         self.exposes_tool(&ToolName::plain("exec_command"))
@@ -168,14 +176,13 @@ impl ToolRouter {
     }
 
     /// Whether the configured collaboration backend's child-management tools remain exposed.
-    // Consumed by the follow-up live tool-plan selection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn can_manage_children(&self) -> bool {
         self.can_manage_children
     }
 
     // Answers if the tool plan lets the model invoke the tool directly, through code mode, or deferred tool search.
-    fn exposes_tool(&self, name: &ToolName) -> bool {
+    pub(crate) fn exposes_tool(&self, name: &ToolName) -> bool {
         let name = name.clone().with_default_namespace();
         if self
             .code_mode_tool_names
@@ -210,6 +217,10 @@ impl ToolRouter {
 
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         self.registry.deferred_tool_namespaces()
+    }
+
+    pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.registry.mcp_namespaces()
     }
 
     #[cfg(test)]
@@ -315,14 +326,14 @@ impl ToolRouter {
             tracker,
             call,
             source,
-            /*terminal_outcome_reached*/ None,
+            /*call_state*/ None,
         )
         .await
     }
 
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
+    pub(crate) async fn dispatch_tool_call_with_state(
         &self,
         session: Arc<Session>,
         step_context: Arc<StepContext>,
@@ -330,7 +341,7 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
         source: ToolCallSource,
-        terminal_outcome_reached: Arc<AtomicBool>,
+        call_state: Arc<ToolCallState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         self.dispatch_tool_call_with_code_mode_result_inner(
             session,
@@ -339,7 +350,7 @@ impl ToolRouter {
             tracker,
             call,
             source,
-            Some(terminal_outcome_reached),
+            Some(call_state),
         )
         .await
     }
@@ -353,7 +364,7 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
         source: ToolCallSource,
-        terminal_outcome_reached: Option<Arc<AtomicBool>>,
+        call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let ToolCall {
             tool_name,
@@ -377,8 +388,50 @@ impl ToolRouter {
         };
 
         self.registry
-            .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
+            .dispatch_any_with_state(invocation, call_state)
             .await
+    }
+}
+
+/// Records the registered inventory once per sampling request, before transport retries.
+/// Registrations do not imply model visibility or reachability; hosted tools are excluded.
+pub(crate) fn record_registration_metrics(router: &ToolRouter, telemetry: &SessionTelemetry) {
+    let mut direct = 0usize;
+    let mut direct_model_only = 0usize;
+    let mut deferred = 0usize;
+    let mut deferred_model_only = 0usize;
+    let mut code_mode_only = 0usize;
+    let mut hidden = 0usize;
+    for tool in router.registry.entries() {
+        match tool.exposure {
+            ToolExposure::Direct => direct += 1,
+            ToolExposure::DirectModelOnly => direct_model_only += 1,
+            ToolExposure::Deferred => deferred += 1,
+            ToolExposure::DeferredModelOnly => deferred_model_only += 1,
+            ToolExposure::CodeModeOnly => code_mode_only += 1,
+            ToolExposure::Hidden => hidden += 1,
+        }
+    }
+
+    let tool_mode = match router.tool_mode {
+        ToolMode::Direct => "direct",
+        ToolMode::CodeMode => "code_mode",
+        ToolMode::CodeModeOnly => "code_mode_only",
+    };
+    for (exposure, count) in [
+        (EXPOSURE_DIRECT, direct),
+        (EXPOSURE_DIRECT_MODEL_ONLY, direct_model_only),
+        (EXPOSURE_DEFERRED, deferred),
+        (EXPOSURE_DEFERRED_MODEL_ONLY, deferred_model_only),
+        (EXPOSURE_CODE_MODE_ONLY, code_mode_only),
+        (EXPOSURE_HIDDEN, hidden),
+    ] {
+        telemetry.histogram_with_boundaries(
+            TOOL_REGISTRATIONS_METRIC,
+            i64::try_from(count).unwrap_or(i64::MAX),
+            TOOL_REGISTRATIONS_METRIC_BUCKETS,
+            &[("exposure", exposure), ("tool_mode", tool_mode)],
+        );
     }
 }
 

@@ -16,6 +16,7 @@ use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -281,7 +282,7 @@ impl CoreShellActionProvider {
         };
         match stopwatch
             .pause_for(async {
-                let (turn_context, step_settings, strict_auto_review) = self
+                let (turn_context, settings, _, strict_auto_review) = self
                     .session
                     .active_turn_context_and_strict_auto_review()
                     .await
@@ -293,8 +294,9 @@ impl CoreShellActionProvider {
                     })?;
                 let approval_ctx = ApprovalContext {
                     review_context: GuardianReviewContext::from_resolved_settings(
-                        turn_context,
-                        &step_settings,
+                        Arc::clone(&turn_context),
+                        &settings,
+                        self.review_context.environments(),
                     ),
                     // The running process can outlive its launching tool or code-mode cell.
                     cancellation_token: None,
@@ -368,9 +370,12 @@ impl CoreShellActionProvider {
                             EscalationDecision::deny(Some(rejection))
                         }
                         ReviewDecision::TimedOut => EscalationDecision::deny(Some(
-                            crate::guardian::guardian_timeout_message(
+                            ResolvedModelMessages::from_model(
                                 self.review_context.turn().model_info(),
-                            ),
+                            )
+                            .auto_review()
+                            .timeout_instructions
+                            .to_string(),
                         )),
                         ReviewDecision::ApprovedMcpPolicyAmendment => {
                             error!("Shell escalation received ApprovedMcpPolicyAmendment");
@@ -652,7 +657,6 @@ impl CoreShellCommandExecutor {
                 windows_sandbox_policy_cwd: self.sandbox_policy_cwd.clone().into(),
                 windows_sandbox_workspace_roots: self.windows_sandbox_workspace_roots.clone(),
                 windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: false,
                 permission_profile: self.permission_profile.clone(),
                 windows_sandbox_filesystem_overrides: None,
                 arg0: self.arg0.clone(),
@@ -713,7 +717,8 @@ impl CoreShellCommandExecutor {
                     env,
                     permission_profile: &self.permission_profile,
                     additional_permissions: None,
-                })?
+                })
+                .await?
             }
             EscalationExecution::Permissions(
                 EscalationPermissions::AdditionalPermissionProfile(permission_profile),
@@ -725,7 +730,8 @@ impl CoreShellCommandExecutor {
                     env,
                     permission_profile: &self.permission_profile,
                     additional_permissions: Some(permission_profile),
-                })?
+                })
+                .await?
             }
             EscalationExecution::Permissions(EscalationPermissions::ResolvedPermissionProfile(
                 permissions,
@@ -737,7 +743,8 @@ impl CoreShellCommandExecutor {
                     env,
                     permission_profile: &permissions.permission_profile,
                     additional_permissions: None,
-                })?
+                })
+                .await?
             }
         };
 
@@ -745,7 +752,7 @@ impl CoreShellCommandExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_sandboxed_exec(
+    async fn prepare_sandboxed_exec(
         &self,
         params: PrepareSandboxedExecParams<'_>,
     ) -> anyhow::Result<PreparedExec> {
@@ -763,7 +770,7 @@ impl CoreShellCommandExecutor {
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Auto,
-            self.windows_sandbox_level,
+            SandboxType::None,
             self.network.is_some(),
         );
         let cwd = PathUri::from_abs_path(workdir);
@@ -788,16 +795,16 @@ impl CoreShellCommandExecutor {
             environment_id: self.network_environment_id.as_deref(),
             network: self.network.as_ref(),
             sandbox_policy_cwd: &sandbox_policy_cwd,
-            codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
+            sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
             use_legacy_landlock: self.use_legacy_landlock,
             windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_private_desktop: false,
         })?;
         let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             exec_request,
             options,
             self.windows_sandbox_workspace_roots.clone(),
-        )?;
+        )
+        .await?;
         if let Some(network) = exec_request.network.as_ref() {
             network
                 .apply_to_env_for_optional_environment(

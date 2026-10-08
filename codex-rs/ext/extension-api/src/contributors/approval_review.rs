@@ -1,73 +1,13 @@
 //! Request-scoped approval decisions. A review only satisfies the review gate; the host enforces permissions.
 
-use std::fmt;
 use std::sync::Arc;
 
 use codex_protocol::ThreadId;
-use codex_protocol::approvals::GuardianAssessmentOutcome;
-use codex_protocol::approvals::GuardianRiskLevel;
-use codex_protocol::approvals::GuardianUserAuthorization;
-use serde_json::Value;
 
-use crate::ConversationHistorySnapshot;
 use crate::ExtensionData;
 
 /// Thread-local state installed only after Guardian V2's async classifier initializes.
 pub struct GuardianV2Enabled;
-
-/// Classification returned by an approval reviewer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalAssessment {
-    /// Final allow-or-deny decision for the requested action.
-    pub outcome: GuardianAssessmentOutcome,
-    /// Risk level assigned to the action by the reviewer.
-    pub risk_level: GuardianRiskLevel,
-    /// Whether the conversation authorizes the requested action.
-    pub user_authorization: GuardianUserAuthorization,
-    /// Human-readable explanation of the assessment.
-    pub rationale: String,
-}
-
-/// Operational failure returned by an approval reviewer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApprovalReviewError {
-    /// The reviewer could not produce a valid assessment.
-    Failed(String),
-    /// The request exceeded its synchronous review deadline.
-    TimedOut,
-    /// The request was cancelled by its parent approval.
-    Cancelled,
-}
-
-impl fmt::Display for ApprovalReviewError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Failed(message) => write!(formatter, "approval review failed: {message}"),
-            Self::TimedOut => formatter.write_str("approval review timed out"),
-            Self::Cancelled => formatter.write_str("approval review was cancelled"),
-        }
-    }
-}
-
-impl std::error::Error for ApprovalReviewError {}
-
-/// Immutable context for reviewing an existing host-owned approval action.
-pub struct ApprovalReviewInput<'a> {
-    /// Structured action evidence rendered by the host's existing approval path.
-    pub action: &'a Value,
-    /// Canonical immutable conversation snapshot captured before review.
-    pub conversation_history: Arc<dyn ConversationHistorySnapshot>,
-    /// Stable host-owned thread identifier.
-    pub thread_id: ThreadId,
-    /// Store scoped to this thread runtime.
-    pub thread_store: &'a ExtensionData,
-    /// Stable host-owned turn identifier.
-    pub turn_id: &'a str,
-    /// Policy reason that caused the host to request approval.
-    pub approval_reason: Option<&'a str>,
-    /// Reason an earlier request is being retried, when applicable.
-    pub retry_reason: Option<&'a str>,
-}
 
 /// Guardian's choice for one approval. Synchronous results pass through unchanged.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,18 +18,25 @@ pub enum ApprovalDecision {
     AskUser,
 }
 
-/// Runs the existing synchronous review for the bound action and cancellation token.
-/// Implementations must not resolve policy or reuse an async score.
+/// Runs an extension-owned review already bound to an action by the host.
+/// `None` requests the host user flow when automatic review exhausts its input budget
+/// and host policy permits it. An optional async approval resolves only when current
+/// cached evidence authorizes the action; it races the complete synchronous review.
 pub trait SynchronousApprovalReviewer: Send + Sync {
-    fn review(
-        &self,
+    fn review<'a>(
+        &'a self,
         reason: codex_protocol::approvals::GuardianReviewReason,
-    ) -> crate::ExtensionFuture<'_, codex_protocol::protocol::ReviewDecision>;
+        async_approval: Option<crate::ExtensionFuture<'a, ()>>,
+    ) -> crate::ExtensionFuture<'a, Option<codex_protocol::protocol::ReviewDecision>>;
 }
 
 /// Inputs to Guardian's policy choice. Conversation and scores stay thread-owned.
 pub struct ApprovalDecisionInput<'a> {
     pub approval_id: &'a str,
+    /// Host tool invocation being approved, absent for approvals without a tool call.
+    pub tool_call_id: Option<&'a str>,
+    /// Host-resolved permission evidence; unavailable evidence cannot authorize cached approval.
+    pub permissions: Option<&'a codex_guardian_context::PermissionContext>,
     pub action: &'a serde_json::Value,
     pub thread_id: ThreadId,
     pub thread_store: &'a ExtensionData,

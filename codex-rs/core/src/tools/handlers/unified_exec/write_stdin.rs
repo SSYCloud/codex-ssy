@@ -1,8 +1,11 @@
 use crate::function_tool::FunctionCallError;
+use codex_features::Feature;
+
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
@@ -79,6 +82,18 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if turn
+            .config
+            .features
+            .get()
+            .enabled(Feature::StableEnvironmentTools)
+        {
+            resolve_tool_environment(
+                &step_context,
+                /*environment_id*/ None,
+                "unified exec is unavailable in this session",
+            )?;
+        }
         let context =
             UnifiedExecContext::new(session.clone(), step_context, cancellation_token, call_id);
         let response = session
@@ -91,7 +106,12 @@ impl WriteStdinHandler {
                     input: &args.chars,
                     yield_time_ms: args.yield_time_ms,
                     max_output_tokens: args.max_output_tokens,
-                    truncation_policy: turn.model_info().truncation_policy.into(),
+                    truncation_policy: context
+                        .step_context
+                        .settings
+                        .model_info
+                        .truncation_policy
+                        .into(),
                     interaction_event: Some(WriteStdinInteractionEvent {
                         session: &session,
                         turn: &turn,

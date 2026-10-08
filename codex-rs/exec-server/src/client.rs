@@ -45,6 +45,7 @@ use crate::environment::EnvironmentConnectionState;
 use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
+use crate::process_telemetry::trace_process_id;
 use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
 use crate::protocol::CapabilityRootsDiscoverParams;
 use crate::protocol::CapabilityRootsDiscoverResponse;
@@ -79,6 +80,7 @@ use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
 use crate::protocol::FS_REMOVE_METHOD;
 use crate::protocol::FS_WALK_METHOD;
+use crate::protocol::FS_WRITE_BLOCK_METHOD;
 use crate::protocol::FS_WRITE_FILE_METHOD;
 use crate::protocol::FsCanonicalizeParams;
 use crate::protocol::FsCanonicalizeResponse;
@@ -90,6 +92,7 @@ use crate::protocol::FsCreateDirectoryParams;
 use crate::protocol::FsCreateDirectoryResponse;
 use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsGetMetadataResponse;
+use crate::protocol::FsOpenMode;
 use crate::protocol::FsOpenParams;
 use crate::protocol::FsOpenResponse;
 use crate::protocol::FsReadBlockParams;
@@ -102,6 +105,8 @@ use crate::protocol::FsRemoveParams;
 use crate::protocol::FsRemoveResponse;
 use crate::protocol::FsWalkParams;
 use crate::protocol::FsWalkResponse;
+use crate::protocol::FsWriteBlockParams;
+use crate::protocol::FsWriteBlockResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
 use crate::protocol::HTTP_REQUEST_BODY_DELTA_METHOD;
@@ -120,6 +125,16 @@ use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
+use crate::protocol::WireFsCanonicalizeParams;
+use crate::protocol::WireFsCopyParams;
+use crate::protocol::WireFsCreateDirectoryParams;
+use crate::protocol::WireFsGetMetadataParams;
+use crate::protocol::WireFsOpenParams;
+use crate::protocol::WireFsReadDirectoryParams;
+use crate::protocol::WireFsReadFileParams;
+use crate::protocol::WireFsRemoveParams;
+use crate::protocol::WireFsWalkParams;
+use crate::protocol::WireFsWriteFileParams;
 use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::rpc::RpcCallError;
@@ -138,9 +153,13 @@ mod provisioning_tests;
 mod recovery;
 #[path = "client_refresh.rs"]
 mod refresh;
-#[cfg(test)]
+pub(crate) use connection_failure::can_retry_connection_attempt;
 pub(crate) use recovery::is_environment_offline_error;
 pub(crate) use recovery::is_retryable_recovery_error;
+
+#[path = "client/connection_failure.rs"]
+mod connection_failure;
+use connection_failure::ConnectionFailure;
 pub(crate) use recovery::is_retryable_registry_error;
 pub(crate) use recovery::registry_recovery_retry_delay;
 use refresh::ConnectionAttempt;
@@ -275,12 +294,14 @@ struct Inner {
     session_id: OnceLock<String>,
     retired: CancellationToken,
     /// Caches metadata from initialization or the first successful info request for this client's lifetime.
-    environment_info: OnceCell<EnvironmentInfo>,
+    environment_info: OnceCell<Arc<EnvironmentInfo>>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
 }
 
 struct ConnectionState {
     status: ConnectionStatus,
+    // Publish registration renewal together with the recovered transport.
+    executor_registration_id: Option<String>,
     active_process_starts: usize,
     environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
@@ -288,7 +309,7 @@ struct ConnectionState {
 enum ConnectionStatus {
     Connected(Arc<RpcClient>),
     Recovering,
-    Failed(String),
+    Failed(ConnectionFailure),
 }
 
 impl ConnectionState {
@@ -309,7 +330,8 @@ impl ConnectionState {
         let _ = self
             .environment_connection_state_tx
             .send_if_modified(|current| {
-                if *current == state {
+                // A terminal failure must wake callers waiting on recovery.
+                if *current == state && !matches!(self.status, ConnectionStatus::Failed(_)) {
                     false
                 } else {
                     *current = state;
@@ -337,6 +359,7 @@ pub struct ExecServerClient {
 /// `timeout_for_error` keeps diagnostics tied to the caller's configured
 /// budget after readiness has consumed part of that budget.
 pub(crate) struct NoiseInitializeContext {
+    pub(crate) executor_registration_id: String,
     pub(crate) span: tracing::Span,
     pub(crate) timeout_for_error: Duration,
 }
@@ -526,7 +549,7 @@ impl LazyRemoteExecServerClient {
                 || self.startup.result.get().is_some_and(|result| {
                     result
                         .as_ref()
-                        .is_err_and(|error| recovery::is_retryable_recovery_error(error))
+                        .is_err_and(|error| can_retry_connection_attempt(error))
                 })) {
             Box::pin(self.reconnect()).await
         } else {
@@ -588,6 +611,11 @@ impl LazyRemoteExecServerClient {
             .filter(|client| !client.is_disconnected())
     }
 
+    pub(crate) fn cached_executor_registration_id(&self) -> Option<String> {
+        self.cached_client()
+            .and_then(|client| client.executor_registration_id())
+    }
+
     fn cached_client(&self) -> Option<ExecServerClient> {
         self.current_client
             .lock()
@@ -628,7 +656,7 @@ impl HttpClient for LazyRemoteExecServerClient {
 
 impl LazyRemoteExecServerClient {
     pub(crate) async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
-        self.get().await?.environment_info().await
+        Ok(self.get().await?.environment_info().await?.as_ref().clone())
     }
 }
 
@@ -648,6 +676,8 @@ pub enum ExecServerError {
     WebSocketConfiguration(String),
     #[error("timed out waiting for exec-server initialize handshake after {timeout:?}")]
     InitializeTimedOut { timeout: Duration },
+    #[error(transparent)]
+    ApplicationNetworkPolicy(#[from] codex_http_client::NetworkPolicyDenied),
     #[error("exec-server transport closed")]
     Closed,
     #[error("{0}")]
@@ -658,6 +688,8 @@ pub enum ExecServerError {
     Json(#[from] serde_json::Error),
     #[error("HTTP request failed: {0}")]
     HttpRequest(String),
+    #[error("authentication required: {0}")]
+    AuthenticationRequired(String),
     #[error("exec-server protocol error: {0}")]
     Protocol(String),
     #[error(
@@ -683,6 +715,15 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    fn executor_registration_id(&self) -> Option<String> {
+        self.inner
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .executor_registration_id
+            .clone()
+    }
+
     fn attach_environment_connection_state(
         &self,
         state_tx: watch::Sender<EnvironmentConnectionState>,
@@ -717,9 +758,7 @@ impl ExecServerClient {
             ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => Err(
                 ExecServerError::Disconnected("exec-server environment is recovering".to_string()),
             ),
-            ConnectionStatus::Failed(message) => {
-                Err(ExecServerError::Disconnected(message.clone()))
-            }
+            ConnectionStatus::Failed(message) => Err(message.clone().into()),
         }
     }
 
@@ -794,11 +833,11 @@ impl ExecServerClient {
         self.call(EXEC_METHOD, &params).await
     }
 
-    /// Returns cached executor metadata, fetching it lazily if initialization omitted it.
-    pub async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+    /// Returns shared cached executor metadata, fetching it lazily if initialization omitted it.
+    pub async fn environment_info(&self) -> Result<Arc<EnvironmentInfo>, ExecServerError> {
         self.inner
             .environment_info
-            .get_or_try_init(|| self.force_environment_info())
+            .get_or_try_init(|| async { self.force_environment_info().await.map(Arc::new) })
             .await
             .cloned()
     }
@@ -807,11 +846,25 @@ impl ExecServerClient {
     // TODO: Remove after app-server migrates off this call.
     pub async fn force_environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         let rpc_client = self.rpc_client().await?;
-        self.map_rpc_call_result(
-            rpc_client
-                .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
-                .await,
+        // Bound sending as well as receiving: a stuck transport can fill the outbound queue.
+        let result = timeout(
+            ENVIRONMENT_INFO_TIMEOUT,
+            rpc_client.call(ENVIRONMENT_INFO_METHOD, &()),
         )
+        .await;
+        match result {
+            Ok(result) => self.map_rpc_call_result(result),
+            Err(_) => {
+                let error = ExecServerError::from(RpcCallError::TimedOut {
+                    method: ENVIRONMENT_INFO_METHOD.to_string(),
+                    timeout: ENVIRONMENT_INFO_TIMEOUT,
+                });
+                // Retire only the connection we probed; recovery ignores a stale client.
+                rpc_client.close_transport().await;
+                self.inner.request_recovery(rpc_client, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     pub async fn read_environment_config(
@@ -900,11 +953,25 @@ impl ExecServerClient {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, ExecServerError> {
-        self.call(FS_READ_FILE_METHOD, &params).await
+        self.call(FS_READ_FILE_METHOD, &WireFsReadFileParams::from(params))
+            .await
     }
 
     pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
-        self.call(FS_OPEN_METHOD, &params).await
+        // Older executors ignore the mode field and could silently return a read-only handle.
+        if params.mode == FsOpenMode::Replace
+            && !self
+                .environment_info()
+                .await?
+                .capabilities
+                .file_write_streaming
+        {
+            return Err(ExecServerError::Protocol(
+                "exec-server does not support writable file streams".to_string(),
+            ));
+        }
+        self.call(FS_OPEN_METHOD, &WireFsOpenParams::from(params))
+            .await
     }
 
     pub async fn fs_read_block(
@@ -912,6 +979,23 @@ impl ExecServerClient {
         params: FsReadBlockParams,
     ) -> Result<FsReadBlockResponse, ExecServerError> {
         self.call(FS_READ_BLOCK_METHOD, &params).await
+    }
+
+    pub async fn fs_write_block(
+        &self,
+        params: FsWriteBlockParams,
+    ) -> Result<FsWriteBlockResponse, ExecServerError> {
+        if !self
+            .environment_info()
+            .await?
+            .capabilities
+            .file_write_streaming
+        {
+            return Err(ExecServerError::Protocol(
+                "exec-server does not support writable file streams".to_string(),
+            ));
+        }
+        self.call(FS_WRITE_BLOCK_METHOD, &params).await
     }
 
     pub async fn fs_close(
@@ -925,52 +1009,77 @@ impl ExecServerClient {
         &self,
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, ExecServerError> {
-        self.call(FS_WRITE_FILE_METHOD, &params).await
+        self.call(FS_WRITE_FILE_METHOD, &WireFsWriteFileParams::from(params))
+            .await
     }
 
     pub async fn fs_create_directory(
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, ExecServerError> {
-        self.call(FS_CREATE_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_CREATE_DIRECTORY_METHOD,
+            &WireFsCreateDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_get_metadata(
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, ExecServerError> {
-        self.call(FS_GET_METADATA_METHOD, &params).await
+        self.call(
+            FS_GET_METADATA_METHOD,
+            &WireFsGetMetadataParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_canonicalize(
         &self,
         params: FsCanonicalizeParams,
     ) -> Result<FsCanonicalizeResponse, ExecServerError> {
-        self.call(FS_CANONICALIZE_METHOD, &params).await
+        self.call(
+            FS_CANONICALIZE_METHOD,
+            &WireFsCanonicalizeParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_read_directory(
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, ExecServerError> {
-        self.call(FS_READ_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_READ_DIRECTORY_METHOD,
+            &WireFsReadDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_walk(&self, params: FsWalkParams) -> Result<FsWalkResponse, ExecServerError> {
-        self.call(FS_WALK_METHOD, &params).await
+        self.call(FS_WALK_METHOD, &WireFsWalkParams::from(params))
+            .await
     }
 
     pub async fn fs_remove(
         &self,
         params: FsRemoveParams,
     ) -> Result<FsRemoveResponse, ExecServerError> {
-        self.call(FS_REMOVE_METHOD, &params).await
+        self.call(FS_REMOVE_METHOD, &WireFsRemoveParams::from(params))
+            .await
     }
 
     pub async fn fs_copy(&self, params: FsCopyParams) -> Result<FsCopyResponse, ExecServerError> {
-        self.call(FS_COPY_METHOD, &params).await
+        self.call(FS_COPY_METHOD, &WireFsCopyParams::from(params))
+            .await
     }
 
+    #[tracing::instrument(
+        name = "codex.exec_server.process_start",
+        skip_all,
+        fields(process.id = trace_process_id(params.process_id.as_str())),
+    )]
     pub(crate) async fn start_process(
         &self,
         params: ExecParams,
@@ -1129,9 +1238,7 @@ impl ExecServerClient {
                 Some(Ok(()))
             }
             ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => None,
-            ConnectionStatus::Failed(message) => {
-                Some(Err(ExecServerError::Disconnected(message.clone())))
-            }
+            ConnectionStatus::Failed(message) => Some(Err(message.clone().into())),
         }
     }
 
@@ -1184,6 +1291,9 @@ impl ExecServerClient {
         let inner = Arc::new(Inner {
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Connected(Arc::clone(&rpc_client)),
+                executor_registration_id: noise_context
+                    .as_ref()
+                    .map(|context| context.executor_registration_id.clone()),
                 active_process_starts: 0,
                 environment_connection_state_tx: watch::channel(
                     EnvironmentConnectionState::Connected,
@@ -1217,7 +1327,7 @@ impl ExecServerClient {
             .await?;
         if let Some(info) = initialize_response.environment_info {
             assert!(
-                client.inner.environment_info.set(info).is_ok(),
+                client.inner.environment_info.set(Arc::new(info)).is_ok(),
                 "new client metadata cache must be empty"
             );
         }
@@ -1628,8 +1738,8 @@ impl Inner {
         // Do not register a process session that can never receive environment
         // notifications. Without this check, remote MCP startup could create a
         // dead session and wait for process output that will never arrive.
-        if let Some(message) = self.failure_message() {
-            return Err(ExecServerError::Disconnected(message));
+        if let Some(message) = self.connection_failure() {
+            return Err(message.into());
         }
         let sessions = self.sessions.load();
         if sessions.contains_key(process_id) {
@@ -1845,6 +1955,7 @@ mod tests {
 
     use super::ExecServerClient;
     use super::ExecServerClientConnectOptions;
+    use super::ExecServerError;
     use super::LazyRemoteExecServerClient;
     use crate::EnvironmentObservedStatus;
     use crate::ProcessId;
@@ -1869,6 +1980,10 @@ mod tests {
     use crate::protocol::ExecOutputStream;
     use crate::protocol::ExecParams;
     use crate::protocol::ExecResponse;
+    use crate::protocol::FS_OPEN_METHOD;
+    use crate::protocol::FsOpenMode;
+    use crate::protocol::FsOpenParams;
+    use crate::protocol::FsWriteBlockParams;
     use crate::protocol::INITIALIZE_METHOD;
     use crate::protocol::INITIALIZED_METHOD;
     use crate::protocol::InitializeResponse;
@@ -2543,8 +2658,9 @@ mod tests {
     #[test_case::test_case(Some(EnvironmentInfo::local()); "from_initialize")]
     #[test_case::test_case(Some(EnvironmentInfo {
         executor_version: "1.2.3-alpha.4".to_string(),
+        provider_id: Some("sha256:fb4f62da3e84f6864dcec8ede7bc66f1c96ecaeaf55f8a786b85df994057c8ac".to_string()),
         ..EnvironmentInfo::local()
-    }); "with_executor_version")]
+    }); "with_executor_metadata")]
     #[test_case::test_case(None; "legacy_server")]
     #[tokio::test]
     async fn environment_info_is_cached(
@@ -2592,15 +2708,93 @@ mod tests {
         })
         .await?;
 
-        assert_eq!(client.environment_info().await?, expected_info);
+        let info = client.environment_info().await?;
+        assert_eq!(info.as_ref(), &expected_info);
         server.await?;
         // The server is gone, so a cloned client must use the shared cache.
-        assert_eq!(client.clone().environment_info().await?, expected_info);
+        let cached_info = client.clone().environment_info().await?;
+        assert_eq!(cached_info.as_ref(), &expected_info);
+        assert!(Arc::ptr_eq(&info, &cached_info));
         Ok(())
     }
 
+    /// Old executors must never receive writable opens they would silently treat as reads.
     #[tokio::test]
-    async fn remote_websocket_client_resumes_session() {
+    async fn writable_file_streams_require_executor_capability() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let read_open = FsOpenParams {
+            handle_id: "read-handle".to_string(),
+            path: PathUri::parse("file:///tmp/existing.txt")?,
+            mode: FsOpenMode::Read,
+            sandbox: None,
+        };
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_websocket(&listener).await;
+            let mut info = EnvironmentInfo::local();
+            info.capabilities.file_write_streaming = false;
+            complete_websocket_initialize_with_environment_info(
+                &mut websocket,
+                "session-1",
+                /*expected_resume_session_id*/ None,
+                Some(info),
+            )
+            .await;
+            let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut websocket).await
+            else {
+                panic!("expected read-only open");
+            };
+            assert_eq!(request.method, FS_OPEN_METHOD);
+            assert_eq!(
+                request.params,
+                Some(serde_json::json!({
+                    "handleId": "read-handle",
+                    "path": "file:///tmp/existing.txt",
+                    "mode": "read",
+                    "sandbox": null,
+                }))
+            );
+            write_jsonrpc_websocket(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({ "handleId": "read-handle" }),
+                }),
+            )
+            .await;
+        });
+        let client = ExecServerClient::connect_websocket(RemoteExecServerConnectArgs::new(
+            websocket_url,
+            "file-stream-test".to_string(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        ))
+        .await?;
+        let error = client
+            .fs_open(FsOpenParams {
+                mode: FsOpenMode::Replace,
+                ..read_open.clone()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecServerError::Protocol(_)));
+        let error = client
+            .fs_write_block(FsWriteBlockParams {
+                handle_id: "write-handle".to_string(),
+                offset: 0,
+                chunk: vec![1].into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecServerError::Protocol(_)));
+        client.fs_open(read_open).await?;
+        server.await?;
+        Ok(())
+    }
+
+    #[test_case::test_case(false; "socket_closed")]
+    #[test_case::test_case(true; "health_check_timed_out")]
+    #[tokio::test]
+    async fn remote_websocket_client_resumes_session(health_check_timeout: bool) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -2618,7 +2812,22 @@ mod tests {
                 /*expected_resume_session_id*/ None,
             )
             .await;
-            first.close(None).await.expect("websocket should close");
+            if health_check_timeout {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut first).await
+                else {
+                    panic!("expected environment info request");
+                };
+                assert_eq!(request.method, "environment/info");
+                // Keep the socket open without answering. The client must close it itself.
+                while let Some(Ok(message)) = first.next().await {
+                    assert!(matches!(message, Message::Ping(_) | Message::Close(_)));
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            } else {
+                first.close(None).await.expect("websocket should close");
+            }
 
             let mut resumed = accept_websocket(&listener).await;
             complete_websocket_initialize(
@@ -2641,6 +2850,13 @@ mod tests {
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
         let stable_client = client.get().await.expect("client should connect");
+        if health_check_timeout {
+            let error = stable_client
+                .force_environment_info()
+                .await
+                .expect_err("unanswered health check should time out");
+            assert!(error.to_string().contains("timed out"));
+        }
         timeout(Duration::from_secs(1), resumed_rx)
             .await
             .expect("session resume should not time out")

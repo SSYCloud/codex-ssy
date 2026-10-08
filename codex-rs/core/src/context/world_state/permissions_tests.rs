@@ -1,11 +1,15 @@
 use super::*;
+use crate::context::world_state::test_support::FragmentSectionTestExt as _;
 use crate::context::world_state::test_support::render_section_cases;
 use codex_execpolicy::Decision;
+use codex_models_manager::model_info::model_info_from_slug;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ApprovalMessages;
+use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::PermissionMessages;
 use codex_protocol::protocol::AskForApproval;
 use pretty_assertions::assert_eq;
@@ -46,17 +50,24 @@ fn approved_prefix_is_rendered_without_reinjecting_permissions() {
         .expect("test prefix should be valid");
     let with_approved_prefix = permissions_state_with_default_messages(&exec_policy);
     let approved_prefix = r#"["touch", "allow-prefix.txt"]"#;
-    let without_snapshot = without_approved_prefix.snapshot();
-    let with_snapshot = with_approved_prefix.snapshot();
+    let without_snapshot = without_approved_prefix
+        .render_fragment_diff(PreviousSectionState::Absent)
+        .0
+        .unwrap();
+    let with_snapshot = with_approved_prefix
+        .render_fragment_diff(PreviousSectionState::Absent)
+        .0
+        .unwrap();
     let rendered_update = with_approved_prefix
-        .render_diff(Known(&without_snapshot))
+        .render_fragment_diff(Known(&without_snapshot))
+        .1
         .expect("approving a prefix should render a world-state update")
         .render();
 
     assert_ne!(without_snapshot, with_snapshot);
     assert_ne!(
-        without_approved_prefix.instructions,
-        with_approved_prefix.instructions
+        without_approved_prefix.instructions.body(),
+        with_approved_prefix.instructions.body()
     );
     assert!(
         !without_approved_prefix
@@ -102,19 +113,26 @@ fn renders_only_newly_approved_prefixes() {
         .add_prefix_rule(&["cargo".to_string(), "test".to_string()], Decision::Allow)
         .expect("test prefix should be valid");
     let with_new_prefix = permissions_state_with_default_messages(&exec_policy);
-    let existing_snapshot = with_existing_prefix.snapshot();
-    let current_snapshot = with_new_prefix.snapshot();
+    let existing_snapshot = with_existing_prefix
+        .render_fragment_diff(PreviousSectionState::Absent)
+        .0
+        .unwrap();
+    let current_snapshot = with_new_prefix
+        .render_fragment_diff(PreviousSectionState::Absent)
+        .0
+        .unwrap();
 
     assert_eq!(
         with_new_prefix
-            .render_diff(Known(&existing_snapshot))
+            .render_fragment_diff(Known(&existing_snapshot))
+            .1
             .map(|fragment| fragment.render()),
         Some("Approved command prefix saved:\n- [\"cargo\", \"test\"]".to_string())
     );
-    assert!(
-        with_new_prefix
-            .render_diff(Known(&current_snapshot))
-            .is_none()
+    let (snapshot, fragment) = with_new_prefix.render_fragment_diff(Known(&current_snapshot));
+    assert_eq!(
+        (snapshot, fragment.map(|fragment| fragment.render())),
+        (None, None)
     );
 }
 
@@ -138,13 +156,20 @@ fn legacy_snapshot_deserializes_and_only_suppresses_matching_full_permissions() 
     }))
     .expect("legacy world-state snapshot should deserialize");
     let expected_permissions = with_approved_prefix.instructions.render();
+    let retained = ContextualUserFragment::into(with_approved_prefix.instructions.clone());
     let mut world_state = WorldState::default();
     world_state.add_section(with_approved_prefix);
 
-    assert!(world_state.render_diff(&matching_legacy).is_empty());
+    assert!(
+        world_state
+            .render_history_fragment_diff(Some(&matching_legacy), std::slice::from_ref(&retained))
+            .1
+            .is_empty()
+    );
     assert_eq!(
         world_state
-            .render_diff(&stale_legacy)
+            .render_history_fragment_diff(Some(&stale_legacy), &[retained])
+            .1
             .into_iter()
             .map(|fragment| fragment.render())
             .collect::<Vec<_>>(),
@@ -164,7 +189,13 @@ fn removing_an_approved_prefix_renders_full_permissions() {
     let without_approved_prefix = permissions_state_with_default_messages(&Policy::empty());
 
     let rendered = without_approved_prefix
-        .render_diff(Known(&with_approved_prefix.snapshot()))
+        .render_fragment_diff(Known(
+            &with_approved_prefix
+                .render_fragment_diff(PreviousSectionState::Absent)
+                .0
+                .unwrap(),
+        ))
+        .1
         .expect("removing a prefix should refresh permissions")
         .render();
 
@@ -177,7 +208,7 @@ fn persisted_permissions_are_detected_inside_bundled_developer_messages() {
     let retained = ContextualUserFragment::into(state.instructions.clone());
     let mut world_state = super::super::WorldState::default();
     world_state.add_section(state);
-    let snapshot = world_state.snapshot();
+    let snapshot = world_state.render_full().0;
     let mut bundled_retained = retained.clone();
     let ResponseItem::Message { content, .. } = &mut bundled_retained else {
         panic!("permissions should render as a message");
@@ -191,17 +222,22 @@ fn persisted_permissions_are_detected_inside_bundled_developer_messages() {
 
     assert_eq!(
         world_state
-            .render_history_diff(/*previous*/ None, std::slice::from_ref(&retained))
+            .render_history_fragment_diff(/*previous*/ None, std::slice::from_ref(&retained))
+            .1
             .len(),
         1,
     );
     assert_eq!(
-        world_state.render_history_diff(Some(&snapshot), &[]).len(),
+        world_state
+            .render_history_fragment_diff(Some(&snapshot), &[])
+            .1
+            .len(),
         1,
     );
     assert!(
         world_state
-            .render_history_diff(Some(&snapshot), &[bundled_retained])
+            .render_history_fragment_diff(Some(&snapshot), &[bundled_retained])
+            .1
             .is_empty()
     );
 }
@@ -221,32 +257,34 @@ fn permissions_state(
         workspace_write: Some("Workspace write.".to_string()),
         read_only: Some("Read only.".to_string()),
     };
+    let mut model = model_info_from_slug("test-model");
+    model.model_messages = Some(ModelMessages {
+        approvals: Some(approval_messages),
+        permissions: Some(permission_messages),
+        ..Default::default()
+    });
+    let model_messages = ResolvedModelMessages::from_model(&model);
     PermissionsState::new(
         &permission_profile,
         approval_policy,
-        ApprovalPromptContext::new(
-            ApprovalsReviewer::User,
-            Some(&approval_messages),
-            Some(&permission_messages),
-        ),
+        ApprovalPromptContext::new(ApprovalsReviewer::User, model_messages),
         &Policy::empty(),
         Path::new("/workspace"),
+        /*paths*/ None,
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     )
 }
 
 fn permissions_state_with_default_messages(exec_policy: &Policy) -> PermissionsState {
+    let model_messages = ResolvedModelMessages::bundled();
     PermissionsState::new(
         &PermissionProfile::read_only(),
         AskForApproval::OnRequest,
-        ApprovalPromptContext::new(
-            ApprovalsReviewer::User,
-            /*messages*/ None,
-            /*permission_messages*/ None,
-        ),
+        ApprovalPromptContext::new(ApprovalsReviewer::User, model_messages),
         exec_policy,
         Path::new("/workspace"),
+        /*paths*/ None,
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     )

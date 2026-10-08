@@ -68,7 +68,6 @@ fn test_exec_request(
     cwd: AbsolutePathBuf,
     env: HashMap<String, String>,
 ) -> ExecRequest {
-    let windows_sandbox_private_desktop = false;
     let permission_profile = turn.permission_profile();
     let network = None;
     let arg0 = None;
@@ -81,9 +80,13 @@ fn test_exec_request(
         ExecExpiration::DefaultTimeout,
         ExecCapturePolicy::ShellTool,
         SandboxType::None,
-        turn.config.effective_workspace_roots(),
+        turn.config
+            .effective_workspace_roots()
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("test workspace roots are host-native"),
         turn.windows_sandbox_level,
-        windows_sandbox_private_desktop,
         permission_profile,
         arg0,
     )
@@ -116,7 +119,7 @@ async fn exec_command_with_tty(
                 /*network_policy_decider*/ None,
                 tty,
                 Box::new(NoopSpawnLifecycle),
-                turn.environments
+                turn.initial_environments
                     .primary()
                     .expect("turn environment")
                     .environment
@@ -144,7 +147,9 @@ async fn exec_command_with_tty(
             tty,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
             permissions: TerminalPermissions::for_launch(
-                turn.environments.primary().expect("turn environment"),
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
                 turn,
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
@@ -618,7 +623,9 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             tty: true,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
             permissions: TerminalPermissions::for_launch(
-                turn.environments.primary().expect("turn environment"),
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
                 &turn,
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
@@ -654,7 +661,8 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
-    allow_terminate.notify_waiters();
+    // Retain the release even if the sole termination waiter has not registered yet.
+    allow_terminate.notify_one();
     let terminated = tokio::time::timeout(Duration::from_secs(2), terminate_task)
         .await
         .expect("terminate should finish")
@@ -701,7 +709,9 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             tty: true,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
             permissions: TerminalPermissions::for_launch(
-                turn.environments.primary().expect("turn environment"),
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
                 &turn,
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
@@ -847,7 +857,8 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
 
     let remote_test_env = remote_test_env().await?;
     let (_, mut turn) = make_session_and_context().await;
-    let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0] else {
+    let TurnEnvironmentState::Ready(environment) = &mut turn.initial_environments.environments[0]
+    else {
         panic!("expected ready primary environment");
     };
     environment.environment = Arc::new(remote_test_env.environment().clone());
@@ -873,7 +884,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),
-            turn.environments
+            turn.initial_environments
                 .primary()
                 .expect("turn environment")
                 .environment
@@ -925,7 +936,9 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         let mut store = manager.process_store.lock().await;
         let entry = store.processes.get_mut(&process_id).unwrap();
         entry.permissions = TerminalPermissions::for_launch(
-            turn.environments.primary().expect("turn environment"),
+            turn.initial_environments
+                .primary()
+                .expect("turn environment"),
             &turn,
             TerminalSandboxSource::Native,
             SandboxPermissions::RequireEscalated,
@@ -936,23 +949,10 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         entry.cwd = cwd.clone();
         Arc::clone(&entry.process)
     };
-    // A queued write must acquire the terminal lock before reading active strict
-    // mode: code-mode calls can enable it while another interaction is draining.
-    {
-        let interaction = original.interaction_lock().lock_owned().await;
-        let _active_turn = session.active_turn.lock().await;
-        let mut queued = Box::pin(write_stdin(
-            &session, &turn, process_id, "queued\n", /*yield_time_ms*/ 250,
-        ));
-        let mut task_context = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        assert!(queued.as_mut().poll(&mut task_context).is_pending());
-        drop(interaction);
-        assert!(queued.as_mut().poll(&mut task_context).is_pending());
-        assert!(original.interaction_lock().try_lock_owned().is_err());
-    }
     // Empty polling must complete without an approval response.
+    // The test deadline must allow the minimum empty-poll wait.
     tokio::time::timeout(
-        Duration::from_secs(/*secs*/ 5),
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS) + Duration::from_secs(/*secs*/ 5),
         write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 250),
     )
     .await??;
@@ -980,7 +980,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         .get_mut(&process_id)
         .unwrap()
         .environment_id = turn
-        .environments
+        .initial_environments
         .primary()
         .unwrap()
         .selection
@@ -1043,6 +1043,76 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         assert!(original.interaction_lock().try_lock_owned().is_ok());
     }
     original.terminate();
+    assert!(session.terminate_background_terminal(process_id).await);
+    Ok(())
+}
+
+/// A queued write observes strict review enabled on its captured step while waiting
+/// for another terminal interaction to finish.
+#[tokio::test]
+async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use crate::tools::sandboxing::ToolError;
+    use codex_features::Feature;
+
+    skip_if_sandbox!(Ok(()));
+    let (session, turn, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.features.enable(Feature::WriteStdinApproval).unwrap();
+        },
+    )
+    .await;
+    let manager = &session.services.unified_exec_manager;
+    let opened = exec_command(
+        &session, &turn, "cat", /*yield_time_ms*/ 250, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = opened.process_id.expect("running terminal");
+    let process = Arc::clone(
+        &manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .unwrap()
+            .process,
+    );
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "write".to_string(),
+    );
+    let interaction = process.interaction_lock().lock_owned().await;
+    let mut queued = Box::pin(manager.write_stdin(
+        &context,
+        WriteStdinRequest {
+            process_id,
+            // NUL input must be rejected when strict review becomes required.
+            input: "\0",
+            yield_time_ms: 250,
+            max_output_tokens: None,
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            interaction_event: None,
+        },
+    ));
+    let mut task_context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    assert!(queued.as_mut().poll(&mut task_context).is_pending());
+    context.step_context.turn.record_granted_permissions(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        Default::default(),
+        /*strict_auto_review*/ true,
+    );
+    drop(interaction);
+    assert!(matches!(
+        queued.await,
+        Err(UnifiedExecError::StdinApproval(ToolError::Rejected(reason)))
+            if reason.contains("NUL byte")
+    ));
     assert!(session.terminate_background_terminal(process_id).await);
     Ok(())
 }

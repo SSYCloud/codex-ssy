@@ -104,6 +104,7 @@ pub struct ThreadStartParams {
     pub base_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    /// @deprecated `friendly` and `pragmatic` no longer select a style.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
     /// @deprecated Ignored. Use Ultra reasoning effort for proactive multi-agent behavior.
@@ -126,6 +127,12 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.projectId")]
     #[ts(optional = nullable)]
     pub project_id: Option<String>,
+    /// Initial Daybreak choice for this persistent thread. Omitted or null
+    /// leaves it unset. This does not select a turn's `cyberAccessProgram`
+    /// or grant access. Not supported for ephemeral threads.
+    #[experimental("thread/start.daybreakEnabled")]
+    #[ts(optional = nullable)]
+    pub daybreak_enabled: Option<bool>,
     /// Optional sticky environments for this thread.
     ///
     /// Omitted selects the default environment when environment access is
@@ -183,6 +190,9 @@ pub struct ThreadStartResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -225,6 +235,10 @@ impl ThreadStartResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSettingsUpdateParams {
     pub thread_id: String,
+    /// Replace this thread's disabled plugin IDs.
+    /// Omitted/null preserves the list; [] clears it.
+    #[ts(optional = nullable)]
+    pub disabled_plugin_ids: Option<Vec<String>>,
     /// Override the working directory for subsequent turns.
     #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
@@ -273,7 +287,8 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental("thread/settings/update.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
-    /// Override the personality for subsequent turns.
+    /// @deprecated `friendly` and `pragmatic` no longer select a style.
+    /// Changing this does not rewrite the thread's existing instructions.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
 }
@@ -287,6 +302,9 @@ pub struct ThreadSettingsUpdateResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSettings {
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
@@ -302,6 +320,7 @@ pub struct ThreadSettings {
     #[experimental("thread/settings.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
+    /// @deprecated Reports the saved setting; `friendly` and `pragmatic` no longer select a style.
     pub personality: Option<Personality>,
 }
 
@@ -393,6 +412,8 @@ pub struct ThreadResumeParams {
     pub base_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    /// @deprecated `friendly` and `pragmatic` no longer select a style.
+    /// Changing this does not rewrite the thread's existing instructions.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
     /// When true, return only thread metadata and live-resume state without
@@ -417,6 +438,9 @@ pub struct ThreadResumeResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -439,6 +463,8 @@ pub struct ThreadResumeResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Effective collaboration mode. Absent when resuming from an older server.
+    pub collaboration_mode: Option<CollaborationMode>,
     /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
     #[experimental("thread/resume.multiAgentMode")]
     #[serde(default)]
@@ -517,6 +543,15 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 /// Prefer using thread_id whenever possible.
 pub struct ThreadForkParams {
     pub thread_id: String,
+
+    /// Start from the loaded parent's effective config, tools, environments, and
+    /// persisted history to maximize prompt-cache reuse. Requires a loaded,
+    /// persisted parent and `ephemeral: true`. Enables `features.reasoning_effort_override`
+    /// on the fork. Cannot be combined with configuration overrides, `path`, `lastTurnId`,
+    /// or `beforeTurnId`.
+    #[experimental("thread/fork.experimentalPredictionMode")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_prediction_mode: bool,
 
     /// Optional last turn id to fork through, inclusive.
     ///
@@ -608,6 +643,9 @@ pub struct ThreadForkResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -812,11 +850,24 @@ impl From<codex_protocol::protocol::ThreadGoal> for ThreadGoal {
     }
 }
 
+/// Distinguishes explicit user actions from automatic goal lifecycle mutations.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadGoalMutationOrigin {
+    User,
+    Automatic,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalSetParams {
     pub thread_id: String,
+    /// Missing provenance does not supply user authorization.
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
     #[ts(optional = nullable)]
     pub objective: Option<String>,
     #[ts(optional = nullable)]
@@ -857,6 +908,9 @@ pub struct ThreadGoalGetResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalClearParams {
     pub thread_id: String,
+    /// Missing provenance does not supply user authorization.
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1225,31 +1279,6 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
     pub terminated: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-/// DEPRECATED: `thread/rollback` will be removed soon.
-pub struct ThreadRollbackParams {
-    pub thread_id: String,
-    /// The number of turns to drop from the end of the thread. Must be >= 1.
-    ///
-    /// This only modifies the thread's history and does not revert local file changes
-    /// that have been made by the agent. Clients are responsible for reverting these changes.
-    pub num_turns: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadRollbackResponse {
-    /// The updated thread after applying the rollback, with `turns` populated.
-    ///
-    /// The ThreadItems stored in each Turn are lossy since we explicitly do not
-    /// persist all agent interactions, such as command executions. This is the same
-    /// behavior as `thread/resume`.
-    pub thread: Thread,
-}
-
 /// Replace a paginated thread's durable history with the prefix before one turn.
 ///
 /// This only changes persisted conversation history. It does not revert local file changes.
@@ -1378,6 +1407,11 @@ pub struct ThreadListParams {
     /// Optional page size; defaults to a reasonable server-side value.
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// Thread IDs to exclude before applying the result limit. Up to 100
+    /// entries; invalid IDs or a larger list are rejected, never truncated.
+    /// Send the same exclusions on each page. Omitted, null, or empty means no exclusions.
+    #[ts(optional = nullable)]
+    pub excluded_thread_ids: Option<Vec<String>>,
     /// Optional sort key; defaults to created_at.
     #[ts(optional = nullable)]
     pub sort_key: Option<ThreadSortKey>,
@@ -1569,8 +1603,8 @@ pub struct ThreadSearchResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchOccurrencesParams {
     pub thread_id: String,
-    /// Case-insensitive literal substring to find in visible user messages and final assistant
-    /// messages.
+    /// Case-insensitive literal substring to find in visible user messages and both partial and
+    /// final assistant answers.
     pub search_term: String,
     /// Opaque cursor returned by a previous call for the same thread and search term.
     #[ts(optional = nullable)]
@@ -1737,15 +1771,38 @@ pub struct ThreadItemsListParams {
     /// Optional turn id to filter by. When omitted, returns items across the thread.
     #[ts(optional = nullable)]
     pub turn_id: Option<String>,
-    /// Opaque cursor to pass to the next call to continue after the last item.
+    /// Opaque continuation cursor or an exclusive item anchor in the requested visible turn.
+    /// An item anchor requires a non-empty `turnId`; ascending (the default) returns items
+    /// after it, and descending returns items before it. Continue with the returned string cursor.
     #[ts(optional = nullable)]
-    pub cursor: Option<String>,
+    pub cursor: Option<ThreadItemsListCursor>,
     /// Optional item page size.
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
     /// Optional item pagination direction; defaults to ascending.
     #[ts(optional = nullable)]
     pub sort_direction: Option<SortDirection>,
+}
+
+/// Starting position for an item-history page.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(export_to = "v2/")]
+pub enum ThreadItemsListCursor {
+    Opaque(String),
+    Anchor(ThreadItemsListAnchor),
+}
+
+/// An exclusive item position within the requested visible turn.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type", rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadItemsListAnchor {
+    Item {
+        #[serde(rename = "itemId")]
+        #[ts(rename = "itemId")]
+        item_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1755,6 +1812,12 @@ pub struct ThreadItemEntry {
     /// Turn containing this item.
     pub turn_id: String,
     pub item: ThreadItem,
+    /// Unix timestamp (milliseconds) when the item started, if recorded by the producer.
+    #[ts(type = "number | null")]
+    pub started_at_ms: Option<i64>,
+    /// Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
+    #[ts(type = "number | null")]
+    pub completed_at_ms: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

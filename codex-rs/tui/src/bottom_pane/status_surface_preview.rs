@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use codex_protocol::ThreadId;
 use ratatui::text::Line;
 
 use super::status_line_from_segments;
@@ -33,6 +34,7 @@ pub(crate) enum StatusSurfacePreviewItem {
     EstimatedThreadCost,
     SessionId,
     FastMode,
+    Daybreak,
     RawOutput,
     WorkspaceHeadline,
     Model,
@@ -70,6 +72,7 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::EstimatedThreadCost => "~$1.82",
             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
             StatusSurfacePreviewItem::FastMode => "Fast on",
+            StatusSurfacePreviewItem::Daybreak => "Daybreak off",
             StatusSurfacePreviewItem::RawOutput => "raw output",
             StatusSurfacePreviewItem::WorkspaceHeadline => "Workspace headline",
             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
@@ -107,6 +110,7 @@ impl StatusSurfacePreviewItem {
             Self::EstimatedThreadCost,
             Self::SessionId,
             Self::FastMode,
+            Self::Daybreak,
             Self::RawOutput,
             Self::WorkspaceHeadline,
             Self::Model,
@@ -126,12 +130,14 @@ struct PreviewValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StatusSurfacePreviewData {
+    pub(crate) thread_id: Option<ThreadId>,
     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
 }
 
 impl Default for StatusSurfacePreviewData {
     fn default() -> Self {
         let mut data = Self {
+            thread_id: None,
             values: BTreeMap::new(),
         };
         for item in StatusSurfacePreviewItem::iter() {
@@ -242,7 +248,7 @@ impl StatusSurfacePreviewData {
             self.value_for(item.preview_item())
                 .map(|value| (item, value.to_string()))
         });
-        status_line_from_segments(segments, use_theme_colors)
+        status_line_from_segments(segments, use_theme_colors, self.thread_id)
     }
 }
 

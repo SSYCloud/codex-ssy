@@ -1,6 +1,8 @@
 //! User-message and shell-prompt submission behavior for `ChatWidget`.
 
 use super::*;
+use codex_app_server_protocol::ImageReference;
+use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
     pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
@@ -90,6 +92,7 @@ impl ChatWidget {
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
+            UserMessageSource::Prompt,
         )
         .0
     }
@@ -103,6 +106,7 @@ impl ChatWidget {
             user_message,
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
+            UserMessageSource::Prompt,
         )
         .1
     }
@@ -112,29 +116,80 @@ impl ChatWidget {
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
+        source: UserMessageSource,
     ) -> (bool, Option<AppCommand>) {
+        self.submit_user_message_with_prepared_images(
+            user_message,
+            history_record,
+            shell_escape_policy,
+            source,
+            /*prepared_images*/ None,
+        )
+    }
+
+    pub(super) fn submit_user_message_with_prepared_images(
+        &mut self,
+        user_message: UserMessage,
+        history_record: UserMessageHistoryRecord,
+        shell_escape_policy: ShellEscapePolicy,
+        source: UserMessageSource,
+        prepared_images: Option<Vec<UserInput>>,
+    ) -> (bool, Option<AppCommand>) {
+        self.bottom_pane.dismiss_composer_sparkle();
         if self.has_misalignment_policy_violation() {
             return (false, None);
         }
-        if self.input_queue.rate_limit_recovery_pending {
-            self.input_queue
-                .queued_user_messages
-                .push_back(QueuedUserMessage::from(user_message));
+        self.empty_state_animation.borrow_mut().dismiss();
+        if self.input_queue.rate_limit_recovery_pending || self.pending_image_submission.is_some() {
+            let model_prompt = source == UserMessageSource::Prompt
+                && (shell_escape_policy == ShellEscapePolicy::Disallow
+                    || !user_message.text.starts_with('!'));
+            // A prepared submission was accepted before any messages queued behind it.
+            let queue_index = if prepared_images.is_some() {
+                0
+            } else {
+                self.input_queue.queued_user_messages.len()
+            };
+            self.input_queue.queued_user_messages.insert(
+                queue_index,
+                QueuedUserMessage {
+                    source,
+                    ..QueuedUserMessage::new(
+                        user_message,
+                        match shell_escape_policy {
+                            ShellEscapePolicy::Allow => QueuedInputAction::Plain,
+                            ShellEscapePolicy::Disallow => QueuedInputAction::Literal,
+                        },
+                    )
+                },
+            );
             self.input_queue
                 .queued_user_message_history_records
-                .push_back(history_record);
+                .insert(queue_index, history_record);
             self.refresh_pending_input_preview();
+            if model_prompt {
+                self.bottom_pane.clear_pending_questions();
+            }
             return (true, None);
         }
         if !self.is_session_configured() {
+            let model_prompt = source == UserMessageSource::Prompt
+                && (shell_escape_policy == ShellEscapePolicy::Disallow
+                    || !user_message.text.starts_with('!'));
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
                 .queued_user_messages
-                .push_front(QueuedUserMessage::from(user_message));
+                .push_front(QueuedUserMessage {
+                    source,
+                    ..QueuedUserMessage::from(user_message)
+                });
             self.input_queue
                 .queued_user_message_history_records
                 .push_front(history_record);
             self.refresh_pending_input_preview();
+            if model_prompt {
+                self.bottom_pane.clear_pending_questions();
+            }
             return (true, None);
         }
         if user_message.text.is_empty()
@@ -169,10 +224,6 @@ impl ChatWidget {
             text_elements,
             mut mention_bindings,
         } = user_message;
-        if !self.bottom_pane.task_mentions_enabled() {
-            mention_bindings
-                .retain(|binding| crate::task_mentions::valid_thread_path(&binding.path).is_none());
-        }
 
         let render_in_history = !self.turn_lifecycle.agent_turn_running;
         let mut items: Vec<UserInput> = Vec::new();
@@ -192,16 +243,33 @@ impl ChatWidget {
 
         for image_url in &remote_image_urls {
             items.push(UserInput::Image {
-                url: image_url.clone(),
+                image: ImageReference::Inline {
+                    url: image_url.clone(),
+                },
                 detail: None,
             });
         }
 
-        for image in &local_images {
-            items.push(UserInput::LocalImage {
+        if let Some(prepared_images) = prepared_images {
+            items.extend(prepared_images);
+        } else if self.snapshot_local_images && !local_images.is_empty() {
+            self.prepare_image_submission(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                history_record,
+                source,
+            );
+            return (true, None);
+        } else {
+            items.extend(local_images.iter().map(|image| UserInput::LocalImage {
                 path: image.path.clone(),
                 detail: None,
-            });
+            }));
         }
 
         if !text.is_empty() {
@@ -211,13 +279,21 @@ impl ChatWidget {
             });
         }
 
-        let mentions = collect_tool_mentions(&text, &HashMap::new());
+        if !self.bottom_pane.task_mentions_enabled() {
+            mention_bindings
+                .retain(|binding| crate::task_mentions::valid_thread_path(&binding.path).is_none());
+        }
+
+        let reply_text = crate::async_question_reply::display_text(&text);
+        let mentions =
+            collect_tool_mentions(reply_text.as_deref().unwrap_or(&text), &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
+            .filter(|binding| binding.sigil == '$')
             .map(|binding| binding.mention.clone())
             .collect();
         let mut skill_names_lower: HashSet<String> = HashSet::new();
-        let mut selected_skill_paths: HashSet<AbsolutePathBuf> = HashSet::new();
+        let mut selected_skill_paths = HashSet::new();
         let mut selected_plugin_ids: HashSet<String> = HashSet::new();
 
         if let Some(skills) = self.bottom_pane.skills() {
@@ -226,32 +302,40 @@ impl ChatWidget {
                 .map(|skill| skill.name.to_ascii_lowercase())
                 .collect();
 
+            // TODO(anp): Preserve executor path identity through both structured skill input paths
+            // below and selection. UserInput::Skill still relies on host-native path interpretation.
             for binding in &mention_bindings {
                 let path = binding
                     .path
                     .strip_prefix("skill://")
                     .unwrap_or(binding.path.as_str());
-                let path = Path::new(path);
-                if let Some(skill) = skills.iter().find(|skill| skill.path.as_path() == path)
-                    && selected_skill_paths.insert(skill.path.clone())
+                let Some(path) = LegacyAppPathString::from_string(path).to_inferred_path_uri()
+                else {
+                    continue;
+                };
+                if let Some(skill) = skills
+                    .iter()
+                    .find(|skill| skill.path.to_inferred_path_uri().as_ref() == Some(&path))
+                    && selected_skill_paths.insert(path)
                 {
                     items.push(UserInput::Skill {
                         name: skill.name.clone(),
-                        path: skill.path.to_path_buf(),
+                        path: PathBuf::from(skill.path.as_str()),
                     });
                 }
             }
 
             let skill_mentions = find_skill_mentions_with_tool_mentions(&mentions, skills);
             for skill in skill_mentions {
-                if bound_names.contains(skill.name.as_str())
-                    || !selected_skill_paths.insert(skill.path.clone())
-                {
+                let Some(path) = skill.path.to_inferred_path_uri() else {
+                    continue;
+                };
+                if bound_names.contains(skill.name.as_str()) || !selected_skill_paths.insert(path) {
                     continue;
                 }
                 items.push(UserInput::Skill {
                     name: skill.name.clone(),
-                    path: skill.path.to_path_buf(),
+                    path: PathBuf::from(skill.path.as_str()),
                 });
             }
         }
@@ -347,7 +431,10 @@ impl ChatWidget {
         } else {
             None
         };
+        let submitted_image_display = (render_in_history && !local_images.is_empty())
+            .then(|| Self::user_message_display_from_inputs(&items));
         let client_user_message_id = uuid::Uuid::new_v4().to_string();
+        crate::startup_recovery::bind_submission(&text, &client_user_message_id);
         let pending_steer = (!render_in_history).then(|| PendingSteer {
             client_id: client_user_message_id.clone(),
             user_message: UserMessage {
@@ -358,17 +445,13 @@ impl ChatWidget {
                 mention_bindings: mention_bindings.clone(),
             },
             history_record: history_record.clone(),
+            source,
             compare_key: Self::pending_steer_compare_key_from_items(&items),
         });
-        let personality = self
-            .config
-            .personality
-            .filter(|_| self.config.features.enabled(Feature::Personality))
-            .filter(|_| self.current_model_supports_personality());
         let service_tier = self.service_tier_update_for_core();
         let active_permission_profile = self.config.permissions.active_permission_profile();
         let op = AppCommand::user_turn(
-            client_user_message_id,
+            client_user_message_id.clone(),
             items,
             self.config.cwd.to_path_buf(),
             AskForApproval::from(self.config.permissions.approval_policy.value()),
@@ -379,7 +462,6 @@ impl ChatWidget {
             service_tier,
             /*final_output_json_schema*/ None,
             collaboration_mode,
-            personality,
         );
         let submitted_message = UserMessage {
             text,
@@ -409,9 +491,14 @@ impl ChatWidget {
         if !self.submit_op(op.clone()) {
             return (false, None);
         }
+        if source == UserMessageSource::Prompt {
+            self.bottom_pane.clear_pending_questions();
+        }
         self.dismiss_backend_banner_for_new_turn();
+        self.note_realtime_typed_input(&submitted_message.text);
         if render_in_history {
             self.input_queue.user_turn_pending_start = true;
+            self.input_queue.pending_user_message_client_id = Some(client_user_message_id.clone());
         }
 
         // Persist the submitted text to cross-session message history. Mentions are encoded into
@@ -440,6 +527,11 @@ impl ChatWidget {
             }
         };
         if let Some((text, elements)) = history {
+            let reply_text = crate::async_question_reply::display_text(text);
+            let (text, elements) = match &reply_text {
+                Some(text) => (text.as_str(), &[][..]),
+                None => (text.as_str(), elements),
+            };
             self.append_message_history_entry(encode_history_mentions_at_elements(
                 text,
                 &encoded_mentions,
@@ -455,6 +547,7 @@ impl ChatWidget {
 
         if render_in_history {
             self.safety_buffering_prompt = Some(submitted_message.clone());
+            self.safety_buffering_source = source;
             if !render_before_submit {
                 self.on_user_message_display(user_message_display_for_history(
                     submitted_message,
@@ -463,7 +556,14 @@ impl ChatWidget {
             }
         }
 
-        self.transcript.needs_final_message_separator = false;
+        if render_in_history {
+            self.last_rendered_user_message_client_id = Some(client_user_message_id);
+        }
+        if let Some(display) = submitted_image_display {
+            // Match the server echo's portable media without changing the locally rendered cell.
+            self.last_rendered_user_message_display = Some(display);
+        }
+
         (true, Some(op))
     }
 
@@ -483,14 +583,13 @@ impl ChatWidget {
         remote_image_urls: Vec<String>,
     ) {
         // Preserve the user's composed payload so they can retry after changing models.
-        let local_image_paths = local_images.iter().map(|img| img.path.clone()).collect();
-        self.set_remote_image_urls(remote_image_urls);
-        self.bottom_pane.set_composer_text_with_mention_bindings(
+        self.restore_user_message_to_composer(UserMessage {
             text,
             text_elements,
-            local_image_paths,
+            local_images,
             mention_bindings,
-        );
+            remote_image_urls,
+        });
         self.add_to_history(history_cell::new_warning_event(
             self.image_inputs_not_supported_message(),
         ));

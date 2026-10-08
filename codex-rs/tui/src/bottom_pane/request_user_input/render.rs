@@ -276,30 +276,15 @@ impl RequestUserInputOverlay {
         Paragraph::new(progress_line).render(sections.progress_area, buf);
 
         // Question prompt text.
-        let question_y = sections.question_area.y;
         let answered =
             self.is_question_answered(self.current_index(), &self.composer.current_text());
-        for (offset, line) in sections.question_lines.iter().enumerate() {
-            if question_y.saturating_add(offset as u16)
-                >= sections.question_area.y + sections.question_area.height
-            {
-                break;
-            }
-            let question_line = if answered {
-                Line::from(line.clone())
-            } else {
-                Line::from(line.clone()).cyan()
-            };
-            Paragraph::new(question_line).render(
-                Rect {
-                    x: sections.question_area.x,
-                    y: question_y.saturating_add(offset as u16),
-                    width: sections.question_area.width,
-                    height: 1,
-                },
-                buf,
-            );
-        }
+        let style = if answered {
+            ratatui::style::Style::default()
+        } else {
+            ratatui::style::Style::default().fg(crate::style::accent_color())
+        };
+        crate::terminal_hyperlinks::HyperlinkParagraph::new(&sections.question_lines, style)
+            .render(sections.question_area, buf);
 
         // Build rows with selection markers for the shared selection renderer.
         let option_rows = self.option_rows();
@@ -347,7 +332,7 @@ impl RequestUserInputOverlay {
         let option_tip = if options_hidden {
             let selected = self.selected_option_index().unwrap_or(0).saturating_add(1);
             let total = self.options_len();
-            Some(super::FooterTip::new(format!("option {selected}/{total}")))
+            Some(Line::from(format!("option {selected}/{total}").dim()))
         } else {
             None
         };
@@ -362,11 +347,7 @@ impl RequestUserInputOverlay {
                 if tip_idx > 0 {
                     spans.push(TIP_SEPARATOR.into());
                 }
-                if tip.highlight {
-                    spans.push(tip.text.cyan().bold().not_dim());
-                } else {
-                    spans.push(tip.text.into());
-                }
+                spans.extend(tip.spans);
             }
             let line = Line::from(spans).dim();
             let line = truncate_line_word_boundary_with_ellipsis(line, footer_area.width as usize);

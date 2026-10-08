@@ -29,7 +29,7 @@ fn search_info_uses_connector_name_for_output_namespace_description() {
     let handler = McpHandler::new(tool_info).expect("MCP tool spec should build");
     let search_info = handler.search_info().expect("MCP search info");
 
-    let LoadableToolSpec::Namespace(namespace) = search_info.entry.output else {
+    let LoadableToolSpec::Namespace(namespace) = search_info.entry.to_loadable_spec() else {
         panic!("expected namespace search output");
     };
     assert_eq!(namespace.description, "Tools for working with Calendar.");
@@ -57,7 +57,7 @@ fn mcp_namespace_descriptions_preserve_complete_metadata() {
             description: Some(full_description.clone()),
         })
     );
-    let LoadableToolSpec::Namespace(namespace) = search_info.entry.output else {
+    let LoadableToolSpec::Namespace(namespace) = search_info.entry.to_loadable_spec() else {
         panic!("expected namespace search output");
     };
     assert_eq!(namespace.description, full_description);
@@ -83,7 +83,7 @@ fn mcp_namespace_descriptions_are_bounded_at_512_kib() {
             description: Some(full_description),
         })
     );
-    let LoadableToolSpec::Namespace(namespace) = search_info.entry.output else {
+    let LoadableToolSpec::Namespace(namespace) = search_info.entry.to_loadable_spec() else {
         panic!("expected namespace search output");
     };
     assert_eq!(namespace.description, expected_description);
@@ -92,8 +92,9 @@ fn mcp_namespace_descriptions_are_bounded_at_512_kib() {
 #[test]
 fn agent_plugin_namespace_descriptions_use_the_stricter_bound() {
     let expected_description = "é".repeat(MAX_AGENT_PLUGIN_MCP_NAMESPACE_DESCRIPTION_BYTES / 2);
+    let full_description = format!("{expected_description}overflow");
     let mut info = tool_info();
-    info.namespace_description = Some(format!("{expected_description}overflow"));
+    info.namespace_description = Some(full_description.clone());
     let handler = McpHandler::new_agent_plugin(info).expect("MCP tool spec should build");
     let search_info = handler.search_info().expect("MCP search info");
 
@@ -104,10 +105,14 @@ fn agent_plugin_namespace_descriptions_use_the_stricter_bound() {
             description: Some(expected_description.clone()),
         })
     );
-    let LoadableToolSpec::Namespace(namespace) = search_info.entry.output else {
+    let LoadableToolSpec::Namespace(namespace) = search_info.entry.to_loadable_spec() else {
         panic!("expected namespace search output");
     };
     assert_eq!(namespace.description, expected_description);
+    assert_eq!(
+        handler.tool_info().namespace_description.as_deref(),
+        Some(full_description.as_str())
+    );
 }
 
 fn tool_info() -> ToolInfo {

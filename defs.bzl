@@ -5,8 +5,9 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_mac
 load("//bazel/rules/testing:foreign_platform_binary.bzl", "foreign_platform_binary")
 load("//bazel/rules/testing/wine:wine_runtime.bzl", "WINE_TEST_TARGET_COMPATIBLE_WITH", "wine_test_runtime")
 
-# Match Cargo's Windows linker behavior so Bazel-built binaries and tests use
-# the same stack reserve on both Windows ABIs and resolve UCRT imports on MSVC.
+# Reserve 8 MiB of stack on Windows and statically link the CRT on MSVC.
+# V8's x64 allocator shim defines malloc/free; importing them from dynamic UCRT
+# as well replaces the import thunks during linking.
 WINDOWS_GNULLVM_RUSTC_LINK_FLAGS = [
     "-C",
     "link-arg=-Wl,--stack,8388608",  # 8 MiB
@@ -18,9 +19,7 @@ WINDOWS_RUSTC_LINK_FLAGS = select({
         "-C",
         "link-arg=/STACK:8388608",  # 8 MiB
         "-C",
-        "link-arg=/NODEFAULTLIB:libucrt.lib",
-        "-C",
-        "link-arg=ucrt.lib",
+        "target-feature=+crt-static",
     ],
     "//conditions:default": [],
 })
@@ -98,6 +97,7 @@ def _workspace_root_test_impl(ctx):
         ),
         RunEnvironmentInfo(
             environment = env,
+            inherited_environment = ctx.attr.env_inherit,
         ),
     ]
 
@@ -153,6 +153,7 @@ workspace_root_test = rule(
             allow_files = True,
         ),
         "env": attr.string_dict(),
+        "env_inherit": attr.string_list(),
         "runfile_env": attr.label_keyed_string_dict(
             cfg = "target",
         ),
@@ -297,8 +298,10 @@ def codex_rust_crate(
         visibility = ["//visibility:public"],
     )
 
+    package_data = DEP_DATA.get(native.package_name())
     rustc_env = {
         "BAZEL_PACKAGE": native.package_name(),
+        "CARGO_PKG_NAME": package_data["package_name"],
     } | rustc_env
 
     manifest_relpath = native.package_name()
@@ -306,7 +309,8 @@ def codex_rust_crate(
         manifest_relpath = manifest_relpath[len("codex-rs/"):]
     manifest_path = manifest_relpath + "/Cargo.toml"
 
-    binaries = DEP_DATA.get(native.package_name())["binaries"]
+    crate_version = package_data["version"]
+    binaries = package_data["binaries"]
 
     lib_srcs = crate_srcs if crate_srcs != None else native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
 
@@ -315,11 +319,11 @@ def codex_rust_crate(
     if build_script_enabled and native.glob(["build.rs"], allow_empty = True):
         cargo_build_script(
             name = name + "-build-script",
+            pkg_name = package_data["package_name"],
             srcs = ["build.rs"],
             deps = all_crate_deps(build = True),
             data = build_script_data,
-            # Some build script deps sniff version-related env vars...
-            version = "0.0.0",
+            version = crate_version,
         )
 
         maybe_deps += [name + "-build-script"]
@@ -338,6 +342,7 @@ def codex_rust_crate(
             rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
             rustc_env_files = rustc_env_files,
+            version = crate_version,
             visibility = ["//visibility:public"],
         )
 
@@ -365,8 +370,9 @@ def codex_rust_crate(
                 "--remap-path-prefix=codex-rs=",
             ],
             rustc_env = rustc_env,
-            data = test_data_extra,
+            data = test_data_extra + [binary for binary in extra_binaries if binary not in test_data_extra],
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         unit_test_kwargs = {}
@@ -381,6 +387,10 @@ def codex_rust_crate(
         workspace_root_test(
             name = unit_test_name,
             env = test_env,
+            runfile_env = {
+                binary: "CARGO_BIN_EXE_" + Label(binary).name
+                for binary in extra_binaries
+            },
             test_bin = ":" + unit_test_binary,
             workspace_root_marker = "//codex-rs/utils/cargo-bin:repo_root.marker",
             tags = test_tags,
@@ -403,10 +413,11 @@ def codex_rust_crate(
             crate_root = main,
             deps = all_crate_deps() + maybe_deps + deps_extra,
             edition = crate_edition,
-            # Keep per-binary Cargo link behavior scoped to the matching
-            # generated rust_binary instead of leaking it to sibling binaries.
+            # Scope each binary's compile data and linker flags to its generated
+            # rust_binary so they do not affect sibling binaries.
             compile_data = binary_compile_data_extra.get(binary, []),
             rustc_flags = rustc_flags_extra + binary_rustc_flags_extra.get(binary, []) + WINDOWS_RUSTC_LINK_FLAGS,
+            rustc_env = rustc_env,
             # Keep stamp = 0: rules_rust otherwise makes stable-status.txt and
             # volatile-status.txt compiler inputs, even though we only consume
             # STABLE_GIT_COMMIT. BUILD_USER and BUILD_HOST vary across developers
@@ -417,6 +428,7 @@ def codex_rust_crate(
             rustc_env_files = ["//bazel/build-info:build-commit-env"] if binary in binaries_with_build_commit else [],
             srcs = native.glob(["src/**/*.rs"]),
             stamp = 0,
+            version = crate_version,
             visibility = ["//visibility:public"],
         )
 
@@ -438,6 +450,7 @@ def codex_rust_crate(
             rustc_env = rustc_env,
             data = test_data_extra,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         binary_unit_test_kwargs = {}
@@ -569,6 +582,7 @@ def codex_rust_crate(
                 rustc_env = rustc_env,
                 target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
                 tags = test_tags + ["manual"],
+                version = crate_version,
             )
 
             workspace_root_test(
@@ -610,6 +624,7 @@ def codex_rust_crate(
                 env = integration_test_cargo_env,
                 target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
                 tags = test_tags,
+                version = crate_version,
                 **test_kwargs
             )
 
@@ -682,6 +697,7 @@ def codex_rust_crate(
             env = integration_test_cargo_env,
             target_compatible_with = WINDOWS_GNULLVM_ONLY,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         workspace_root_test(

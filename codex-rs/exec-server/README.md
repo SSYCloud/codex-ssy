@@ -25,6 +25,16 @@ The CLI entrypoint supports:
 - `--remote URL --environment-id ID [--name NAME]`
 - `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
 
+## Authentication
+
+Direct WebSocket listeners support app-server's opt-in auth flags, including `--ws-auth capability-token --ws-token-sha256 HEX`, token files, and signed bearer tokens; clients send `Authorization: Bearer TOKEN` on each connection.
+Use a protected transport or TLS proxy for remote access; authentication is checked at connection time and these flags do not apply to stdio, remote registration, or forwarding.
+
+App-server clients can supply the raw token through `environment/add.authBearerToken` or `auth_bearer_token` in an `environments.toml` URL entry; omission preserves unauthenticated behavior.
+Tokens require `wss://` or a loopback destination, are redacted in diagnostics, and are reused on reconnect without automatic refresh.
+
+## Remote connections
+
 Remote mode registers the local exec-server with the environment registry,
 then reconnects to the service-provided rendezvous websocket as the environment.
 Remote communication uses the Noise relay contract; the registry and harness
@@ -193,6 +203,7 @@ Response:
   "environmentInfo": {
     "shell": { "name": "bash", "path": "/bin/bash" },
     "executorVersion": "1.2.3-alpha.4",
+    "providerId": "sha256:fb4f62da3e84f6864dcec8ede7bc66f1c96ecaeaf55f8a786b85df994057c8ac",
     "cwd": "file:///workspace"
   }
 }
@@ -202,6 +213,12 @@ Response:
 `environment/info`, so clients can use it without a second request.
 
 `executorVersion` is the executor's package release version, or `0.0.0` when unknown.
+
+The executor caches optional `providerId` at startup using
+`codex_build_info::build_id(commit, target)`, which CI can also call for an
+explicit build target. This opaque compatibility key excludes package version
+and requires no manifest. It identifies a standard build configuration, not exact
+executable bytes. Unstamped and legacy executors may omit it.
 
 Rust clients cache this metadata for the client's lifetime, including session
 resumption. If initialization omits it, the first metadata request fetches and
@@ -417,8 +434,8 @@ for invalid or unavailable paths. Native absolute path strings are rejected;
 callers must convert them to `file:` URIs before sending requests:
 
 - `fs/readFile`
-- `fs/open`, `fs/readBlock`, and `fs/close` (internal transport for
-  `ExecutorFileSystem::read_file_stream`)
+- `fs/open`, `fs/readBlock`, `fs/writeBlock`, and `fs/close` (file handles;
+  reads also back `ExecutorFileSystem::read_file_stream`)
 - `fs/writeFile`
 - `fs/createDirectory`
 - `fs/getMetadata`
@@ -427,7 +444,11 @@ callers must convert them to `file:` URIs before sending requests:
 - `fs/remove`
 - `fs/copy`
 
-Each filesystem request accepts an optional `sandbox` object. When `sandbox`
+`fs/open.mode` is `read` (default) or `replace` (create or truncate for writing).
+Writable handles require `fileWriteStreaming`; `fs/writeBlock` writes a nonempty
+base64 `chunk` of up to 1 MiB at an explicit `offset`.
+
+Path-based filesystem requests accept an optional `sandbox` object. When `sandbox`
 contains a `ReadOnly` or `WorkspaceWrite` policy, the operation runs in a
 hidden helper process launched from the top-level `codex` executable and
 prepared through the shared sandbox transform path. Helper requests and
@@ -461,18 +482,28 @@ The crate exports:
 - `RemoteExecServerConnectArgs`
 - protocol request/response structs for process and filesystem RPCs
 - `DEFAULT_LISTEN_URL` and `ExecServerListenUrlParseError`
-- `ExecServerRuntimePaths`
+- `ExecServerRuntimeOptions`
 - `run_main()` for embedding the websocket server
 - `RemoteEnvironmentConfig` and `run_remote_environment()` for embedding remote
   registration mode
 
-Callers must pass `ExecServerRuntimePaths` and an explicitly configured
+Callers must pass `ExecServerRuntimeOptions` and an explicitly configured
 `HttpClientFactory` to `run_main()`. The top-level `codex exec-server` command
-builds these paths from the `codex` arg0 dispatch state and resolves its HTTP
-client factory from the effective Codex configuration.
+builds the runtime options from the `codex` arg0 dispatch state and startup flags,
+and resolves its HTTP client factory from the effective Codex configuration.
 `RemoteEnvironmentConfig::new(...)` also takes the auth provider and HTTP client
 factory that remote registration mode should use; the CLI builds the auth
 provider from Codex auth state before starting remote mode.
+
+`--proxy-private-ips-via-upstream` (or
+`CODEX_EXEC_SERVER_PROXY_PRIVATE_IPS_VIA_UPSTREAM=true`) allows permitted private IP
+destinations to use an inherited upstream proxy. If no valid proxy configuration
+applies to the request protocol, routing falls back to a direct connection. This
+includes unset, malformed, or unsupported proxy settings. Setting
+`allow_upstream_proxy=false` also keeps routing direct; loopback always stays local.
+Destination policy still applies to every route. Enforcing mandatory upstream routing
+would require a separate fail-closed mode. A connection failure after selecting an
+upstream proxy is returned as an error, without retrying directly.
 
 ## Example session
 

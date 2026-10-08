@@ -135,7 +135,9 @@ async fn local_mcp_startup_and_refresh_use_configured_http_client() -> Result<()
                     environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: Some(Duration::from_secs(10)),
@@ -158,6 +160,7 @@ async fn local_mcp_startup_and_refresh_use_configured_http_client() -> Result<()
         .await?;
     wait_for_mcp_server(&fixture.codex, SERVER_NAME).await?;
 
+    let current_config = fixture.codex.config().await;
     let mut refreshed_config = fixture.config.clone();
     let mut servers = refreshed_config.mcp_servers.get().clone();
     let server = servers
@@ -175,7 +178,10 @@ async fn local_mcp_startup_and_refresh_use_configured_http_client() -> Result<()
         .mcp_servers
         .set(servers)
         .expect("test MCP servers should accept the refreshed configuration");
-    fixture.codex.refresh_runtime_config(refreshed_config).await;
+    let _ = fixture
+        .codex
+        .refresh_runtime_config(current_config, refreshed_config)
+        .await;
     let result = fixture
         .codex
         .call_mcp_tool(
@@ -366,7 +372,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
         permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
         shell_environment_policy: Default::default(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
-        windows_sandbox_private_desktop: fixture.config.permissions.windows_sandbox_private_desktop,
+        windows_sandbox_type: fixture.config.permissions.windows_sandbox_type,
         use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: Some(EnvironmentMcpPolicy {
@@ -397,7 +403,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
                 },
             ])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(environments),
+                environments: Some(environments.into_requests()),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -419,6 +425,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
             client_id: None,
             callback_url: None,
             callback_port: Some(skill_callback_port),
+            ..Default::default()
         })
     );
     assert!(!servers.contains_key(DENIED_SERVER_NAME));

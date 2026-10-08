@@ -169,7 +169,7 @@ async fn opening_existing_rollout_preserves_modified_time() -> std::io::Result<(
     drop(open_log_file(&rollout_path)?);
     assert_eq!(fs::metadata(&rollout_path)?.modified()?, modified);
 
-    drop(open_rollout_for_append(&rollout_path).await?);
+    drop(open_rollout_for_append(&rollout_path, /*writer_lock*/ None).await?);
     assert_eq!(fs::metadata(&rollout_path)?.modified()?, modified);
     Ok(())
 }
@@ -189,6 +189,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
 
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
@@ -196,6 +198,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             parent_thread_id: None,
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
+            runtime_workspace_roots: None,
             originator: "test".to_string(),
             cli_version: "test".to_string(),
             source: SessionSource::Cli,
@@ -455,12 +458,6 @@ async fn load_rollout_items_preserves_security_risk_scores() -> std::io::Result<
         sampled_at: None,
     };
     let security_risk_item = RolloutItem::SecurityRiskScore(security_risk.clone());
-    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
-        assert!(crate::is_persisted_rollout_item(
-            &security_risk_item,
-            history_mode
-        ));
-    }
 
     let mut file = File::create(&rollout_path)?;
     for (ordinal, item) in [
@@ -614,6 +611,58 @@ fn strip_legacy_ghost_snapshot_keeps_checkpoint_metadata_aligned() {
             {"slot": "user"}
         ])
     );
+}
+
+#[tokio::test]
+async fn recorder_preserves_additional_tools_in_both_history_modes() -> std::io::Result<()> {
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                thread_id,
+                /*forked_from_id*/ None,
+                /*parent_thread_id*/ None,
+                SessionSource::Exec,
+                /*thread_source*/ None,
+                "test_originator".to_string(),
+                BaseInstructions::default(),
+                Vec::new(),
+            )
+            .with_history_mode(history_mode),
+        )
+        .await?;
+        let item = RolloutItem::ResponseItem(
+            ResponseItem::AdditionalTools {
+                id: None,
+                role: "developer".to_string(),
+                tools: vec![serde_json::json!({
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "Available tools.",
+                    "tools": [{"type": "function", "name": "lookup",
+                        "description": "Look up a value.",
+                        "parameters": {"type": "object", "properties": {}}}]
+                })],
+            }
+            .into(),
+        );
+        let persisted = crate::persisted_rollout_items(std::slice::from_ref(&item), history_mode);
+        recorder.record_canonical_items(&persisted).await?;
+        recorder.flush().await?;
+        let (items, loaded_thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+        assert_eq!(loaded_thread_id, Some(thread_id));
+        assert_eq!(parse_errors, 0);
+        assert_eq!(
+            serde_json::to_value(&items[1..])?,
+            serde_json::to_value([item])?
+        );
+        recorder.shutdown().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1234,6 +1283,52 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 }
 
 #[tokio::test]
+async fn list_archived_threads_without_db_keeps_threads_without_previews() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let archive_dir = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir_all(&archive_dir)?;
+    let older = ThreadId::new();
+    let newer = ThreadId::new();
+    for (timestamp, thread_id) in [
+        ("2026-07-09T00-00-00", older),
+        ("2026-07-09T00-01-00", newer),
+    ] {
+        let path = archive_dir.join(format!("rollout-{timestamp}-{thread_id}.jsonl"));
+        write_paginated_rollout(&path, thread_id, &[])?;
+    }
+
+    let mut cursor = None;
+    let mut found = Vec::new();
+    for expected_more in [true, false] {
+        let page = RolloutRecorder::list_archived_threads(
+            /*state_db_ctx*/ None,
+            &config,
+            /*page_size*/ 1,
+            cursor.as_ref(),
+            ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
+            &[],
+            /*model_providers*/ None,
+            /*cwd_filters*/ None,
+            config.model_provider_id.as_str(),
+            /*search_term*/ None,
+        )
+        .await?;
+        assert_eq!(page.items.len(), 1);
+        found.extend(
+            page.items
+                .into_iter()
+                .map(|item| (item.thread_id, item.preview)),
+        );
+        cursor = page.next_cursor;
+        assert_eq!(cursor.is_some(), expected_more);
+    }
+    assert_eq!(found, vec![(Some(newer), None), (Some(older), None)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
 -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -1298,6 +1393,8 @@ async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
         .await
         .expect("state db upsert should succeed");
 
+    let older_path = write_session_file(home.path(), "2025-01-01T13-00-00", Uuid::from_u128(9014))?;
+
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
         Some(runtime.clone()),
@@ -1325,6 +1422,25 @@ async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
         .await
         .expect("state db lookup should succeed");
     assert_eq!(stored_metadata, Some(metadata));
+    let cursor = page.next_cursor.expect("another thread remains");
+    assert_eq!(cursor.thread_id(), None);
+    runtime.close().await;
+    let fallback = RolloutRecorder::list_threads(
+        Some(runtime),
+        &config,
+        /*page_size*/ 1,
+        Some(&cursor),
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        default_provider.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(fallback.items.len(), 1);
+    assert_eq!(fallback.items[0].path, older_path);
     Ok(())
 }
 
@@ -1424,6 +1540,23 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
     )
     .await?;
     assert_eq!(repaired_state_db_only_page.items.len(), 1);
+    runtime.close().await;
+    let error = RolloutRecorder::list_threads_from_state_db(
+        Some(runtime),
+        &config,
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ Some(cwd_filters.as_slice()),
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await
+    .expect_err("a failed database query must not look like an exhausted listing");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
     Ok(())
 }
 
@@ -1797,28 +1930,23 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
         item: RolloutItem::TurnContext(TurnContextItem {
             turn_id: Some("turn-1".to_string()),
             root_turn_id: None,
+            disabled_plugin_ids: None,
             cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
                 .expect("absolute latest cwd"),
-            workspace_roots: None,
-            current_date: None,
-            timezone: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
             active_permission_profile: None,
-            network: None,
             file_system_sandbox_policy: None,
             model: "test-model".to_string(),
             comp_hash: None,
-            personality: None,
             collaboration_mode: None,
             multi_agent_version: None,
-            multi_agent_mode: None,
             realtime_active: None,
             cyber_access_program: None,
             effort: None,
-            summary: codex_protocol::config_types::ReasoningSummary::Auto,
+            summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
         }),
     };
     writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;

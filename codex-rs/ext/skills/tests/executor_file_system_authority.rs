@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -15,14 +14,20 @@ use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::DiscoveredSkillFiles;
 use codex_exec_server::EnvironmentManager;
+#[cfg(windows)]
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::ExecutorFileSystemFuture;
 use codex_exec_server::FileMetadata;
+use codex_exec_server::FileSystemEnvironmentAccessor;
 use codex_exec_server::FileSystemReadStream;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::GetMetadataOptions;
+use codex_exec_server::LOCAL_FS;
+#[cfg(windows)]
+use codex_exec_server::LocalFileSystem;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::ReadFileOptions;
 use codex_exec_server::RemoveOptions;
@@ -30,11 +35,15 @@ use codex_exec_server::WalkEntry;
 use codex_exec_server::WalkEntryKind;
 use codex_exec_server::WalkOptions;
 use codex_exec_server::WalkOutcome;
+#[cfg(windows)]
+use codex_exec_server::WindowsSandboxSelection;
 use codex_exec_server::WriteFileOptions;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::PermissionProfile;
+#[cfg(windows)]
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+#[cfg(windows)]
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::Product;
 use codex_skills_extension::ExecutorSkillProvider;
@@ -44,10 +53,13 @@ use codex_skills_extension::catalog::SkillAuthority;
 use codex_skills_extension::catalog::SkillCatalog;
 use codex_skills_extension::catalog::SkillCatalogEntry;
 use codex_skills_extension::catalog::SkillPackageId;
+#[cfg(windows)]
+use codex_skills_extension::catalog::SkillReadResult;
 use codex_skills_extension::catalog::SkillResourceId;
 use codex_skills_extension::catalog::SkillSourceKind;
 use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProvider;
+use codex_skills_extension::provider::SkillReadContext;
 use codex_skills_extension::provider::SkillReadRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -292,7 +304,7 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
     assert_eq!(skill.name, "synthetic");
     assert_eq!(
         skill.path_to_skills_md,
-        canonical_root.join("skill/SKILL.md")
+        PathUri::from_abs_path(&canonical_root.join("skill/SKILL.md"))
     );
     assert_eq!(
         snapshot.read_skill_text(&skill).await.expect("skill body"),
@@ -300,41 +312,71 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
     );
 }
 
+/// Restricted skill reads must fail closed when the Windows executor has no sandbox selected.
+#[cfg(windows)]
 #[tokio::test]
-async fn windows_executor_skill_read_rejects_disabled_sandbox_on_any_orchestrator() {
+async fn windows_executor_skill_read_requires_a_requested_sandbox() -> io::Result<()> {
+    let test_root = create_local_skill_root("windows-sandbox")?;
+    // Disabled sandbox selection must fail before launching any helper.
+    let runtime_paths = ExecServerRuntimeOptions::new(
+        std::env::current_exe()?,
+        /*codex_linux_sandbox_exe*/ None,
+    )?;
+    let file_system: Arc<dyn ExecutorFileSystem> =
+        Arc::new(LocalFileSystem::with_runtime_paths(runtime_paths));
     let provider = ExecutorSkillProvider::new_with_restriction_product(
         Arc::new(EnvironmentManager::default_for_tests()),
         /*restriction_product*/ None,
     );
-    let sandbox = FileSystemSandboxContext::from_permission_profile(
+    let resource = SkillResourceId::environment(
+        "skill://windows-root/skill/SKILL.md",
+        "local",
+        PathUri::from_host_native_path(test_root.join("skill/SKILL.md"))?,
+    );
+    let access = FileSystemEnvironmentAccessor::unrestricted(&file_system);
+    let read = provider
+        .read(SkillReadRequest {
+            authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
+            package: SkillPackageId("skill://windows-root/skill".into()),
+            resource: resource.clone(),
+            context: SkillReadContext::Executor { fs: &access },
+        })
+        .await
+        .expect("read the existing skill without sandbox restrictions");
+    assert_eq!(
+        read,
+        SkillReadResult {
+            resource: resource.clone(),
+            contents: SKILL_CONTENTS.to_string(),
+        }
+    );
+
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
         PermissionProfile::from_runtime_permissions(
             &FileSystemSandboxPolicy::restricted(Vec::new()),
             NetworkSandboxPolicy::Restricted,
         ),
+        PathUri::from_host_native_path(&test_root)?,
     );
-    let resource = SkillResourceId::environment(
-        "skill://windows-root/C:/skill/SKILL.md",
-        "local",
-        PathUri::parse("file:///C:/skill/SKILL.md").expect("Windows resource URI"),
-    );
+    sandbox.windows_sandbox_selection = WindowsSandboxSelection::Disabled;
+    let access = FileSystemEnvironmentAccessor::new(&file_system, sandbox);
     let error = provider
         .read(SkillReadRequest {
-            _lifetime: PhantomData,
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
-            package: SkillPackageId("skill://windows-root/C:/skill".into()),
-            resource,
-            resolved_executor_roots: Vec::new(),
-            sandbox: Some(sandbox),
-            host_snapshot: None,
-            mcp_resources: None,
+            package: SkillPackageId("skill://windows-root/skill".into()),
+            resource: resource.clone(),
+            context: SkillReadContext::Executor { fs: &access },
         })
         .await
         .expect_err("disabled Windows sandbox must fail closed");
-
     assert_eq!(
         error.message,
-        "executor skill resource requires an unavailable filesystem sandbox"
+        format!(
+            "failed to read executor skill resource {}: filesystem sandbox cannot be enforced on this executor",
+            resource.as_str()
+        )
     );
+    std::fs::remove_dir_all(test_root)
 }
 
 #[tokio::test]
@@ -372,7 +414,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
-            include_orchestrator_skills: false,
+            include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
         })
@@ -462,7 +504,7 @@ async fn executor_discovery_preserves_posix_and_windows_locator_alias_roots() {
                 host_snapshot: None,
                 include_host_skills: false,
                 include_bundled_skills: true,
-                include_orchestrator_skills: false,
+                include_cloud_skills: false,
                 mcp_resources: None,
                 executor_capability_discovery: Some(discovery),
             })
@@ -579,7 +621,7 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         host_snapshot: None,
         include_host_skills: false,
         include_bundled_skills: true,
-        include_orchestrator_skills: false,
+        include_cloud_skills: false,
         mcp_resources: None,
         executor_capability_discovery,
     };
@@ -592,7 +634,7 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         .snapshot(&executor_roots, &Default::default())
         .await;
     let bundled = provider
-        .list(query(Some(discovery)))
+        .list(query(Some(discovery.clone())))
         .await
         .expect("list bundled executor skills");
 
@@ -640,12 +682,52 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         .find(|entry| entry.name == "catalog:repaired")
         .expect("repaired skill");
     assert_eq!(repaired.description, "Build for AWS: ECS");
+    assert!(repaired.prompt_visible);
     let invalid_metadata = direct
         .entries
         .iter()
         .find(|entry| entry.name == "catalog:invalid-metadata")
         .expect("invalid metadata skill");
     assert_eq!(invalid_metadata.dependencies, None);
+
+    assert!(direct.entries.iter().all(|entry| entry.enabled));
+    // Match the discovery path, including aliases such as macOS's /var -> /private/var.
+    let disabled_path = PathUri::from_host_native_path(&repaired_skill).expect("skill URI");
+    for environment_id in ["local", "other-executor"] {
+        let configured = provider.clone().with_disabled_skill_paths(HashMap::from([(
+            environment_id.to_string(),
+            std::collections::HashSet::from([disabled_path.clone()]),
+        )]));
+        let mut expected = direct.clone();
+        if environment_id == "local" {
+            expected
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == "catalog:repaired")
+                .expect("repaired skill")
+                .enabled = false;
+        }
+        for discovery in [None, Some(discovery.clone())] {
+            let actual = configured
+                .list(query(discovery))
+                .await
+                .expect("list configured executor skills");
+            assert_eq!(comparable_entries(&actual), comparable_entries(&expected));
+            assert_eq!(actual.warnings, expected.warnings);
+            let visible_names = actual
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled && entry.prompt_visible)
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            let expected_visible_names = if environment_id == "local" {
+                vec!["catalog:invalid-metadata"]
+            } else {
+                vec!["catalog:invalid-metadata", "catalog:repaired"]
+            };
+            assert_eq!(visible_names, expected_visible_names);
+        }
+    }
 
     std::fs::remove_dir_all(test_root).expect("remove skill directory");
 }
@@ -691,7 +773,7 @@ async fn pre_discovered_executor_catalog_snapshot() {
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
-            include_orchestrator_skills: false,
+            include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
         })
@@ -808,7 +890,7 @@ async fn direct_executor_discovery_preserves_hidden_nested_and_probed_metadata()
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
-            include_orchestrator_skills: false,
+            include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
         })
@@ -868,7 +950,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
-            include_orchestrator_skills: false,
+            include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
         })
@@ -877,15 +959,12 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
     let [entry] = catalog.entries.as_slice() else {
         panic!("expected exactly one skill");
     };
+    let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
     let request = SkillReadRequest {
-        _lifetime: PhantomData,
         authority: entry.authority.clone(),
         package: entry.id.clone(),
         resource: entry.main_prompt.clone(),
-        resolved_executor_roots: Vec::new(),
-        sandbox: None,
-        host_snapshot: None,
-        mcp_resources: None,
+        context: SkillReadContext::Executor { fs: &access },
     };
 
     std::fs::remove_dir_all(&test_root).expect("remove skill directory after discovery");
@@ -917,7 +996,10 @@ async fn high_level_discovery_cache_separates_filesystem_permission_contexts() {
         .expect("update executor skill");
     let sandbox_contexts = HashMap::from([(
         "local".to_string(),
-        FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled),
+        FileSystemSandboxContext::from_permission_profile(
+            PermissionProfile::Disabled,
+            PathUri::from_host_native_path(&test_root).expect("skill root URI"),
+        ),
     )]);
     let second_snapshot = cache.snapshot(&executor_roots, &sandbox_contexts).await;
     let second_discovery = second_snapshot.roots()[0]

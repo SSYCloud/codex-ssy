@@ -16,8 +16,10 @@ mod loader;
 pub mod provider;
 mod render;
 mod render_observability;
+mod required;
 mod selection;
 mod shadow_selection_experiment;
+mod skills_extension_state;
 mod sources;
 mod state;
 mod telemetry;
@@ -40,10 +42,13 @@ pub use host_snapshot::HostSkillsSnapshot;
 pub use invocation::detect_implicit_skill_invocation;
 pub use provider::ExecutorSkillProvider;
 pub use provider::HostSkillProvider;
-pub use provider::OrchestratorSkillProvider;
 pub use provider::SkillProvider;
+pub use required::EnvironmentSkillRequirements;
+pub use required::validate_required_skills;
+pub(crate) use skills_extension_state::SkillsExtensionState;
 pub use sources::SkillProviderSource;
 pub use sources::SkillProviders;
+pub use state::SkillsThreadState;
 pub use telemetry::record_plugin_turn_usage;
 
 /// Recognizes persisted explicit skill prompts without exposing their fragment implementation.

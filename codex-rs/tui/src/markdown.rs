@@ -6,9 +6,9 @@
 //! - [`append_markdown`] -- general-purpose, used for plan blocks and history
 //!   cells that already hold pre-processed markdown (no fence unwrapping).
 //! - [`append_markdown_agent`] -- for agent responses.  Runs
-//!   [`unwrap_markdown_fences`] first so that `` ```md ``/`` ```markdown ``
+//!   [`normalize_markdown_for_rendering`] first so that `` ```md ``/`` ```markdown ``
 //!   fences containing tables are stripped and `pulldown-cmark` sees raw
-//!   table syntax instead of fenced code.
+//!   table syntax instead of fenced code, when `tui.rendering.tables` is enabled.
 //!
 //! ## Why fence unwrapping exists
 //!
@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use crate::inline_visualization::InlineVisualizationContext;
 use crate::inline_visualization::rewrite_inline_visualizations;
+use crate::markdown_render::ListSpacing;
 use crate::table_detect;
 use crate::terminal_hyperlinks::HyperlinkLine;
 
@@ -64,7 +65,7 @@ pub(crate) fn append_markdown_agent(
     width: Option<usize>,
     lines: &mut Vec<Line<'static>>,
 ) {
-    let normalized = unwrap_markdown_fences(markdown_source);
+    let normalized = normalize_markdown_for_rendering(markdown_source);
     let rendered = crate::markdown_render::render_markdown_text_with_width_and_cwd(
         &normalized,
         width,
@@ -73,36 +74,46 @@ pub(crate) fn append_markdown_agent(
     crate::render::line_utils::push_owned_lines(&rendered.lines, lines);
 }
 
+#[cfg(test)]
 pub(crate) fn render_markdown_agent_with_links_and_cwd(
     markdown_source: &str,
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Vec<HyperlinkLine> {
-    render_markdown_agent_with_links_cwd_and_visualizations(
+    render_markdown_agent_with_list_spacing(
         markdown_source,
         width,
         cwd,
         /*inline_visualization_context*/ None,
+        ListSpacing::AfterMultiline,
     )
 }
 
-pub(crate) fn render_markdown_agent_with_links_cwd_and_visualizations(
+pub(crate) fn render_markdown_agent_with_list_spacing(
     markdown_source: &str,
     width: Option<usize>,
     cwd: Option<&Path>,
     inline_visualization_context: Option<&InlineVisualizationContext>,
+    list_spacing: ListSpacing,
 ) -> Vec<HyperlinkLine> {
     let rewritten = rewrite_inline_visualizations(markdown_source, inline_visualization_context);
-    let normalized = unwrap_markdown_fences(&rewritten.markdown);
+    let mut code_sources = Vec::new();
+    let normalized = if crate::markdown_render::preferences::current().tables {
+        unwrap_markdown_fences_with_sources(&rewritten.markdown, &mut code_sources)
+    } else {
+        Cow::Borrowed(rewritten.markdown.as_ref())
+    };
     let is_hidden_link_destination = |destination: &str| {
         rewritten.trusted_file_links.contains_key(destination)
             || crate::markdown_render::hide_web_link_destination(destination)
     };
-    let mut lines = crate::markdown_render::render_streaming_markdown_lines_with_width_and_cwd(
+    let mut lines = crate::markdown_render::render_with_copy_sources(
         &normalized,
         width,
         cwd,
         &is_hidden_link_destination,
+        list_spacing,
+        code_sources,
     )
     .lines;
     for hyperlink in lines.iter_mut().flat_map(|line| &mut line.hyperlinks) {
@@ -122,22 +133,34 @@ pub(crate) fn render_streaming_markdown_agent_with_links_and_cwd(
     markdown_source: &str,
     width: Option<usize>,
     cwd: Option<&Path>,
+    list_spacing: ListSpacing,
 ) -> crate::markdown_render::StreamingMarkdownRender {
-    let normalized = unwrap_markdown_fences(markdown_source);
+    let normalized = normalize_markdown_for_rendering(markdown_source);
     let mut rendered = crate::markdown_render::render_streaming_markdown_lines_with_width_and_cwd(
         &normalized,
         width,
         cwd,
         &crate::markdown_render::hide_web_link_destination,
+        list_spacing,
     );
     if normalized != markdown_source {
         // Fence unwrapping removes opening/closing lines. A normalized tail that is still a raw
         // suffix necessarily begins after those removed lines, so its boundary can safely be
         // mapped back to the raw source; otherwise leave the transformed block mutable.
+        rendered.pending_math_start = rendered.pending_math_start.map(|boundary| {
+            markdown_source
+                .strip_suffix(&normalized[boundary..])
+                .map_or(0, str::len)
+        });
         rendered.last_top_level_block_start = rendered
             .last_top_level_block_start
             .and_then(|boundary| markdown_source.strip_suffix(&normalized[boundary..]))
             .map(str::len);
+        rendered.mutable_fence_start = rendered.mutable_fence_start.map(|boundary| {
+            markdown_source
+                .strip_suffix(&normalized[boundary..])
+                .map_or(0, str::len)
+        });
     }
     rendered
 }
@@ -229,6 +252,15 @@ pub(crate) fn extract_copy_targets(markdown_source: &str) -> Vec<CopyTarget> {
     targets
 }
 
+/// Apply table-fence normalization only when terminal table layouts are enabled.
+pub(crate) fn normalize_markdown_for_rendering(markdown_source: &str) -> Cow<'_, str> {
+    if crate::markdown_render::preferences::current().tables {
+        unwrap_markdown_fences(markdown_source)
+    } else {
+        Cow::Borrowed(markdown_source)
+    }
+}
+
 /// Strip `` ```md ``/`` ```markdown `` fences that contain tables, emitting their content as bare
 /// markdown so `pulldown-cmark` parses the tables natively.
 ///
@@ -240,7 +272,14 @@ pub(crate) fn extract_copy_targets(markdown_source: &str) -> Vec<CopyTarget> {
 /// The fence unwrapping is intentionally conservative: it buffers the entire fence body before
 /// deciding, and an unclosed fence at end-of-input is re-emitted with its opening line so partial
 /// streams degrade to code display.
-pub(crate) fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
+pub(crate) fn unwrap_markdown_fences(markdown_source: &str) -> Cow<'_, str> {
+    unwrap_markdown_fences_with_sources(markdown_source, &mut Vec::new())
+}
+
+fn unwrap_markdown_fences_with_sources<'a>(
+    markdown_source: &'a str,
+    sources: &mut Vec<crate::markdown_copy::SourceBlock>,
+) -> Cow<'a, str> {
     // Zero-copy fast path: most messages contain no fences at all.
     if !markdown_source.contains("```") && !markdown_source.contains("~~~") {
         return Cow::Borrowed(markdown_source);
@@ -370,7 +409,7 @@ pub(crate) fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, st
     let mut active_fence: Option<ActiveFence> = None;
     let mut source_offset = 0usize;
 
-    let mut push_source_range = |range: Range<usize>| {
+    let push_source_range = |out: &mut String, range: Range<usize>| {
         if !range.is_empty() {
             out.push_str(&markdown_source[range]);
         }
@@ -384,7 +423,7 @@ pub(crate) fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, st
         if let Some(active) = active_fence.take() {
             match active {
                 ActiveFence::Passthrough(fence) => {
-                    push_source_range(line_range);
+                    push_source_range(&mut out, line_range);
                     if !is_close_fence(line, fence) {
                         active_fence = Some(ActiveFence::Passthrough(fence));
                     }
@@ -395,15 +434,27 @@ pub(crate) fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, st
                             &content_from_ranges(markdown_source, &data.content_ranges),
                             data.fence.is_blockquoted,
                         ) {
+                            let start = out.len();
                             for range in data.content_ranges {
-                                push_source_range(range);
+                                push_source_range(&mut out, range);
+                            }
+                            let fenced = &markdown_source[data.opening_range.start..line_range.end];
+                            if let Some(CopyTarget::Code { content, .. }) =
+                                extract_copy_targets(fenced)
+                                    .into_iter()
+                                    .find(|target| matches!(target, CopyTarget::Code { .. }))
+                            {
+                                sources.push(crate::markdown_copy::SourceBlock {
+                                    range: start..out.len(),
+                                    content,
+                                });
                             }
                         } else {
-                            push_source_range(data.opening_range);
+                            push_source_range(&mut out, data.opening_range);
                             for range in data.content_ranges {
-                                push_source_range(range);
+                                push_source_range(&mut out, range);
                             }
-                            push_source_range(line_range);
+                            push_source_range(&mut out, line_range);
                         }
                     } else {
                         data.content_ranges.push(line_range);
@@ -424,22 +475,22 @@ pub(crate) fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, st
                     },
                 )));
             } else {
-                push_source_range(line_range);
+                push_source_range(&mut out, line_range);
                 active_fence = Some(ActiveFence::Passthrough(fence));
             }
             continue;
         }
 
-        push_source_range(line_range);
+        push_source_range(&mut out, line_range);
     }
 
     if let Some(active) = active_fence {
         match active {
             ActiveFence::Passthrough(_) => {}
             ActiveFence::MarkdownCandidate(data) => {
-                push_source_range(data.opening_range);
+                push_source_range(&mut out, data.opening_range);
                 for range in data.content_ranges {
-                    push_source_range(range);
+                    push_source_range(&mut out, range);
                 }
             }
         }

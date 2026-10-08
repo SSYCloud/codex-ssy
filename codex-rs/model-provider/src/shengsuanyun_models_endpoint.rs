@@ -8,10 +8,12 @@ use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::default_client::ClientRedirectPolicy;
 use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
+use codex_models_manager::manager::ModelsEndpointResponse;
 use codex_models_manager::model_info::BASE_INSTRUCTIONS;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::error::CodexErr;
@@ -28,7 +30,6 @@ use serde::Deserialize;
 use tokio::time::timeout;
 
 use crate::auth::resolve_provider_auth;
-use crate::provider::enforce_managed_residency;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSES_API_SUPPORT: &str = "/v1/responses";
@@ -71,11 +72,11 @@ impl ShengSuanYunModelsEndpoint {
         &self,
         _client_version: &str,
         http_client_factory: HttpClientFactory,
-    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+    ) -> CoreResult<ModelsEndpointResponse> {
         let auth = self.auth().await;
+        let identity = crate::models_identity::identity(&self.provider_info, auth.as_ref())?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
-        let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
-        enforce_managed_residency(&mut api_provider);
+        let api_provider = self.provider_info.to_api_provider(auth_mode)?;
         let api_auth = resolve_provider_auth(auth.as_ref(), &self.provider_info)?;
 
         let request = api_provider.build_request(Method::GET, "models");
@@ -89,6 +90,7 @@ impl ShengSuanYunModelsEndpoint {
                 http_client_factory,
                 request.url.clone(),
                 ClientRouteClass::Api,
+                ClientRedirectPolicy::Default,
             )
             .await
             .map_err(|err| CodexErr::Stream(err.to_string()))?;
@@ -117,7 +119,11 @@ impl ShengSuanYunModelsEndpoint {
                 })
                 .map(shengsuanyun_model_to_model_info)
                 .collect();
-            Ok((models, /* etag */ None))
+            Ok(ModelsEndpointResponse {
+                models,
+                etag: None,
+                identity,
+            })
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
@@ -129,6 +135,14 @@ fn map_transport_error(error: TransportError) -> CodexErr {
 }
 
 impl ModelsEndpointClient for ShengSuanYunModelsEndpoint {
+    fn identity(&self) -> Option<String> {
+        let auth = self
+            .auth_manager
+            .as_ref()
+            .and_then(|manager| manager.auth_cached());
+        crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()
+    }
+
     fn has_command_auth(&self) -> bool {
         self.provider_info.has_command_auth()
     }
@@ -142,7 +156,7 @@ impl ModelsEndpointClient for ShengSuanYunModelsEndpoint {
         &'a self,
         client_version: &'a str,
         http_client_factory: HttpClientFactory,
-    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
         Box::pin(Self::list_models(self, client_version, http_client_factory))
     }
 }
@@ -226,6 +240,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         availability_nux: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
@@ -233,7 +248,6 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
             tools: None,
             confirmation_policies: None,
             instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
-            instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: None,
@@ -241,6 +255,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
             multi_agent: None,
             token_budget: None,
             guardian_v2: None,
+            content_filter_guidance: None,
         }),
         include_skills_usage_instructions: false,
         include_plugin_usage_instructions: false,
@@ -264,6 +279,7 @@ fn shengsuanyun_model_to_model_info(model: ShengSuanYunModel) -> ModelInfo {
         supports_search_tool: false,
         supports_experimental_context: false,
         use_responses_lite: false,
+        supports_reasoning_effort_updates: false,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
@@ -328,13 +344,14 @@ mod tests {
             /* auth_manager */ None,
         );
 
-        let (models, _etag) = endpoint
+        let models = endpoint
             .list_models(
                 "0.0.0",
                 HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
             )
             .await
-            .expect("models request should succeed");
+            .expect("models request should succeed")
+            .models;
 
         assert_eq!(models.len(), 1);
         let model = &models[0];

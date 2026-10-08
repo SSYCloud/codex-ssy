@@ -53,7 +53,6 @@ const ROLE_INSTRUCTIONS: &str = "configured role developer instructions";
 /// V2 fork modes, roles, and unset/blank overrides expose their agreed instruction precedence.
 #[test_case("no history"; "no history")]
 #[test_case("full history"; "full history")]
-#[test_case("bounded history"; "bounded history")]
 #[test_case("configured role without instructions"; "configured role without instructions")]
 #[test_case("unset override"; "unset override")]
 #[test_case("blank override"; "blank override")]
@@ -61,14 +60,12 @@ const ROLE_INSTRUCTIONS: &str = "configured role developer instructions";
 #[test_case("explicit configured role"; "explicit configured role")]
 #[test_case("full history configured role"; "full history configured role")]
 #[test_case("implicit configured default"; "implicit configured default")]
-#[test_case("bounded implicit configured default"; "bounded implicit configured default")]
 #[test_case("full fork skips default role"; "full fork skips default role")]
 #[tokio::test]
 async fn spawned_subagents_apply_configured_developer_instruction_precedence(
     case: &str,
 ) -> Result<()> {
     let fork_turns = match case {
-        "bounded history" | "bounded implicit configured default" => Some("1"),
         "no history" | "explicit configured role" | "implicit configured default" => Some("none"),
         _ => None,
     };
@@ -81,8 +78,7 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
     let configured_override = match case {
         "unset override"
         | "full history configured role"
-        | "configured role without instructions"
-        | "bounded implicit configured default" => None,
+        | "configured role without instructions" => None,
         "blank override" => Some("   "),
         "full history" => Some("  child-only developer instructions  "),
         _ => Some(CHILD_INSTRUCTIONS),
@@ -98,7 +94,6 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
             | "explicit configured role"
             | "full history configured role"
             | "implicit configured default"
-            | "bounded implicit configured default"
             | "full fork skips default role"
     );
     let role_has_instructions = matches!(
@@ -106,7 +101,6 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
         "explicit configured role"
             | "full history configured role"
             | "implicit configured default"
-            | "bounded implicit configured default"
             | "full fork skips default role"
     );
     let expected = match case {
@@ -114,8 +108,7 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
         "blank override" => None,
         "explicit configured role"
         | "full history configured role"
-        | "implicit configured default"
-        | "bounded implicit configured default" => Some(ROLE_INSTRUCTIONS),
+        | "implicit configured default" => Some(ROLE_INSTRUCTIONS),
         _ => Some(CHILD_INSTRUCTIONS),
     };
     const PARENT_PROMPT: &str = "spawn the instruction override worker";
@@ -198,7 +191,7 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
     config
         .with_extra_config(&feature_config)
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build_initialized()
@@ -379,7 +372,7 @@ async fn compacted_full_history_fork_replaces_parent_developer_instructions() ->
             "[features.multi_agent_v2]\nenabled = true\nsubagent_developer_instructions = {CHILD_INSTRUCTIONS:?}"
         ))
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -635,13 +628,13 @@ async fn cold_resume_preserves_effective_developer_instructions_for_worker(
         ));
     }
     MockResponsesConfig::new(&server.uri())
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_root_config(&format!(
             "developer_instructions = {PARENT_INSTRUCTIONS:?}\nmodel_reasoning_effort = \"high\""
         ))
         .with_extra_config(&feature_config)
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let (thread_id, child_resume_params, baseline) = {
         let mut app_server = TestAppServer::builder()
@@ -650,7 +643,7 @@ async fn cold_resume_preserves_effective_developer_instructions_for_worker(
             .await?;
         let ThreadStartResponse { thread, .. } = app_server
             .start_thread(ThreadStartParams {
-                model: Some("gpt-5.4".to_string()),
+                model: Some("gpt-5.5".to_string()),
                 history_mode: Some(history_mode),
                 ..Default::default()
             })
@@ -863,7 +856,7 @@ features.shell_tool = false
     assert!(loaded.data.contains(&thread_id));
     assert!(!loaded.data.contains(&child_thread_id));
 
-    let mut expected = baseline;
+    let expected = baseline;
     if history_mode == ThreadHistoryMode::Paginated {
         let state_db = StateRuntime::init(
             codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
@@ -881,11 +874,11 @@ features.shell_tool = false
         else {
             anyhow::bail!("expected worker thread-spawn source");
         };
-        // Stale display metadata must not choose which parent controls the resume.
+        // Stale display metadata must not choose which parent controls the resume;
+        // the resume checkpoint restores the canonical source.
         *parent_thread_id = ThreadId::new();
         metadata.source = serde_json::to_string(&source)?;
         state_db.upsert_thread(&metadata).await?;
-        expected.thread.source = source.into();
     }
 
     let is_child_usage = |notification: &JSONRPCNotification| {

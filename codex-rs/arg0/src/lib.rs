@@ -58,6 +58,8 @@ impl Arg0PathEntryGuard {
 }
 
 pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
+    #[cfg(target_os = "linux")]
+    codex_utils_pty::init_spawn_helper(std::env::args_os());
     // Determine if we were invoked via the special alias.
     let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
@@ -100,6 +102,9 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     }
 
     let argv1 = args.next().unwrap_or_default();
+    if argv1 == codex_sandboxing::CODEX_WINDOWS_MXC_ARG1 {
+        codex_sandboxing::run_windows_mxc_main();
+    }
     #[cfg(unix)]
     if argv1 == CODEX_ARG0_EXEC_HELPER_ARG1 {
         codex_exec_server::run_arg0_exec_helper_main();
@@ -129,13 +134,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Err(_) => std::process::exit(1),
                 };
                 let cwd = cwd.into();
-                let update_file_mode = codex_apply_patch::apply_patch_file_update_mode_from_env();
-                match runtime.block_on(codex_apply_patch::apply_patch_with_options(
+                match runtime.block_on(codex_apply_patch::apply_patch(
                     &patch_arg,
-                    codex_apply_patch::ApplyPatchOptions {
-                        update_file_mode,
-                        ..Default::default()
-                    },
                     &cwd,
                     &mut stdout,
                     &mut stderr,
@@ -617,7 +617,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing Windows system root"))?;
         let command_shell = PathBuf::from(system_root).join("System32").join("cmd.exe");
         let executable = executable_directory.join("cmd.exe");
-        fs::copy(&command_shell, &executable)?;
+        codex_utils_cargo_bin::copy_executable(&command_shell, &executable)?;
 
         let batch_path = alias_directory.join("apply_patch.bat");
         let executable_path = super::windows_batch_executable_path(&executable, &alias_directory);

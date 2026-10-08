@@ -54,6 +54,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
+use tracing::Instrument;
 
 use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 use crate::event_notification_transport::MAX_EVENT_NOTIFICATION_BYTES;
@@ -218,7 +219,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             None
         };
 
-        let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
+        let body = serde_json::to_value(&message).map_err(StreamableHttpError::Deserialize)?;
+        let request_span = crate::trace_context::request_span(&body);
+        let body = serde_json::to_vec(&body).map_err(StreamableHttpError::Deserialize)?;
         let has_authorization_header = headers.contains_key(AUTHORIZATION);
         if let JsonRpcMessage::Notification(notification) = &message
             && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
@@ -233,16 +236,19 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
 
-        let request = self.http_client.http_request_stream(HttpRequestParams {
-            method: "POST".to_string(),
-            url: uri.to_string(),
-            headers: protocol_headers(&headers),
-            body: Some(body.into()),
-            timeout_ms,
-            redirect_policy,
-            request_id: "buffered-request".to_string(),
-            stream_response: true,
-        });
+        let request = self
+            .http_client
+            .http_request_stream(HttpRequestParams {
+                method: "POST".to_string(),
+                url: uri.to_string(),
+                headers: protocol_headers(&headers),
+                body: Some(body.into()),
+                timeout_ms,
+                redirect_policy,
+                request_id: "buffered-request".to_string(),
+                stream_response: true,
+            })
+            .instrument(request_span);
         let response = if is_event_stream_request {
             tokio::time::timeout(EVENT_STREAM_RESPONSE_TIMEOUT, request)
                 .await
@@ -790,7 +796,7 @@ fn mcp_redirect_policy(
 // rmcp's automatic lifecycle does not yet recognize deployed legacy discovery
 // rejection shapes. Remove this compatibility shim once the SDK does:
 // https://github.com/modelcontextprotocol/rust-sdk/issues/1040
-fn legacy_discovery_fallback_response(
+pub(super) fn legacy_discovery_fallback_response(
     request: &ClientJsonRpcMessage,
     response: ServerJsonRpcMessage,
     allow_uncorrelated_http_rejection: bool,

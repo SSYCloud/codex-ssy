@@ -1,18 +1,24 @@
 #![allow(clippy::unwrap_used)]
 
+use core_test_support::test_codex::local_requests;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use codex_core::TurnInputRequest;
 use codex_core::shell::default_user_shell;
 use codex_features::Feature;
+use codex_models_manager::bundled_models_response;
 use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+use codex_models_manager::manager::StaticModelsManager;
+use codex_prompts::render_model_instructions;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
@@ -30,7 +36,6 @@ use core_test_support::responses::strip_metadata_from_json;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -135,6 +140,25 @@ async fn prompt_tools_are_consistent_across_requests(
 
     const CUSTOM_BASE_INSTRUCTIONS: &str =
         "Custom base.\r\n## Plan tool\r\nPreserve this custom workflow.\r\n";
+    const MODEL_BASE_INSTRUCTIONS: &str = "Model base.\n\n## Planning\nYou have access to an `update_plan` tool which tracks steps.\n\n## Work\nKeep working.\n\n## `update_plan`\nUpdate the plan.\n";
+
+    let mut model = bundled_models_response()?
+        .models
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
+    model
+        .model_messages
+        .as_mut()
+        .expect("bundled model messages")
+        .instructions_template = Some(MODEL_BASE_INSTRUCTIONS.to_string());
+    // Supply model instructions without making them an explicit config catalog override.
+    let models_manager = Arc::new(StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![model],
+        },
+    ));
 
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
@@ -149,14 +173,17 @@ async fn prompt_tools_are_consistent_across_requests(
     .await;
 
     let TestCodex {
+        // Keep the file-backed instructions alive across request-boundary refreshes.
+        home: _home,
         codex,
         config,
         thread_manager,
         ..
     } = test_codex()
+        .with_models_manager(models_manager)
         .with_pre_build_hook(write_global_instructions)
         .with_config(move |config| {
-            config.model = Some("gpt-5.2".to_string());
+            config.model = Some("gpt-5.5".to_string());
             if let Some(update_plan_enabled) = update_plan_enabled {
                 config.update_plan_enabled = update_plan_enabled;
             }
@@ -190,7 +217,7 @@ async fn prompt_tools_are_consistent_across_requests(
     let base_instructions = if custom_instructions {
         CUSTOM_BASE_INSTRUCTIONS.to_string()
     } else {
-        let original = model_info.get_model_instructions(config.personality);
+        let original = render_model_instructions(&model_info);
         if expected_update_plan_enabled {
             original
         } else {
@@ -220,7 +247,7 @@ async fn prompt_tools_are_consistent_across_requests(
                 collaboration_mode: Some(CollaborationMode {
                     mode: ModeKind::Plan,
                     settings: Settings {
-                        model: "gpt-5.2".to_string(),
+                        model: "gpt-5.5".to_string(),
                         reasoning_effort: None,
                         developer_instructions: Some(mode_instructions.clone()),
                     },
@@ -252,11 +279,11 @@ async fn prompt_tools_are_consistent_across_requests(
     ]);
     let body0 = req1.single_request().body_json();
 
-    assert_eq!(body0["instructions"], serde_json::json!(base_instructions),);
+    assert_eq!(req1.single_request().instructions_text(), base_instructions);
     assert_tool_names(&body0, &expected_tools_names);
 
     let body1 = req2.single_request().body_json();
-    assert_eq!(body1["instructions"], serde_json::json!(base_instructions),);
+    assert_eq!(req2.single_request().instructions_text(), base_instructions);
     assert_tool_names(&body1, &expected_tools_names);
 
     for request in [&req1, &req2] {
@@ -301,7 +328,9 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let TestCodex {
+        home: _home, codex, ..
+    } = test_codex()
         .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
             config
@@ -330,22 +359,16 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let body0 = req1.single_request().body_json();
-    let instructions0 = body0["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions0 = req1.single_request().instructions_text();
     assert!(
         instructions0.contains("You are"),
         "expected non-empty instructions"
     );
 
-    let body1 = req2.single_request().body_json();
-    let instructions1 = body1["instructions"]
-        .as_str()
-        .expect("instructions should be a string");
+    let instructions1 = req2.single_request().instructions_text();
     assert_eq!(
-        normalize_newlines(instructions1),
-        normalize_newlines(instructions0)
+        normalize_newlines(&instructions1),
+        normalize_newlines(&instructions0)
     );
 
     Ok(())
@@ -369,7 +392,12 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     )
     .await;
 
-    let TestCodex { codex, config, .. } = test_codex()
+    let TestCodex {
+        home: _home,
+        codex,
+        config,
+        ..
+    } = test_codex()
         .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
             config
@@ -400,11 +428,11 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     let input1 = body1["input"].as_array().expect("input array");
     assert_eq!(
         input1.len(),
-        3,
-        "expected permissions + cached contextual user prefix + user msg"
+        4,
+        "expected base instructions + permissions + cached contextual user prefix + user msg"
     );
 
-    let ui_text = input1[1]["content"][0]["text"]
+    let ui_text = input1[2]["content"][0]["text"]
         .as_str()
         .expect("ui message text");
     assert!(
@@ -413,17 +441,17 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     );
 
     let cwd_str = config.cwd.to_string_lossy();
-    let env_text = input1[1]["content"][1]["text"]
+    let env_text = input1[2]["content"][1]["text"]
         .as_str()
         .expect("environment context text");
     assert_default_env_context(env_text, &cwd_str);
     assert_eq!(
-        input1[1]["content"][1]["type"].as_str(),
+        input1[2]["content"][1]["type"].as_str(),
         Some("input_text"),
         "expected environment context bundled after UI message in cached contextual message"
     );
     assert_eq_without_metadata_or_item_ids(
-        input1[2].clone(),
+        input1[3].clone(),
         text_user_input("hello 1".to_string()),
     );
 
@@ -458,7 +486,12 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
     )
     .await;
 
-    let TestCodex { codex, config, .. } = test_codex()
+    let TestCodex {
+        home: _home,
+        codex,
+        config,
+        ..
+    } = test_codex()
         .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
             config
@@ -726,7 +759,9 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let TestCodex {
+        home: _home, codex, ..
+    } = test_codex()
         .with_pre_build_hook(write_global_instructions)
         .with_config(|config| {
             config
@@ -764,7 +799,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(new_cwd.abs())),
+                environments: Some(local_requests(new_cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -854,6 +889,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     .await;
 
     let TestCodex {
+        home: _home,
         codex,
         config,
         session_configured,
@@ -883,7 +919,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(default_cwd.clone())),
+                environments: Some(local_requests(default_cwd.clone())),
                 approval_policy: Some(default_approval_policy),
                 sandbox_policy: Some(default_sandbox_policy.clone()),
                 summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
@@ -908,7 +944,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(default_cwd.clone())),
+                environments: Some(local_requests(default_cwd.clone())),
                 approval_policy: Some(default_approval_policy),
                 sandbox_policy: Some(default_sandbox_policy.clone()),
                 summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
@@ -931,8 +967,9 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
+    let expected_base_instructions = body1["input"][0].clone();
+    let expected_permissions_msg = body1["input"][1].clone();
+    let expected_ui_msg = body1["input"][2].clone();
 
     let default_cwd_lossy = default_cwd.to_string_lossy();
     let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
@@ -951,6 +988,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let expected_user_message_1 = text_user_input("hello 1".to_string());
 
     let expected_input_1 = serde_json::Value::Array(vec![
+        expected_base_instructions.clone(),
         expected_permissions_msg.clone(),
         expected_contextual_user_msg_1.clone(),
         expected_user_message_1.clone(),
@@ -959,6 +997,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
 
     let expected_user_message_2 = text_user_input("hello 2".to_string());
     let expected_input_2 = serde_json::Value::Array(vec![
+        expected_base_instructions,
         expected_permissions_msg,
         expected_contextual_user_msg_1,
         expected_user_message_1,
@@ -987,6 +1026,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     )
     .await;
     let TestCodex {
+        home: _home,
         codex,
         config,
         session_configured,
@@ -1016,7 +1056,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(default_cwd.clone())),
+                environments: Some(local_requests(default_cwd.clone())),
                 approval_policy: Some(default_approval_policy),
                 sandbox_policy: Some(default_sandbox_policy.clone()),
                 summary: Some(default_summary.unwrap_or(ReasoningSummary::Auto)),
@@ -1043,7 +1083,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(default_cwd.clone())),
+                environments: Some(local_requests(default_cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1067,8 +1107,9 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     let body1 = request1.body_json();
     let body2 = request2.body_json();
 
-    let expected_permissions_msg = body1["input"][0].clone();
-    let expected_ui_msg = body1["input"][1].clone();
+    let expected_base_instructions = body1["input"][0].clone();
+    let expected_permissions_msg = body1["input"][1].clone();
+    let expected_ui_msg = body1["input"][2].clone();
 
     let expected_env_text_1 = expected_ui_msg["content"][1]["text"]
         .as_str()
@@ -1084,6 +1125,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     ]);
     let expected_user_message_1 = text_user_input("hello 1".to_string());
     let expected_input_1 = serde_json::Value::Array(vec![
+        expected_base_instructions.clone(),
         expected_permissions_msg.clone(),
         expected_contextual_user_msg_1.clone(),
         expected_user_message_1.clone(),
@@ -1125,6 +1167,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
     );
     let expected_user_message_2 = text_user_input("hello 2".to_string());
     let expected_input_2 = serde_json::Value::Array(vec![
+        expected_base_instructions,
         expected_permissions_msg,
         expected_contextual_user_msg_1,
         expected_user_message_1,

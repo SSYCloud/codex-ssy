@@ -14,8 +14,12 @@ use codex_network_proxy::NetworkProxyConfig;
 #[cfg(unix)]
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
+#[cfg(unix)]
+use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+#[cfg(unix)]
+use codex_protocol::config_types::ShellEnvironmentPolicy;
 #[cfg(unix)]
 use codex_protocol::config_types::TrustLevel;
 #[cfg(unix)]
@@ -51,7 +55,7 @@ use core_test_support::skip_if_remote;
 #[cfg(unix)]
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -59,8 +63,6 @@ use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
@@ -199,7 +201,7 @@ async fn run_snapshot_command_with_options(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -275,7 +277,7 @@ async fn run_tool_turn_on_harness(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -574,7 +576,7 @@ async fn shell_snapshot_v2_prewarm_stops_on_shutdown() -> Result<()> {
 }; "untrusted")]
 #[test_case::test_case(|config| {
     config.permissions.network = Some(NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig { enabled: true, allow_local_binding: true, ..Default::default() },
+        NetworkProxyConfig { enabled: true, allow_local_binding: Some(true), ..Default::default() },
         /*requirements*/ None,
         config.permissions.permission_profile(),
     ).expect("configure managed network"));
@@ -693,14 +695,14 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
         ],
     )
     .await;
-    let mut environments = local_selections(test.config.cwd.clone());
-    environments.environments[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
+    let mut requests = local_requests(test.config.cwd.clone());
+    requests.environment_requests[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
         allow_login_shell: true,
-        workspace_roots: environments.environments[0].workspace_roots.clone(),
+        workspace_roots: requests.environment_requests[0].workspace_roots.clone(),
         permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
         shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
-        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
+        windows_sandbox_type: test.config.permissions.windows_sandbox_type,
         use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,
@@ -714,7 +716,7 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(environments),
+                environments: Some(requests),
                 ..Default::default()
             }),
         )
@@ -749,6 +751,102 @@ async fn shell_snapshot_v2_guardian_uses_its_resolved_permissions_and_tools(
         !profile_home.path().join(guardian_id).exists(),
         "Guardian profile must not inherit writable owner permissions"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_snapshot_omits_filtered_and_overridden_exports() -> Result<()> {
+    skip_if_remote!(Ok(()), "legacy snapshots require a local environment");
+    let home = tempfile::tempdir()?;
+    let shell_path = home.path().join("bash");
+    // Seed the capture shell without changing the test process environment. Replay uses -c.
+    codex_utils_cargo_bin::write_executable(
+        &shell_path,
+        r#"#!/bin/sh
+if [ "$1" = -lc ]; then
+  export HOME="${0%/*}"
+  export PROFILE_ALLOWED='first
+second'
+  export PROFILE_TOKEN=token-sentinel
+  export PROFILE_DENIED=denied-sentinel
+  export OTHER=other-sentinel
+  export PROFILE_SECRET=original-secret-sentinel
+fi
+exec /bin/bash --noprofile --norc "$@"
+"#,
+    )?;
+    let builder = test_codex()
+        .with_user_shell(
+            codex_shell_command::shell_detect::DetectedShell {
+                shell_type: codex_shell_command::shell_detect::ShellType::Bash,
+                shell_path,
+            }
+            .into(),
+        )
+        .with_config(|config| {
+            config.features.enable(Feature::ShellSnapshot).unwrap();
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            config.features.disable(Feature::ShellSnapshotV2).unwrap();
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .unwrap();
+            config.permissions.shell_environment_policy = ShellEnvironmentPolicy {
+                ignore_default_excludes: false,
+                exclude: vec![EnvironmentVariablePattern::new_case_insensitive(
+                    "PROFILE_DENIED",
+                )],
+                include_only: ["PATH", "PROFILE_*"]
+                    .map(EnvironmentVariablePattern::new_case_insensitive)
+                    .to_vec(),
+                r#set: HashMap::from([("PROFILE_SECRET".to_string(), "dummy".to_string())]),
+                ..Default::default()
+            };
+        });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let snapshot_path = wait_for_snapshot(harness.test().home.path()).await?;
+    let snapshot = fs::read_to_string(&snapshot_path).await?;
+    for sentinel in [
+        "token-sentinel",
+        "denied-sentinel",
+        "other-sentinel",
+        "original-secret-sentinel",
+    ] {
+        assert!(!snapshot.contains(sentinel));
+    }
+    let snapshot_path = shlex::try_quote(snapshot_path.to_str().unwrap())?;
+    let args = json!({
+        "cmd": format!("printf '%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_TOKEN-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"${{OTHER-missing}}\" \"$PROFILE_SECRET\"; . {snapshot_path}; printf '|%s' \"$PROFILE_SECRET\""),
+        "shell": "/bin/bash",
+        "yield_time_ms": 1_000,
+    });
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                ev_function_call("snapshot-policy", "exec_command", &args.to_string()),
+                ev_completed("tool"),
+            ]),
+            sse(vec![ev_completed("done")]),
+        ],
+    )
+    .await;
+    // Keep the environment selection unchanged so the readiness wait refers to this turn's snapshot.
+    harness
+        .test()
+        .submit_text_turn("verify snapshot filtering")
+        .await?;
+    let output = harness.function_call_stdout("snapshot-policy").await;
+    assert_eq!(
+        normalize_newlines(&output)
+            .split_once("Output:\n")
+            .unwrap()
+            .1
+            .trim(),
+        "first\nsecond|missing|missing|missing|dummy|dummy"
+    );
+    harness.test().codex.shutdown_and_wait().await?;
     Ok(())
 }
 
@@ -807,7 +905,7 @@ async fn shell_snapshot_v2_filters_profile_secrets_without_creating_files() -> R
 
         assert_eq!(end.exit_code, 0);
         assert_eq!(
-            normalize_newlines(&end.stdout).trim(),
+            normalize_newlines(&end.aggregated_output).trim(),
             "helper|path|policy|missing"
         );
     }
@@ -855,7 +953,7 @@ async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result
     .await;
 
     assert_eq!(end.exit_code, 0);
-    assert_eq!(normalize_newlines(&end.stdout).trim(), "legacy");
+    assert_eq!(normalize_newlines(&end.aggregated_output).trim(), "legacy");
     Ok(())
 }
 
@@ -864,7 +962,7 @@ async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result
 async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
     let command = "echo snapshot-linux";
     let run = run_snapshot_command(command).await?;
-    let stdout = normalize_newlines(&run.end.stdout);
+    let output = normalize_newlines(&run.end.aggregated_output);
 
     assert_eq!(run.begin.command.get(1).map(String::as_str), Some("-lc"));
     assert_eq!(run.begin.command.get(2).map(String::as_str), Some(command));
@@ -873,8 +971,8 @@ async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert_posix_snapshot_sections(&run.snapshot_content);
     assert_eq!(run.end.exit_code, 0);
     assert!(
-        stdout.contains("snapshot-linux"),
-        "stdout should contain snapshot marker; stdout={stdout:?}"
+        output.contains("snapshot-linux"),
+        "output should contain snapshot marker; output={output:?}"
     );
 
     Ok(())
@@ -920,7 +1018,7 @@ async fn unified_exec_snapshot_preserves_shell_environment_policy_set() -> Resul
     .await?;
 
     assert_eq!(
-        normalize_newlines(&end.stdout).trim(),
+        normalize_newlines(&end.aggregated_output).trim(),
         POLICY_SUCCESS_OUTPUT
     );
     assert_eq!(end.exit_code, 0);
@@ -979,7 +1077,7 @@ async fn unified_exec_snapshot_still_intercepts_apply_patch() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd.clone())),
+                environments: Some(local_requests(cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1066,15 +1164,34 @@ async fn shell_snapshot_deleted_after_shutdown_with_skills() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+#[test_case::test_case(false; "default")]
+#[test_case::test_case(true; "disabled_proxy_with_broker_configured")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn macos_unified_exec_resolves_command_from_tied_path_snapshot() -> Result<()> {
+async fn macos_unified_exec_resolves_command_from_tied_path_snapshot(
+    disabled_proxy: bool,
+) -> Result<()> {
     let builder = test_codex()
         .with_user_shell(get_shell_by_model_provided_path(&PathBuf::from("/bin/zsh")))
-        .with_config(|config| {
+        .with_config(move |config| {
             config
                 .features
                 .enable(Feature::ShellSnapshot)
                 .expect("test config should allow feature update");
+            if disabled_proxy {
+                let mut network = codex_network_proxy::NetworkProxyConfig {
+                    enabled: false,
+                    ..Default::default()
+                };
+                network.set_credential_broker_enabled(/*enabled*/ true);
+                config.permissions.network = Some(
+                    codex_core::config::NetworkProxySpec::from_config_and_constraints(
+                        network,
+                        Some(Default::default()),
+                        config.permissions.permission_profile(),
+                    )
+                    .expect("disabled proxy configuration"),
+                );
+            }
         });
     let harness = TestCodexHarness::with_builder(builder).await?;
     let command_dir = harness
@@ -1085,10 +1202,7 @@ async fn macos_unified_exec_resolves_command_from_tied_path_snapshot() -> Result
         .join("bin");
     fs::create_dir_all(&command_dir).await?;
     let command_path = command_dir.join("snapshot-only-command");
-    fs::write(&command_path, "#!/bin/sh\nprintf tied-path-command").await?;
-    let mut permissions = fs::metadata(&command_path).await?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&command_path, permissions).await?;
+    codex_utils_cargo_bin::write_executable(&command_path, "#!/bin/sh\nprintf tied-path-command")?;
 
     run_tool_turn_on_harness(
         &harness,
@@ -1125,10 +1239,13 @@ async fn macos_unified_exec_resolves_command_from_tied_path_snapshot() -> Result
 
     assert_eq!(
         end.exit_code, 0,
-        "tied-path command failed: stderr={:?}",
-        end.stderr
+        "tied-path command failed: output={:?}",
+        end.aggregated_output
     );
-    assert_eq!(normalize_newlines(&end.stdout).trim(), "tied-path-command");
+    assert_eq!(
+        normalize_newlines(&end.aggregated_output).trim(),
+        "tied-path-command"
+    );
 
     Ok(())
 }
@@ -1160,7 +1277,10 @@ async fn macos_unified_exec_uses_shell_snapshot() -> Result<()> {
 
     assert!(run.snapshot_path.starts_with(&run.codex_home));
     assert_posix_snapshot_sections(&run.snapshot_content);
-    assert_eq!(normalize_newlines(&run.end.stdout).trim(), "snapshot-macos");
+    assert_eq!(
+        normalize_newlines(&run.end.aggregated_output).trim(),
+        "snapshot-macos"
+    );
     assert_eq!(run.end.exit_code, 0);
 
     Ok(())
@@ -1194,7 +1314,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert!(run.snapshot_content.contains("# aliases "));
     assert!(run.snapshot_content.contains("# exports "));
     assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
+        normalize_newlines(&run.end.aggregated_output).trim(),
         "snapshot-windows"
     );
     assert_eq!(run.end.exit_code, 0);

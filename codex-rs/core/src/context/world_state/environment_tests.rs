@@ -1,6 +1,7 @@
 use super::super::PreviousSectionState;
 use super::super::test_support::render_section_cases;
 use super::*;
+use crate::context::world_state::test_support::FragmentSectionTestExt as _;
 use anyhow::Result;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_protocol::models::PermissionProfile;
@@ -105,6 +106,7 @@ fn snapshots() -> Result<()> {
             EnvironmentState {
                 cwd: PathUri::parse("file:///repo")?,
                 status: EnvironmentStatus::Available,
+                error: None,
                 shell: None,
                 is_primary: false,
             },
@@ -172,9 +174,13 @@ fn changing_primary_environment_updates_model_context_and_persisted_state() -> R
         .collect(),
         ..Default::default()
     };
-    let previous = before.snapshot();
+    let previous = before
+        .render_fragment_diff(PreviousSectionState::Absent)
+        .0
+        .unwrap();
     let rendered = after
-        .render_diff(PreviousSectionState::Known(&previous))
+        .render_fragment_diff(PreviousSectionState::Known(&previous))
+        .1
         .expect("primary change should update the model")
         .render();
 
@@ -193,8 +199,9 @@ fn changing_primary_environment_updates_model_context_and_persisted_state() -> R
     current_world_state.add_section(after);
     assert_eq!(
         current_world_state
-            .snapshot()
-            .merge_patch_from(&previous_world_state.snapshot())
+            .render_full()
+            .0
+            .merge_patch_from(&previous_world_state.render_full().0)
             .map(serde_json::Value::Object),
         Some(json!({
             "environments": {
@@ -229,11 +236,17 @@ fn legacy_single_environment_snapshot_does_not_change() -> Result<()> {
 
     assert!(
         environment
-            .render_diff(PreviousSectionState::Known(&legacy_snapshot))
+            .render_fragment_diff(PreviousSectionState::Known(&legacy_snapshot))
+            .1
             .is_none()
     );
     assert_eq!(
-        serde_json::to_value(environment.snapshot())?["environments"]["local"],
+        serde_json::to_value(
+            environment
+                .render_fragment_diff(PreviousSectionState::Absent)
+                .0
+                .unwrap()
+        )?["environments"]["local"],
         json!({
             "cwd": PathUri::parse("file:///repo")?.inferred_native_path_string(),
             "status": "available",
@@ -279,7 +292,13 @@ fn crossing_single_environment_boundary_restates_current_environments() -> Resul
         };
 
         let expanded = multiple
-            .render_diff(PreviousSectionState::Known(&single.snapshot()))
+            .render_fragment_diff(PreviousSectionState::Known(
+                &single
+                    .render_fragment_diff(PreviousSectionState::Absent)
+                    .0
+                    .unwrap(),
+            ))
+            .1
             .expect("adding an environment should update the model")
             .render();
         assert_eq!(
@@ -290,7 +309,13 @@ fn crossing_single_environment_boundary_restates_current_environments() -> Resul
         );
 
         let reduced = single
-            .render_diff(PreviousSectionState::Known(&multiple.snapshot()))
+            .render_fragment_diff(PreviousSectionState::Known(
+                &multiple
+                    .render_fragment_diff(PreviousSectionState::Absent)
+                    .0
+                    .unwrap(),
+            ))
+            .1
             .expect("removing an environment should update the model")
             .render();
         assert_eq!(
@@ -308,6 +333,7 @@ fn available(cwd: &str, shell: &str) -> Result<EnvironmentState> {
     Ok(EnvironmentState {
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Available,
+        error: None,
         shell: Some(shell.to_string()),
         is_primary: false,
     })
@@ -324,7 +350,105 @@ fn starting(cwd: &str) -> Result<EnvironmentState> {
     Ok(EnvironmentState {
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Starting,
+        error: None,
         shell: None,
         is_primary: false,
     })
+}
+
+#[test]
+fn failure_context_is_escaped_incremental_and_cleared_on_recovery() -> Result<()> {
+    let failed = EnvironmentsState {
+        environments: [(
+            "remote".to_string(),
+            EnvironmentState {
+                cwd: PathUri::parse("file:///workspace")?,
+                status: EnvironmentStatus::Failed,
+                error: Some("Repository <empty> & unavailable".to_string()),
+                shell: None,
+                is_primary: false,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    insta::assert_snapshot!(failed.body(), @r#"
+
+      <environments>
+        <environment id="remote">
+          <cwd>/workspace</cwd>
+          <status>failed</status>
+          <error>Repository &lt;empty&gt; &amp; unavailable</error>
+        </environment>
+      </environments>
+    "#);
+    assert!(
+        failed
+            .render_fragment_diff(PreviousSectionState::Known(
+                &failed
+                    .render_fragment_diff(PreviousSectionState::Absent)
+                    .0
+                    .unwrap()
+            ))
+            .1
+            .is_none()
+    );
+    let recovered = EnvironmentsState {
+        environments: [(
+            "remote".to_string(),
+            available("file:///workspace", "bash")?,
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let update = recovered
+        .render_fragment_diff(PreviousSectionState::Known(
+            &failed
+                .render_fragment_diff(PreviousSectionState::Absent)
+                .0
+                .unwrap(),
+        ))
+        .1
+        .expect("recovery must be visible to the model");
+    assert!(!update.body().contains("<error>"));
+    assert!(update.body().contains("<shell>bash</shell>"));
+    Ok(())
+}
+
+#[test]
+fn failure_context_limits_total_detail_bytes_at_utf8_boundaries() {
+    use codex_protocol::protocol::EnvironmentConfigState;
+    use codex_protocol::protocol::TurnEnvironmentSelection;
+    let snapshot = TurnEnvironmentSnapshot {
+        environments: (0..4)
+            .map(|index| TurnEnvironmentState::Failed {
+                required_skills: Vec::new(),
+                selection: TurnEnvironmentSelection {
+                    selected_capability_roots: Default::default(),
+                    environment_id: format!("remote-{index}"),
+                    cwd: PathUri::parse("file:///workspace").unwrap(),
+                    workspace_roots: Vec::new(),
+                    config: EnvironmentConfigState::FromThread,
+                },
+                error: "界".repeat(300),
+            })
+            .collect(),
+    };
+    let states = environment_states(&snapshot);
+    let details: Vec<_> = states
+        .values()
+        .map(|state| state.error.as_deref())
+        .collect();
+    let truncated = "界".repeat(85);
+    assert_eq!(
+        details,
+        vec![
+            Some(truncated.as_str()),
+            Some(truncated.as_str()),
+            None,
+            None
+        ]
+    );
 }

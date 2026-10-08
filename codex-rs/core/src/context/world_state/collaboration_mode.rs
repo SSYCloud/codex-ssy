@@ -1,13 +1,15 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateHash;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
-use crate::context::without_update_plan_instructions;
-use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+use codex_prompts::ResolvedCollaborationModeMessages;
+use codex_prompts::ResolvedModelMessages;
+use codex_prompts::without_update_plan_instructions;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItemKind;
-use codex_protocol::openai_models::CollaborationModeMessages;
 use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
 use serde::Deserialize;
@@ -23,17 +25,17 @@ pub(crate) struct CollaborationModeState {
 impl CollaborationModeState {
     pub(crate) fn from_collaboration_mode(
         collaboration_mode: &CollaborationMode,
-        catalog_messages: Option<&CollaborationModeMessages>,
+        messages: ResolvedCollaborationModeMessages<'_>,
         update_plan_enabled: bool,
         custom_model_catalog: bool,
     ) -> Self {
-        let catalog_instructions =
-            catalog_messages.and_then(|messages| match collaboration_mode.mode {
-                ModeKind::Default => messages.default.as_ref(),
-                ModeKind::Plan => messages.plan.as_ref(),
-            });
+        let catalog_instructions = match collaboration_mode.mode {
+            ModeKind::Default => messages.default,
+            ModeKind::Plan => messages.plan,
+        }
+        .catalog_override();
 
-        let instructions = catalog_instructions.cloned().or_else(|| {
+        let instructions = catalog_instructions.map(str::to_string).or_else(|| {
             collaboration_mode
                 .settings
                 .developer_instructions
@@ -44,17 +46,16 @@ impl CollaborationModeState {
             if update_plan_enabled {
                 return instructions;
             }
-            // Clients send built-in presets through the override field too. Match the
-            // entire preset, never a heading that could also occur in custom text.
             let builtin = match catalog_instructions {
                 Some(_) => !custom_model_catalog,
-                None => builtin_collaboration_mode_presets().iter().any(|preset| {
-                    preset
-                        .developer_instructions
-                        .as_ref()
-                        .and_then(Option::as_ref)
-                        == Some(&instructions)
-                }),
+                None => {
+                    // Without a catalog override, mode settings may contain a built-in
+                    // preset or custom text. Compare whole strings against bundled presets
+                    // only to recognize built-in text whose disabled update_plan guidance
+                    // we can strip; custom instructions stay unchanged.
+                    let bundled = ResolvedModelMessages::bundled().collaboration_modes();
+                    instructions == bundled.default.text() || instructions == bundled.plan.text()
+                }
             };
             if builtin {
                 without_update_plan_instructions(&instructions)
@@ -95,10 +96,6 @@ impl WorldStateSection for CollaborationModeState {
     const ID: &'static str = "collaboration_mode";
     type Snapshot = CollaborationModeSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.snapshot.clone()
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && CollaborationModeInstructions::matches_text(text)
     }
@@ -114,7 +111,8 @@ impl WorldStateSection for CollaborationModeState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.snapshot.clone();
         let unchanged = match previous {
             PreviousSectionState::Absent => self.instructions.is_none(),
             PreviousSectionState::Unknown => false,
@@ -137,12 +135,15 @@ impl WorldStateSection for CollaborationModeState {
             }
         };
         if unchanged {
-            return None;
+            return (Some(current), Vec::new());
         }
 
-        Some(Box::new(CollaborationModeInstructions {
-            instructions: self.instructions.clone().unwrap_or_default(),
-        }))
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(CollaborationModeInstructions {
+                instructions: self.instructions.clone().unwrap_or_default(),
+            })],
+        )
     }
 }
 

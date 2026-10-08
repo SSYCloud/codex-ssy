@@ -125,6 +125,9 @@
       ],
       "type": "string"
     },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
     "PluginAuthPolicy": {
       "enum": [
         "ON_INSTALL",
@@ -193,6 +196,18 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "onboardingSkill": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SkillSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The declared onboarding skill, when the plugin and visible skill are enabled."
         },
         "scheduledTasks": {
           "items": {
@@ -1008,7 +1023,7 @@
         "path": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             {
               "type": "null"

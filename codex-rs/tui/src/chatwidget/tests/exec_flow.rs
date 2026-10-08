@@ -141,12 +141,10 @@ async fn failed_exploration_keeps_overlapping_commands_active_until_all_finish()
     assert!(drain_insert_history(&mut rx).is_empty());
     end_exec(&mut chat, followup, "followup\n", "", /*exit_code*/ 0);
 
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1);
-    let history = lines_to_single_string(&cells[0]);
-    insta::assert_snapshot!(history, @r"
+    assert!(drain_insert_history(&mut rx).is_empty());
+    insta::assert_snapshot!(active_blob(&chat), @r"
 • Explored
-  └ List missing
+  └ List missing (exit 1)
     Read foo.txt, bar.txt
 ");
 
@@ -154,8 +152,180 @@ async fn failed_exploration_keeps_overlapping_commands_active_until_all_finish()
     end_exec(&mut chat, later, "later\n", "", /*exit_code*/ 0);
     insta::assert_snapshot!(active_blob(&chat), @r"
 • Explored
-  └ Read later.txt
+  └ List missing (exit 1)
+    Read foo.txt, bar.txt, later.txt
 ");
+}
+
+#[tokio::test]
+async fn exploration_nonzero_exits_remain_visible_beside_successful_reads() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    for (id, command, exit_code) in [
+        ("read", "cat first.txt", 0),
+        ("missing", "cat missing.txt", 1),
+        ("later", "cat later.txt", 0),
+        ("search", "rg absent .", 1),
+        ("error", "rg text missing.txt", 2),
+        ("compound", "cat existing.txt && rg absent .", 1),
+    ] {
+        let item = begin_exec(&mut chat, id, command);
+        end_exec(&mut chat, item, "", "", exit_code);
+    }
+    insta::assert_snapshot!(active_blob(&chat));
+    insta::assert_snapshot!(
+        "compact_exploration_with_failures",
+        chat.transcript
+            .active_cell
+            .as_ref()
+            .unwrap()
+            .compact_hyperlink_lines(/*width*/ 24)
+            .iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let statuses = chat
+        .transcript
+        .active_cell
+        .as_ref()
+        .unwrap()
+        .display_lines(/*width*/ 80)
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .filter(|span| {
+            span.content.starts_with(" (exit") || span.content.starts_with(" (command exit")
+        })
+        .map(|span| (span.content.into_owned(), span.style.fg))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            (" (exit 1)".to_string(), Some(ratatui::style::Color::Red)),
+            (" (exit 1)".to_string(), None),
+            (" (exit 2)".to_string(), Some(ratatui::style::Color::Red)),
+            (" (command exit 1)".to_string(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exploration_reasoning_during_followup_command_stays_ordered() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let first = begin_exec(&mut chat, "first", "ls");
+    end_exec(&mut chat, first, "file.txt\n", "", /*exit_code*/ 0);
+    chat.on_agent_reasoning_delta("Read the file next.".to_string());
+    chat.on_agent_reasoning_final();
+    let second = begin_exec(&mut chat, "second", "cat file.txt");
+    chat.on_agent_reasoning_delta("Waiting for the file.".to_string());
+    chat.on_agent_reasoning_final();
+    assert!(drain_insert_history(&mut rx).is_empty());
+    end_exec(&mut chat, second, "contents\n", "", /*exit_code*/ 0);
+    let transcript = chat.active_cell_transcript_lines(/*width*/ 80).unwrap();
+    insta::assert_snapshot!(lines_to_single_string(&transcript));
+}
+
+#[tokio::test]
+async fn adjacent_exploration_groups_across_reasoning_live_and_replayed() {
+    let mut renders = Vec::new();
+    for replay in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.on_task_started();
+        for (id, script, exit_code) in [
+            ("list", "ls missing", 1),
+            ("read", "cat index.html", 0),
+            ("run", "echo boundary", 0),
+            ("later", "cat later.txt", 0),
+            ("after-message", "cat final.txt", 0),
+        ] {
+            let command = vec!["bash".to_string(), "-lc".to_string(), script.to_string()];
+            let mut item = AppServerThreadItem::CommandExecution {
+                model_context: None,
+                sandbox_type: None,
+                id: id.to_string(),
+                command: codex_shell_command::parse_command::shlex_join(&command),
+                cwd: chat.config.cwd.clone().into(),
+                process_id: None,
+                plugin_id: None,
+                script_path: None,
+                source: ExecCommandSource::UnifiedExecStartup,
+                status: AppServerCommandExecutionStatus::InProgress,
+                command_actions: codex_shell_command::parse_command::parse_command(&command)
+                    .into_iter()
+                    .map(|parsed| {
+                        AppServerCommandAction::from_core_with_cwd(parsed, &chat.config.cwd)
+                    })
+                    .collect(),
+                aggregated_output: Some(format!("{id} output\n")),
+                exit_code: Some(exit_code),
+                duration_ms: Some(5),
+            };
+            if !replay {
+                handle_exec_begin(&mut chat, item.clone());
+            }
+            if let AppServerThreadItem::CommandExecution { status, .. } = &mut item {
+                *status = if exit_code == 0 {
+                    AppServerCommandExecutionStatus::Completed
+                } else {
+                    AppServerCommandExecutionStatus::Failed
+                };
+            }
+            if replay {
+                chat.replay_thread_item(item, "turn-1".to_string(), ReplayKind::ThreadSnapshot);
+            } else {
+                handle_exec_end(&mut chat, item);
+            }
+            if id == "list" {
+                for summary in ["Inspecting the page", "Checking its contents"] {
+                    if replay {
+                        chat.replay_thread_item(
+                            AppServerThreadItem::Reasoning {
+                                id: summary.to_string(),
+                                summary: vec![summary.to_string()],
+                                content: Vec::new(),
+                            },
+                            "turn-1".to_string(),
+                            ReplayKind::ThreadSnapshot,
+                        );
+                    } else {
+                        chat.on_agent_reasoning_delta(summary.to_string());
+                        chat.on_agent_reasoning_final();
+                    }
+                }
+            }
+            if id == "later" {
+                complete_assistant_message(
+                    &mut chat,
+                    "message",
+                    "Checking one more file.",
+                    Some(MessagePhase::Commentary),
+                );
+            }
+        }
+        chat.flush_active_cell();
+        let cells = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 5);
+        let mut render = String::new();
+        for mode in ["Compact", "Expanded", "Raw"] {
+            render.push_str(&format!("{mode}:\n"));
+            for cell in &cells {
+                let lines = match mode {
+                    "Compact" => cell.display_lines(/*width*/ 80),
+                    "Expanded" => cell.transcript_lines(/*width*/ 80),
+                    _ => cell.raw_lines(),
+                };
+                render.push_str(&lines_to_single_string(&lines));
+                render.push('\n');
+            }
+        }
+        renders.push(render);
+    }
+    assert_eq!(renders[0], renders[1]);
+    insta::assert_snapshot!(renders[0]);
 }
 
 #[tokio::test]
@@ -164,6 +334,8 @@ async fn replayed_commands_preserve_individual_output_and_failure_status() {
     let cwd = chat.config.cwd.clone();
     let replayed_command =
         |id: &str, output: &str, source: ExecCommandSource| AppServerThreadItem::CommandExecution {
+            model_context: None,
+            sandbox_type: None,
             id: id.to_string(),
             command: format!("printf {output}"),
             cwd: cwd.clone().into(),
@@ -246,259 +418,6 @@ $ printf declined
 declined
 ✗ (1) • 5ms
 ");
-}
-
-#[tokio::test]
-async fn exec_approval_emits_proposed_command_and_decision_history() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    // Trigger an exec approval request with a short, single-line command
-    let ev = ExecApprovalRequestEvent {
-        kind: Default::default(),
-        call_id: "call-short".into(),
-        approval_id: Some("call-short".into()),
-        turn_id: "turn-short".into(),
-        environment_id: None,
-        command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
-        reason: Some(
-            "this is a test reason such as one that would be produced by the model".into(),
-        ),
-        network_approval_context: None,
-        proposed_execpolicy_amendment: None,
-        proposed_network_policy_amendments: None,
-        additional_permissions: None,
-        available_decisions: None,
-    };
-    handle_exec_approval_request(&mut chat, "sub-short", ev);
-
-    let proposed_cells = drain_insert_history(&mut rx);
-    assert!(
-        proposed_cells.is_empty(),
-        "expected approval request to render via modal without emitting history cells"
-    );
-
-    // The approval modal should display the command snippet for user confirmation.
-    let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    chat.render(area, &mut buf);
-    assert_chatwidget_snapshot!("exec_approval_modal_exec", format!("{buf:?}"));
-
-    // Approve via keyboard and verify a concise decision history line is added
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-    let decision = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected decision cell in history");
-    assert_chatwidget_snapshot!(
-        "exec_approval_history_decision_approved_short",
-        lines_to_single_string(&decision)
-    );
-}
-
-#[test]
-fn app_server_exec_approval_request_splits_shell_wrapped_command() {
-    let script = r#"python3 -c 'print("Hello, world!")'"#;
-    let request = exec_approval_request_from_params(
-        AppServerCommandExecutionRequestApprovalParams {
-            kind: Default::default(),
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            item_id: "item-1".to_string(),
-            started_at_ms: 0,
-            approval_id: Some("approval-1".to_string()),
-            environment_id: None,
-            reason: None,
-            network_approval_context: None,
-            command: Some(
-                shlex::try_join(["/bin/zsh", "-lc", script])
-                    .expect("round-trippable shell wrapper"),
-            ),
-            cwd: Some(test_path_buf("/tmp").abs().into()),
-            command_actions: None,
-            additional_permissions: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
-            available_decisions: None,
-        },
-        &test_path_buf("/tmp").abs(),
-    );
-
-    assert_eq!(
-        request.command,
-        vec![
-            "/bin/zsh".to_string(),
-            "-lc".to_string(),
-            script.to_string(),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn exec_approval_uses_approval_id_when_present() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    handle_exec_approval_request(
-        &mut chat,
-        "sub-short",
-        ExecApprovalRequestEvent {
-            kind: Default::default(),
-            call_id: "call-parent".into(),
-            approval_id: Some("approval-subcommand".into()),
-            turn_id: "turn-short".into(),
-            environment_id: None,
-            command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-            cwd: AbsolutePathBuf::current_dir().expect("current dir"),
-            reason: Some(
-                "this is a test reason such as one that would be produced by the model".into(),
-            ),
-            network_approval_context: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
-            additional_permissions: None,
-            available_decisions: None,
-        },
-    );
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-
-    let mut found = false;
-    while let Ok(app_ev) = rx.try_recv() {
-        if let AppEvent::SubmitThreadOp {
-            op: Op::ExecApproval { id, decision, .. },
-            ..
-        } = app_ev
-        {
-            assert_eq!(id, "approval-subcommand");
-            assert_matches!(
-                decision,
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Accept
-            );
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "expected ExecApproval op to be sent");
-}
-
-#[tokio::test]
-async fn exec_approval_decision_truncates_multiline_and_long_commands() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    // Multiline command: modal should show full command, history records decision only
-    let ev_multi = ExecApprovalRequestEvent {
-        kind: Default::default(),
-        call_id: "call-multi".into(),
-        approval_id: Some("call-multi".into()),
-        turn_id: "turn-multi".into(),
-        environment_id: None,
-        command: vec!["bash".into(), "-lc".into(), "echo line1\necho line2".into()],
-        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
-        reason: Some(
-            "this is a test reason such as one that would be produced by the model".into(),
-        ),
-        network_approval_context: None,
-        proposed_execpolicy_amendment: None,
-        proposed_network_policy_amendments: None,
-        additional_permissions: None,
-        available_decisions: None,
-    };
-    handle_exec_approval_request(&mut chat, "sub-multi", ev_multi);
-    let proposed_multi = drain_insert_history(&mut rx);
-    assert!(
-        proposed_multi.is_empty(),
-        "expected multiline approval request to render via modal without emitting history cells"
-    );
-
-    let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    chat.render(area, &mut buf);
-    let mut saw_first_line = false;
-    for y in 0..area.height {
-        let mut row = String::new();
-        for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
-        }
-        if row.contains("echo line1") {
-            saw_first_line = true;
-            break;
-        }
-    }
-    assert!(
-        saw_first_line,
-        "expected modal to show first line of multiline snippet"
-    );
-
-    // Deny via keyboard; decision snippet should be single-line and elided with " ..."
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-    let aborted_multi = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected aborted decision cell (multiline)");
-    assert_chatwidget_snapshot!(
-        "exec_approval_history_decision_aborted_multiline",
-        lines_to_single_string(&aborted_multi)
-    );
-
-    // Very long single-line command: decision snippet should be truncated <= 80 chars with trailing ...
-    let long = format!("echo {}", "a".repeat(200));
-    let ev_long = ExecApprovalRequestEvent {
-        kind: Default::default(),
-        call_id: "call-long".into(),
-        approval_id: Some("call-long".into()),
-        turn_id: "turn-long".into(),
-        environment_id: None,
-        command: vec!["bash".into(), "-lc".into(), long],
-        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
-        reason: None,
-        network_approval_context: None,
-        proposed_execpolicy_amendment: None,
-        proposed_network_policy_amendments: None,
-        additional_permissions: None,
-        available_decisions: None,
-    };
-    handle_exec_approval_request(&mut chat, "sub-long", ev_long);
-    let proposed_long = drain_insert_history(&mut rx);
-    assert!(
-        proposed_long.is_empty(),
-        "expected long approval request to avoid emitting history cells before decision"
-    );
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-    let aborted_long = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected aborted decision cell (long)");
-    assert_chatwidget_snapshot!(
-        "exec_approval_history_decision_aborted_long",
-        lines_to_single_string(&aborted_long)
-    );
-}
-
-#[tokio::test]
-async fn preamble_keeps_working_status_snapshot() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-
-    // Regression sequence: a preamble line is committed to history before any exec/tool event.
-    // After commentary completes, the status row should be restored before subsequent work.
-    chat.on_task_started();
-    chat.on_agent_message_delta("Preamble line\n".to_string());
-    chat.on_commit_tick();
-    drain_insert_history(&mut rx);
-    complete_assistant_message(
-        &mut chat,
-        "msg-commentary-snapshot",
-        "Preamble line\n",
-        Some(MessagePhase::Commentary),
-    );
-
-    let height = chat.desired_height(/*width*/ 80);
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
-        .expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw preamble + status widget");
-    assert_chatwidget_snapshot!(
-        "preamble_keeps_working_status",
-        normalized_backend_snapshot(terminal.backend())
-    );
 }
 
 #[tokio::test]
@@ -612,6 +531,8 @@ async fn exec_end_without_begin_uses_event_command() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
+            sandbox_type: None,
             id: "call-orphan".to_string(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
@@ -847,7 +768,7 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
     drain_insert_history(&mut rx);
 
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
 
@@ -863,7 +784,7 @@ async fn unified_exec_interaction_after_task_complete_is_suppressed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
 
     terminal_interaction(&mut chat, "call-1", "proc-1", "ls\n");
@@ -886,7 +807,7 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
     complete_assistant_message(&mut chat, "msg-1", "Final response.", /*phase*/ None);
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_transcript_normalized(&mut rx);
     let combined = cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
@@ -910,7 +831,7 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
     handle_agent_message_delta(&mut chat, "Streaming response.");
     handle_turn_completed(&mut chat, "turn-wait-1", /*duration_ms*/ None);
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_transcript_normalized(&mut rx);
     let combined = cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
@@ -946,15 +867,20 @@ async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
         );
         handle_turn_completed(&mut chat, "turn-1", duration_ms);
 
-        let cells = drain_insert_history(&mut rx);
+        let cells = drain_insert_history_with(&mut rx, |cell| {
+            let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+            if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                assert!(rendered.contains("Worked for 2m 5s"), "{rendered}");
+            }
+            normalize_completion_timestamps(cell, rendered)
+                .lines()
+                .map(|line| Line::from(line.to_owned()))
+                .collect()
+        });
         let combined = cells
             .iter()
             .map(|lines| lines_to_single_string(lines))
             .collect::<String>();
-        assert!(
-            combined.contains("Worked for 2m 05s"),
-            "expected final separator to use cumulative turn duration, got:\n{combined}"
-        );
         assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
     }
 }
@@ -1022,11 +948,31 @@ async fn unified_exec_waiting_multiple_empty_snapshots() {
 
     handle_turn_completed(&mut chat, "turn-wait-3", /*duration_ms*/ None);
 
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
+    let cells = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let compact = cells
         .iter()
-        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| {
+            normalize_completion_timestamps(
+                cell.as_ref(),
+                lines_to_single_string(&cell.display_lines(/*width*/ 80)),
+            )
+        })
         .collect::<String>();
+    let transcript = cells
+        .iter()
+        .map(|cell| {
+            normalize_completion_timestamps(
+                cell.as_ref(),
+                lines_to_single_string(&cell.transcript_lines(/*width*/ 80)),
+            )
+        })
+        .collect::<String>();
+    let combined = format!("Chat:\n{compact}\nTranscript:\n{transcript}");
     assert_chatwidget_snapshot!("unified_exec_waiting_multiple_empty_after", combined);
 }
 
@@ -1059,7 +1005,7 @@ async fn unified_exec_empty_then_non_empty_snapshot() {
     terminal_interaction(&mut chat, "call-wait-2a", "proc-2", "");
     terminal_interaction(&mut chat, "call-wait-2b", "proc-2", "ls\n");
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_transcript(&mut rx);
     let combined = cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
@@ -1085,7 +1031,7 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Waiting for background terminal");
     assert_eq!(status.details(), Some("just fix"));
-    let pre_cells = drain_insert_history(&mut rx);
+    let pre_cells = drain_insert_history_transcript(&mut rx);
     let active_combined = pre_cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
@@ -1094,7 +1040,7 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
 
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
 
-    let post_cells = drain_insert_history(&mut rx);
+    let post_cells = drain_insert_history_transcript_normalized(&mut rx);
     let mut combined = pre_cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
@@ -1120,7 +1066,7 @@ async fn view_image_tool_call_adds_history_cell() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected a single history cell");
     let combined = lines_to_single_string(&cells[0]);
-    assert_chatwidget_snapshot!("local_image_attachment_history_snapshot", combined);
+    assert_eq!(combined, "• Viewed image example.png\n");
 }
 
 #[tokio::test]
@@ -1135,7 +1081,7 @@ async fn view_image_tool_call_preserves_foreign_path() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected a single history cell");
     let combined = lines_to_single_string(&cells[0]);
-    assert_chatwidget_snapshot!("foreign_image_attachment_history_snapshot", combined);
+    assert_eq!(combined, "• Viewed image example.png\n");
 }
 
 #[tokio::test]
@@ -1148,18 +1094,6 @@ async fn image_generation_begin_restores_working_status_after_single_line_preamb
 
     assert!(chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_indicator_visible());
-
-    let width: u16 = 80;
-    let height = chat.desired_height(width);
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
-        .expect("create terminal");
-    terminal
-        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
-        .expect("draw image generation status");
-    assert_chatwidget_snapshot!(
-        "image_generation_begin_restores_working_status",
-        normalized_backend_snapshot(terminal.backend())
-    );
 }
 
 #[tokio::test]
@@ -1223,7 +1157,8 @@ async fn exec_history_extends_previous_when_consecutive() {
         "",
         /*exit_code*/ 0,
     );
-    assert_chatwidget_snapshot!("exploring_step4_finish_cat_foo", active_blob(&chat));
+    let explored_foo = active_blob(&chat);
+    assert_chatwidget_snapshot!("exploring_step4_finish_cat_foo", &explored_foo);
 
     // 5) Start & complete "sed -n 100,200p foo.txt" (treated as Read of foo.txt)
     let begin_sed_range = begin_exec(&mut chat, "call-sed-range", "sed -n 100,200p foo.txt");
@@ -1234,7 +1169,7 @@ async fn exec_history_extends_previous_when_consecutive() {
         "",
         /*exit_code*/ 0,
     );
-    assert_chatwidget_snapshot!("exploring_step5_finish_sed_range", active_blob(&chat));
+    assert_eq!(active_blob(&chat), explored_foo);
 
     // 6) Start & complete "cat bar.txt"
     let begin_cat_bar = begin_exec(&mut chat, "call-cat-bar", "cat bar.txt");
@@ -1282,6 +1217,8 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        daybreak_enabled: false,
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -1298,7 +1235,6 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         collaboration_mode: None,
-        personality: None,
         message_history: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
@@ -1316,6 +1252,7 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected RunUserShellCommand op, got {other:?}"),
     }
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FollowTranscript));
     assert_matches!(
         rx.try_recv(),
         Ok(AppEvent::AppendMessageHistoryEntry { text, .. }) if text == "!echo hi"

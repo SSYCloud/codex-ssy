@@ -21,8 +21,11 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 npm install -g @coohu/codex
 ```
 
+Then simply run `codex` to get started. Or and --no-daemon for app server embedded mod
 
-Then simply run `codex` to get started.
+```shell
+codex --no-daemon
+```
 
 <details>
 <summary>You can also go to the <a href="https://github.com/SSYCloud/codex-ssy/releases">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>

@@ -18,8 +18,10 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_login::auth::BedrockApiKeyAuth;
 use codex_login::default_client::originator;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
@@ -40,6 +42,7 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -79,7 +82,7 @@ use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use futures::StreamExt;
@@ -103,6 +106,153 @@ use wiremock::matchers::query_param;
 const INSTALLATION_ID_FILENAME: &str = "installation_id";
 const TEST_WINDOW_ID: &str = "test-thread:0";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test_case::test_case(false, false)]
+#[test_case::test_case(false, true)]
+#[test_case::test_case(true, false)]
+#[test_case::test_case(true, true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_request_enforces_independent_speed_requirements(
+    fast_enabled: bool,
+    ultrafast_enabled: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    for (tier, enabled) in [("priority", fast_enabled), ("ultrafast", ultrafast_enabled)] {
+        for configure_at_start in [false, true] {
+            let server = start_mock_server().await;
+            let response_mock = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
+            let test = test_codex()
+                .with_model("gpt-5.4")
+                .with_model_info_override("gpt-5.4", move |model| {
+                    model.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
+                        id: tier.to_string(),
+                        name: tier.to_string(),
+                        description: String::new(),
+                    }];
+                })
+                .with_config(move |config| {
+                    config
+                        .features
+                        .set_enabled(Feature::FastMode, fast_enabled)
+                        .expect("configure Fast mode");
+                    config
+                        .features
+                        .set_enabled(Feature::UltrafastMode, ultrafast_enabled)
+                        .expect("configure Ultra Fast mode");
+                    config.service_tier = configure_at_start.then(|| tier.to_string());
+                })
+                .build_with_auto_env(&server)
+                .await?;
+            if !configure_at_start {
+                core_test_support::submit_thread_settings(
+                    &test.codex,
+                    ThreadSettingsOverrides {
+                        service_tier: Some(Some(tier.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            test.submit_turn("hello").await?;
+            assert_eq!(
+                response_mock.single_request().body_json()["service_tier"].as_str(),
+                enabled.then_some(tier),
+                "tier={tier}, configure_at_start={configure_at_start}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_request_preserves_flex_without_catalog_support_or_fast_mode()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    for configure_at_start in [false, true] {
+        let server = start_mock_server().await;
+        let response_mock = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
+        let test = test_codex()
+            .with_model("gpt-5.4")
+            .with_model_info_override("gpt-5.4", |model| model.service_tiers.clear())
+            .with_config(move |config| {
+                config
+                    .features
+                    .disable(Feature::FastMode)
+                    .expect("disable FastMode");
+                config.service_tier = configure_at_start.then(|| "flex".to_string());
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        if !configure_at_start {
+            core_test_support::submit_thread_settings(
+                &test.codex,
+                ThreadSettingsOverrides {
+                    service_tier: Some(Some("flex".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        assert_eq!(
+            response_mock.single_request().body_json()["service_tier"],
+            json!("flex"),
+            "configure_at_start={configure_at_start}",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_request_uses_implicit_default_tier_for_bedrock() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    for provider_id in [
+        AMAZON_BEDROCK_PROVIDER_ID,
+        AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
+    ] {
+        let server = start_mock_server().await;
+        let response_mock = mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
+        let test = test_codex()
+            .with_auth(CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
+                api_key: "dummy".to_string(),
+                region: "us-east-1".to_string(),
+            }))
+            .with_model("gpt-5.4")
+            .with_model_info_override("gpt-5.4", |model| model.service_tiers.clear())
+            .with_config(move |config| {
+                let base_url = config.model_provider.base_url.clone();
+                config.model_provider_id = provider_id.to_string();
+                config.model_provider = built_in_model_providers(/*openai_base_url*/ None)
+                    .remove(provider_id)
+                    .expect("built-in Bedrock provider");
+                config.model_provider.base_url = base_url;
+                config.service_tier = Some("flex".to_string());
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        test.submit_turn("hello").await?;
+
+        assert_eq!(
+            response_mock
+                .single_request()
+                .body_json()
+                .get("service_tier"),
+            None,
+            "provider={provider_id}",
+        );
+    }
+    Ok(())
+}
 
 fn rollout_response_item(item: ResponseItem) -> RolloutItem {
     RolloutItem::ResponseItem(item.into())
@@ -237,7 +387,7 @@ async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_
     let first_input = first["input"].as_array().expect("first input");
     let second_input = second["input"].as_array().expect("second input");
     assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
-    for item in first_input {
+    for item in &first_input[1..] {
         assert_eq!(
             item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str(),
             Some(first_turn_id)
@@ -637,9 +787,6 @@ async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> a
     .await;
     let test = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
-        })
         .build(&server)
         .await?;
 
@@ -742,7 +889,7 @@ impl ProviderAuthCommandFixture {
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 if [ -f fail-until-401 ]; then
@@ -754,12 +901,6 @@ tail -n +2 tokens.txt > tokens.next
 mv tokens.next tokens.txt
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./print-token.sh".to_string(), Vec::new())
         };
 
@@ -817,7 +958,7 @@ fn non_zero_u64(value: u64) -> NonZeroU64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_includes_initial_messages_and_sends_prior_items() {
+async fn resume_sends_prior_items() {
     skip_if_no_network!();
 
     // Create a fake rollout session file with prior user + system + assistant messages.
@@ -932,18 +1073,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .await
         .expect("resume conversation");
     let codex = test.codex.clone();
-    let session_configured = test.session_configured;
 
-    // 1) Assert initial_messages only includes existing EventMsg entries; response items are not converted
-    let initial_msgs = session_configured
-        .initial_messages
-        .clone()
-        .expect("expected initial messages option for resumed session");
-    let initial_json = serde_json::to_value(&initial_msgs).unwrap();
-    let expected_initial_json = json!([]);
-    assert_eq!(initial_json, expected_initial_json);
-
-    // 2) Submit new input; the request body must include the prior items, then initial context, then new user input.
+    // Submit new input; the request body must include the prior items, then initial context, then new user input.
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "hello".into(),
@@ -1081,7 +1212,9 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
-                    image_url: legacy_image_url.to_string(),
+                    image: ImageReference::Inline {
+                        image_url: legacy_image_url.to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }],
                 phase: None,
@@ -1221,7 +1354,9 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: image_url.to_string(),
+                        image: ImageReference::Inline {
+                            image_url: image_url.to_string(),
+                        },
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1250,7 +1385,9 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: image_url.to_string(),
+                        image: ImageReference::Inline {
+                            image_url: image_url.to_string(),
+                        },
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1276,7 +1413,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
     .await;
 
     let codex_home = Arc::new(TempDir::new().unwrap());
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.5");
     let test = builder
         .resume(&server, codex_home, session_path.clone())
         .await
@@ -1425,6 +1562,42 @@ async fn provider_auth_command_refreshes_after_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auth_command_refreshes_during_websocket_preconnect() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let auth_fixture = ProviderAuthCommandFixture::new(&["first-token", "second-token"]).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer first-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Auth must recover during preconnect, before the ordinary HTTP fallback turn.
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer second-token"))
+        .respond_with(ResponseTemplate::new(426))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_sse_once_match(
+        &server,
+        header("authorization", "Bearer second-token"),
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.requires_openai_auth = false;
+    provider.auth = Some(auth_fixture.auth());
+    provider.supports_websockets = true;
+    send_request_with_provider(provider).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_auth_command_recovers_after_initial_resolution_failure() {
     skip_if_no_network!();
 
@@ -1508,10 +1681,12 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let provider = ModelProviderInfo {
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: Some(auth),
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -1524,6 +1699,8 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     };
 
     send_request_with_provider(provider).await;
@@ -1531,6 +1708,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
 
 #[expect(clippy::unwrap_used)]
 async fn send_request_with_provider(provider: ModelProviderInfo) {
+    let preconnect = provider.supports_websockets;
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
@@ -1566,6 +1744,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -1575,9 +1754,22 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
             .enabled(Feature::ConcurrentReasoningSummaries),
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
+    if preconnect {
+        client_session
+            .preconnect_websocket(
+                &model_info,
+                /*service_tier*/ None,
+                &session_telemetry,
+                &responses_metadata,
+            )
+            .await
+            .expect("preconnect should recover authentication before the first turn");
+    }
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Message {
         id: None,
@@ -1643,14 +1835,7 @@ async fn includes_base_instructions_override_in_request() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert!(
-        request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("test instructions")
-    );
+    assert_eq!(request.instructions_text(), "test instructions");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1844,11 +2029,11 @@ async fn includes_user_instructions_message_in_request() {
         .with_pre_build_hook(|home| {
             std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = test.codex.clone();
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1863,12 +2048,7 @@ async fn includes_user_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
+    assert!(!request.instructions_text().contains("be nice"));
     assert_message_role(&request_body["input"][0], "developer");
     let developer_texts = request_body["input"]
         .as_array()
@@ -1884,8 +2064,8 @@ async fn includes_user_instructions_message_in_request() {
         "expected permissions message to mention sandbox_mode, got {developer_texts:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert_message_role(&request_body["input"][2], "user");
+    let user_context_texts = message_input_texts(&request_body["input"][2]);
     assert!(
         user_context_texts
             .iter()
@@ -2257,43 +2437,46 @@ async fn powershell_shell_version_is_model_visible_only_when_enabled() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_configured_max_effort_in_request() -> anyhow::Result<()> {
+async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    let server = MockServer::start().await;
+    for (effort, expected) in [
+        ("max", json!("max")),
+        ("0", json!(0)),
+        ("64", json!(64)),
+        ("future", json!("future")),
+        ("-1", json!("-1")),
+        ("18446744073709551616", json!("18446744073709551616")),
+    ] {
+        let server = MockServer::start().await;
+        let resp_mock = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        )
+        .await;
+        let TestCodex { codex, .. } = test_codex()
+            .with_model("gpt-5.4")
+            .with_pre_build_hook(move |home| {
+                std::fs::write(
+                    home.join("config.toml"),
+                    format!("model_reasoning_effort = \"{effort}\"\n"),
+                )
+                .expect("write test config");
+            })
+            .build_with_auto_env(&server)
+            .await?;
 
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
-        .with_config(|config| {
-            config.model_reasoning_effort = Some(ReasoningEffort::Max);
-        })
-        .build(&server)
-        .await?;
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .unwrap();
 
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert_eq!(
-        request_body
-            .get("reasoning")
-            .and_then(|t| t.get("effort"))
-            .and_then(|v| v.as_str()),
-        Some("max")
-    );
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+        let request = resp_mock.single_request();
+        assert_eq!(request.body_json()["reasoning"]["effort"], expected);
+    }
 
     Ok(())
 }
@@ -2309,7 +2492,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.5").build(&server).await?;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2363,7 +2546,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(config.cwd.clone())),
+                environments: Some(local_requests(config.cwd.clone())),
                 approval_policy: Some(config.permissions.approval_policy.value()),
                 sandbox_policy: Some(config.legacy_sandbox_policy()),
                 summary: Some(
@@ -2463,12 +2646,12 @@ async fn model_without_summary_parameter_support_omits_configured_summary() -> a
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.supports_reasoning_summary_parameter = false;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_catalog = Some(model_catalog);
             config.model_reasoning_effort = Some(ReasoningEffort::High);
@@ -2597,8 +2780,8 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
     let TestCodex {
@@ -2607,7 +2790,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
         session_configured,
         ..
     } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_catalog = Some(model_catalog);
         })
@@ -2621,7 +2804,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(config.cwd.clone())),
+                environments: Some(local_requests(config.cwd.clone())),
                 approval_policy: Some(config.permissions.approval_policy.value()),
                 sandbox_policy: Some(config.legacy_sandbox_policy()),
                 summary: Some(ReasoningSummary::Concise),
@@ -2710,12 +2893,12 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             config.model_reasoning_summary = Some(ReasoningSummary::None);
             config.model_catalog = Some(model_catalog);
@@ -2754,7 +2937,7 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.5").build(&server).await?;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2832,7 +3015,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
     )
     .await;
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(|config| {
             config.model_verbosity = Some(Verbosity::High);
         })
@@ -2881,11 +3064,11 @@ async fn includes_developer_instructions_message_in_request() {
         .with_config(|config| {
             config.developer_instructions = Some("be useful".to_string());
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = test.codex.clone();
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2900,12 +3083,7 @@ async fn includes_developer_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
+    assert!(!request.instructions_text().contains("be nice"));
     assert_message_role(&request_body["input"][0], "developer");
     let developer_texts = request_body["input"]
         .as_array()
@@ -2925,8 +3103,8 @@ async fn includes_developer_instructions_message_in_request() {
         "expected developer instructions in a developer message, got {developer_texts:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    let user_context_texts = message_input_texts(&request_body["input"][1]);
+    assert_message_role(&request_body["input"][2], "user");
+    let user_context_texts = message_input_texts(&request_body["input"][2]);
     assert!(
         user_context_texts
             .iter()
@@ -3006,10 +3184,12 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
     let provider = ModelProviderInfo {
         name: "azure".into(),
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -3022,6 +3202,8 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -3060,12 +3242,15 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
@@ -3191,23 +3376,20 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
 
     assert_eq!(body["store"], serde_json::Value::Bool(false));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(10));
-    assert_eq!(body["input"][0]["id"].as_str(), Some("rs_reasoning-id"));
-    assert_eq!(body["input"][1]["id"].as_str(), Some("msg_message-id"));
-    assert_eq!(body["input"][2]["id"].as_str(), Some("ws_web-search-id"));
-    assert_eq!(body["input"][3]["id"].as_str(), Some("fc_function-id"));
-    assert_eq!(
-        body["input"][4]["call_id"].as_str(),
-        Some("function-call-id")
-    );
-    assert_eq!(body["input"][5]["id"].as_str(), Some("lsh_local-shell-id"));
-    assert_eq!(body["input"][6]["id"].as_str(), Some("ctc_custom-tool-id"));
-    assert_eq!(
-        body["input"][7]["call_id"].as_str(),
-        Some("custom-tool-call-id")
-    );
-    assert_eq!(body["input"][8].get("id"), None);
-    assert_eq!(body["input"][9].get("id"), None);
+    let input = body["input"].as_array().expect("request input");
+    assert_eq!(input[0]["role"], "developer");
+    let input = &input[1..];
+    assert_eq!(input.len(), 10);
+    assert_eq!(input[0]["id"].as_str(), Some("rs_reasoning-id"));
+    assert_eq!(input[1]["id"].as_str(), Some("msg_message-id"));
+    assert_eq!(input[2]["id"].as_str(), Some("ws_web-search-id"));
+    assert_eq!(input[3]["id"].as_str(), Some("fc_function-id"));
+    assert_eq!(input[4]["call_id"].as_str(), Some("function-call-id"));
+    assert_eq!(input[5]["id"].as_str(), Some("lsh_local-shell-id"));
+    assert_eq!(input[6]["id"].as_str(), Some("ctc_custom-tool-id"));
+    assert_eq!(input[7]["call_id"].as_str(), Some("custom-tool-call-id"));
+    assert_eq!(input[8].get("id"), None);
+    assert_eq!(input[9].get("id"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3631,10 +3813,12 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
     let provider = ModelProviderInfo {
         name: "custom".to_string(),
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
@@ -3654,6 +3838,8 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     };
 
     // Init session
@@ -3715,6 +3901,7 @@ async fn env_var_overrides_loaded_auth() {
     let provider = ModelProviderInfo {
         name: ModelProviderInfo::create_openai_provider(/*base_url*/ None).name,
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         query_params: Some(std::collections::HashMap::from([(
@@ -3724,6 +3911,7 @@ async fn env_var_overrides_loaded_auth() {
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         http_headers: Some(std::collections::HashMap::from([(
@@ -3738,6 +3926,8 @@ async fn env_var_overrides_loaded_auth() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     };
 
     // Init session

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use codex_exec_server::EnvironmentAccess;
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::FileSystemEnvironmentAccessor;
 use codex_extension_api::SelectedPluginSnapshot;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::protocol::Product;
@@ -26,6 +29,7 @@ use crate::provider::MAX_SKILL_RESOURCE_CONTENT_BYTES;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillProvider;
 use crate::provider::SkillProviderFuture;
+use crate::provider::SkillReadContext;
 use crate::provider::SkillReadRequest;
 use crate::provider::SkillSearchRequest;
 
@@ -34,6 +38,7 @@ use crate::provider::SkillSearchRequest;
 pub struct ExecutorSkillProvider {
     environment_manager: Arc<EnvironmentManager>,
     restriction_product: Option<Product>,
+    disabled_skill_paths: HashMap<String, HashSet<PathUri>>,
 }
 
 impl ExecutorSkillProvider {
@@ -44,7 +49,19 @@ impl ExecutorSkillProvider {
         Self {
             environment_manager,
             restriction_product,
+            disabled_skill_paths: HashMap::new(),
         }
+    }
+
+    /// Applies caller-owned disablement to executor catalogs. Paths identify SKILL.md
+    /// documents in their executor's filesystem; other executors are unaffected.
+    /// By default, all discovered skills remain enabled.
+    pub fn with_disabled_skill_paths(
+        mut self,
+        disabled_skill_paths: HashMap<String, HashSet<PathUri>>,
+    ) -> Self {
+        self.disabled_skill_paths = disabled_skill_paths;
+        self
     }
 }
 
@@ -59,7 +76,7 @@ pub(crate) fn attribute_executor_plugins(
         if let Some(plugin) = snapshot
             .plugins
             .iter()
-            .find(|plugin| plugin.selected_root_id == skill.authority.id)
+            .find(|plugin| plugin.selected_root_id.as_ref() == Some(&skill.authority.id))
         {
             skill.plugin_id = Some(plugin.plugin_id.clone());
             skill.analytics_scope = Some(SkillScope::User);
@@ -98,8 +115,10 @@ impl SkillProvider for ExecutorSkillProvider {
                     ));
                     continue;
                 };
+                // TODO(anp): Take this accessor from the selected turn root when discovery receives
+                // turn permissions; until then, preserve direct access through its existing filesystem.
                 let outcome = load_environment_skills_from_root(
-                    file_system.as_ref(),
+                    &FileSystemEnvironmentAccessor::unrestricted(&file_system),
                     path,
                     self.restriction_product,
                 )
@@ -113,6 +132,7 @@ impl SkillProvider for ExecutorSkillProvider {
                         path,
                         environment_id,
                         /*instructions*/ None,
+                        &self.disabled_skill_paths,
                     ));
                 }
             }
@@ -143,39 +163,23 @@ impl SkillProvider for ExecutorSkillProvider {
                     "executor skill resource does not match its package",
                 ));
             }
+            let SkillReadContext::Executor { fs } = request.context else {
+                return Err(SkillProviderError::new(
+                    "executor skill reads require filesystem access",
+                ));
+            };
             if let Some(contents) = request.resource.environment_contents() {
                 return Ok(SkillReadResult {
                     resource: request.resource.clone(),
                     contents: contents.to_string(),
                 });
             }
-            let Some((environment_id, resource_path)) = request.resource.environment_path() else {
+            let Some((_, resource_path)) = request.resource.environment_path() else {
                 return Err(SkillProviderError::new(
                     "executor skill resource is not bound to an environment",
                 ));
             };
-            let file_system = request
-                .resolved_executor_roots
-                .iter()
-                .find(|root| root.selected_root().id == request.authority.id)
-                .map(|root| root.environment().get_filesystem())
-                .or_else(|| {
-                    self.environment_manager
-                        .get_environment(environment_id)
-                        .map(|environment| environment.get_filesystem())
-                });
-            let Some(file_system) = file_system else {
-                return Err(SkillProviderError::new(format!(
-                    "executor skill resource references unavailable environment `{environment_id}`"
-                )));
-            };
-            let contents = read_bounded_text(
-                file_system.as_ref(),
-                resource_path,
-                request.resource.as_str(),
-                request.sandbox.as_ref(),
-            )
-            .await?;
+            let contents = read_bounded_text(fs, resource_path, request.resource.as_str()).await?;
 
             Ok(SkillReadResult {
                 resource: request.resource,
@@ -223,6 +227,7 @@ impl ExecutorSkillProvider {
                     path,
                     environment_id,
                     Some(skill.instructions),
+                    &self.disabled_skill_paths,
                 ));
             }
         }
@@ -237,6 +242,7 @@ fn catalog_entry_from_skill(
     selected_root_path: &PathUri,
     environment_id: &str,
     instructions: Option<String>,
+    disabled_skill_paths: &HashMap<String, HashSet<PathUri>>,
 ) -> SkillCatalogEntry {
     let handle_prefix = format!("skill://{selected_root_id}/");
     let alias_root = format!(
@@ -269,7 +275,7 @@ fn catalog_entry_from_skill(
             skill.path_to_skills_md.clone(),
         ),
     };
-    let entry = SkillCatalogEntry::new(
+    let mut entry = SkillCatalogEntry::new(
         SkillPackageId(package),
         authority,
         skill.name.clone(),
@@ -280,6 +286,13 @@ fn catalog_entry_from_skill(
     .with_display_path(main_resource)
     .with_alias_root(alias_root)
     .with_dependencies(skill.dependencies.clone());
+
+    if disabled_skill_paths
+        .get(environment_id)
+        .is_some_and(|paths| paths.contains(&skill.path_to_skills_md))
+    {
+        entry = entry.disabled();
+    }
 
     if skill.allows_implicit_invocation() {
         entry
@@ -298,30 +311,17 @@ fn normalized_environment_path(path: &PathUri) -> String {
 }
 
 async fn read_bounded_text(
-    file_system: &dyn codex_exec_server::ExecutorFileSystem,
+    file_system: &dyn EnvironmentAccess,
     path: &PathUri,
     resource: &str,
-    sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<String, SkillProviderError> {
     let read_error = |err| {
         SkillProviderError::new(format!(
             "failed to read executor skill resource {resource}: {err}"
         ))
     };
-    if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox)
-        && path.infer_path_convention() == Some(PathConvention::Windows)
-        && sandbox.is_some_and(|context| {
-            context.windows_sandbox_level
-                == codex_protocol::config_types::WindowsSandboxLevel::Disabled
-        })
-    {
-        return Err(SkillProviderError::new(
-            "executor skill resource requires an unavailable filesystem sandbox",
-        ));
-    }
-
     let mut stream = file_system
-        .read_file_stream(path, sandbox)
+        .read_file_stream(path)
         .await
         .map_err(&read_error)?;
     let mut contents = Vec::new();

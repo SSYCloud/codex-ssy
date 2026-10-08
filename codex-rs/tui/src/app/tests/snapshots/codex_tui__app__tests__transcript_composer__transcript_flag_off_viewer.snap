@@ -1,6 +1,6 @@
 ---
 source: tui/src/app/tests/transcript_composer.rs
-expression: text
+expression: buffer_text(&buffer)
 ---
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
 
@@ -10,6 +10,6 @@ expression: text
 
 › second
 
-───────────────────────────────────────────────────────────────────────────────────────────── 100% ─
- ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
- q close   esc to edit prev
+⌃space select
+ ↑/↓ to scroll · pgup/pgdn to page · home/end to jump
+ q close · f3 find · esc browse prompts

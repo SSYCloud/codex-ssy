@@ -9,8 +9,9 @@ use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 
-pub(super) async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+pub(crate) async fn make_test_app() -> App {
+    let (mut chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    let test_codex_home = chat_widget.test_codex_home.take();
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -33,17 +34,24 @@ pub(super) async fn make_test_app() -> App {
         loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
+        runtime_approvals_reviewer_override: None,
         runtime_permission_profile_override: None,
+        pending_server_profiles: HashMap::new(),
         file_search,
         transcript_cells: Vec::new(),
+        native_history: Default::default(),
+        turn_tips: Default::default(),
+        transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
         pending_thread_usage_history_refresh: false,
         overlay: None,
+        retained_analytics: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
+        pending_thread_switch_resets: 0,
         scrollback_has_older_history: false,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -58,13 +66,27 @@ pub(super) async fn make_test_app() -> App {
         feedback_audience: FeedbackAudience::External,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         app_server_target: crate::AppServerTarget::Embedded,
+        pending_right_click_paste: None,
+        right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+            primary: false,
+            platform_default: true,
+            ssh: false,
+            wsl: false,
+            vscode: crate::tui::VscodeDetection::Other,
+        },
         reconnect: Default::default(),
+        daemon_cli_executable: None,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
+        pending_realtime_speech_replay: HashMap::new(),
+        pending_realtime_transcript_replay: HashMap::new(),
+        realtime_replay_order: VecDeque::new(),
+        background_voice: None,
+        background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
-        pending_thread_titles: HashSet::new(),
+        pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
@@ -80,6 +102,9 @@ pub(super) async fn make_test_app() -> App {
         dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
         dynamic_tool_tasks: HashMap::new(),
         pending_startup_thread_start: false,
+        pending_server_version_notice: None,
+        pending_open_resume_picker: false,
+        pending_working_directory_change: None,
         pending_start_managed_worktree: None,
         pending_managed_worktree_creation: false,
         pending_managed_worktree_created: None,
@@ -87,11 +112,15 @@ pub(super) async fn make_test_app() -> App {
         pending_managed_worktree_attach: None,
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
+        account_email_request_id: None,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
+        pending_mcp_login_start: None,
+        active_mcp_login_ids: HashMap::new(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
+        _test_codex_home: test_codex_home,
     }
 }
 

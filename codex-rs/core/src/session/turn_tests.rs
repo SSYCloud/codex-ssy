@@ -46,16 +46,18 @@ fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
         .with(feedback.logger_layer())
         .with(tracing_subscriber::fmt::layer().with_filter(codex_state::log_db::default_filter()));
 
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        assert!(!tracing::event_enabled!(
-            target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
-            tracing::Level::TRACE,
-            turn_id,
-            estimated_token_count,
-            message
-        ));
-    });
+    static METADATA: tracing::Metadata<'static> = tracing::metadata! {
+        name: "post sampling token estimate filter probe",
+        target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
+        level: tracing::Level::TRACE,
+        fields: &["turn_id", "estimated_token_count", "message"],
+        callsite: &CALLSITE,
+        kind: tracing::metadata::Kind::EVENT.hint(),
+    };
+    static CALLSITE: tracing::callsite::DefaultCallsite =
+        tracing::callsite::DefaultCallsite::new(&METADATA);
+
+    assert!(tracing::Subscriber::register_callsite(&subscriber, &METADATA).is_never());
 }
 
 #[tokio::test]
@@ -69,9 +71,10 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
     let mut last_agent_message = None;
     let item = assistant_output_text("original assistant text");
 
+    let step_context = StepContext::for_test(Arc::new(turn_context));
     let handled = handle_assistant_item_done_in_plan_mode(
         &session,
-        &turn_context,
+        &step_context,
         &turn_store,
         &item,
         &mut state,
@@ -84,5 +87,27 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
     assert_eq!(
         last_agent_message.as_deref(),
         Some("plan contributed assistant text")
+    );
+}
+
+#[test]
+fn realtime_user_verification_notice_excludes_request_payload() {
+    let event = EventMsg::ElicitationRequest(codex_protocol::approvals::ElicitationRequestEvent {
+        turn_id: None,
+        server_name: "private-server-name".to_string(),
+        id: codex_protocol::mcp::RequestId::String("private-request-id".to_string()),
+        request: codex_protocol::approvals::ElicitationRequest::UserVerification {
+            meta: None,
+            title: "private-title".to_string(),
+            description: "private-description".to_string(),
+            challenge: "private-challenge".to_string(),
+        },
+    });
+    assert_eq!(
+        realtime_text_for_event(&event),
+        Some(RealtimeEventText::Handoff(
+            "<user_verification_notice>User verification is required. Please respond in the app.</user_verification_notice>".to_string(),
+            None,
+        )),
     );
 }

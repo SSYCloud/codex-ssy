@@ -14,6 +14,7 @@ use codex_state::ThreadMetadata;
 use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
 use super::helpers::git_info_from_parts;
+use super::helpers::has_guardian_default_title;
 use super::helpers::permission_profile_from_metadata_value;
 use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name;
@@ -198,7 +199,7 @@ fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> Thr
     Ok(())
 }
 
-async fn resolve_requested_rollout_path(
+pub(super) async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
@@ -252,8 +253,14 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    let before = super::history_revision::read(&path).await;
     let items = load_history_items(&path).await?;
-    thread.history = Some(StoredThreadHistory { thread_id, items });
+    let after = super::history_revision::read(&path).await;
+    thread.history = Some(StoredThreadHistory {
+        revision: before.filter(|revision| Some(revision) == after.as_ref()),
+        thread_id,
+        items,
+    });
     Ok(())
 }
 
@@ -437,14 +444,16 @@ async fn thread_name_from_metadata(
     match history_mode {
         ThreadHistoryMode::Paginated => sqlite_thread_name(metadata),
         ThreadHistoryMode::Legacy => {
-            if let Some(title) = distinct_thread_metadata_title(metadata) {
-                Some(title)
+            let title = distinct_thread_metadata_title(metadata);
+            if title.is_some() && !has_guardian_default_title(metadata) {
+                title
             } else {
                 find_thread_name_by_id(store.config.codex_home.as_path(), &metadata.id)
                     .await
                     .ok()
                     .flatten()
                     .filter(|name| !name.trim().is_empty())
+                    .or(title)
             }
         }
     }

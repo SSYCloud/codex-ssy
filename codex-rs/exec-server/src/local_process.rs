@@ -40,13 +40,14 @@ use crate::ExecProcessEvent;
 use crate::ExecProcessEventReceiver;
 use crate::ExecProcessFuture;
 use crate::ExecServerError;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ProcessId;
 use crate::StartedExecProcess;
 use crate::network_policy_decisions::network_policy_decider;
 use crate::process::ExecProcessEventLog;
 use crate::process::sandbox_type_from_protocol;
 use crate::process_sandbox::prepare_exec_request_with_telemetry;
+use crate::protocol::ByteChunk;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::ExecClosedNotification;
 use crate::protocol::ExecEnvPolicy;
@@ -95,19 +96,12 @@ const EXITED_PROCESS_RETENTION: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 const EXITED_PROCESS_RETENTION: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
-struct RetainedOutputChunk {
-    seq: u64,
-    stream: ExecOutputStream,
-    chunk: Vec<u8>,
-}
-
 struct RunningProcess {
     session: ExecCommandSession,
     tty: bool,
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
-    output: VecDeque<RetainedOutputChunk>,
+    output: VecDeque<ProcessOutputChunk>,
     retained_bytes: usize,
     next_seq: u64,
     exit_code: Option<i32>,
@@ -174,7 +168,7 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct LocalProcess {
     inner: Arc<Inner>,
-    runtime_paths: Option<ExecServerRuntimePaths>,
+    runtime_paths: Option<ExecServerRuntimeOptions>,
 }
 
 struct LocalExecProcess {
@@ -191,11 +185,11 @@ impl Default for LocalProcess {
 }
 
 impl LocalProcess {
-    pub(crate) fn with_local_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self {
+    pub(crate) fn with_local_runtime_paths(runtime_paths: ExecServerRuntimeOptions) -> Self {
         Self::with_discarded_notifications(Some(runtime_paths))
     }
 
-    fn with_discarded_notifications(runtime_paths: Option<ExecServerRuntimePaths>) -> Self {
+    fn with_discarded_notifications(runtime_paths: Option<ExecServerRuntimeOptions>) -> Self {
         let (outgoing_tx, mut outgoing_rx) =
             mpsc::channel::<RpcServerOutboundMessage>(NOTIFICATION_CHANNEL_CAPACITY);
         tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
@@ -209,7 +203,7 @@ impl LocalProcess {
     pub(crate) fn new(
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
-        runtime_paths: ExecServerRuntimePaths,
+        runtime_paths: ExecServerRuntimeOptions,
     ) -> Self {
         Self::with_runtime_paths(notifications, telemetry, Some(runtime_paths))
     }
@@ -217,7 +211,7 @@ impl LocalProcess {
     fn with_runtime_paths(
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
-        runtime_paths: Option<ExecServerRuntimePaths>,
+        runtime_paths: Option<ExecServerRuntimeOptions>,
     ) -> Self {
         let requests = notifications.request_sender();
         Self {
@@ -379,7 +373,8 @@ impl LocalProcess {
         #[cfg(unix)]
         let mut prepared = prepared;
         #[cfg(unix)]
-        self.inner
+        let snapshot_file = self
+            .inner
             .shell_snapshots
             .prepare(
                 &params,
@@ -396,6 +391,7 @@ impl LocalProcess {
             SandboxType::MacosSeatbelt => Some(ProcessSandboxType::MacosSeatbelt),
             SandboxType::LinuxSeccomp => Some(ProcessSandboxType::LinuxSeccomp),
             SandboxType::WindowsRestrictedToken => Some(ProcessSandboxType::WindowsRestrictedToken),
+            SandboxType::WindowsMxc => Some(ProcessSandboxType::WindowsMxc),
         };
 
         let start = Arc::new(ProcessStart);
@@ -412,6 +408,13 @@ impl LocalProcess {
             );
         }
 
+        #[cfg(unix)]
+        let inherited_fds = snapshot_file
+            .iter()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        #[cfg(not(unix))]
+        let inherited_fds = Vec::new();
         let spawned_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &prepared.command,
             cwd: prepared.cwd.as_path(),
@@ -421,9 +424,11 @@ impl LocalProcess {
             windows_sandbox: prepared.windows_sandbox_spawn_request(),
             tty: params.tty,
             stdin_open: params.tty || params.pipe_stdin,
-            inherited_fds: &[],
+            inherited_fds: codex_utils_pty::ChildFds::Attached(&inherited_fds),
         })
         .await;
+        #[cfg(unix)]
+        drop(snapshot_file);
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -567,16 +572,12 @@ impl LocalProcess {
                 let mut total_bytes = 0;
                 let mut next_seq = process.next_seq;
                 for retained in process.output.iter().filter(|chunk| chunk.seq > after_seq) {
-                    let chunk_len = retained.chunk.len();
+                    let chunk_len = retained.chunk.0.len();
                     if !chunks.is_empty() && total_bytes + chunk_len > max_bytes {
                         break;
                     }
                     total_bytes += chunk_len;
-                    chunks.push(ProcessOutputChunk {
-                        seq: retained.seq,
-                        stream: retained.stream,
-                        chunk: retained.chunk.clone().into(),
-                    });
+                    chunks.push(retained.clone());
                     next_seq = retained.seq + 1;
                     if total_bytes >= max_bytes {
                         break;
@@ -826,6 +827,7 @@ impl ExecBackend for LocalProcess {
                     CapturePurpose::Prewarm,
                 )
                 .await
+                .map(|_| ())
                 .map_err(map_handler_error)
         })
     }
@@ -972,6 +974,7 @@ async fn stream_output(
 ) {
     while let Some(chunk) = receiver.recv().await {
         let _chunk_len = chunk.len();
+        let chunk = ByteChunk::from(chunk);
         let notification = {
             let mut processes = inner.processes.lock().await;
             let Some(entry) = processes.get_mut(&process_id) else {
@@ -982,26 +985,19 @@ async fn stream_output(
             };
             let seq = process.next_seq;
             process.next_seq += 1;
-            process.retained_bytes += chunk.len();
-            process.output.push_back(RetainedOutputChunk {
-                seq,
-                stream,
-                chunk: chunk.clone(),
-            });
+            process.retained_bytes += chunk.0.len();
+            let output = ProcessOutputChunk { seq, stream, chunk };
+            process.output.push_back(output.clone());
             while process.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS
                 || process.output.len() > RETAINED_OUTPUT_CHUNKS_PER_PROCESS
             {
                 let Some(evicted) = process.output.pop_front() else {
                     break;
                 };
-                process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
+                process.retained_bytes =
+                    process.retained_bytes.saturating_sub(evicted.chunk.0.len());
             }
             let _ = process.wake_tx.send(seq);
-            let output = ProcessOutputChunk {
-                seq,
-                stream,
-                chunk: chunk.into(),
-            };
             process
                 .events
                 .publish(ExecProcessEvent::Output(output.clone()));
@@ -1075,11 +1071,11 @@ fn watch_exit(
                     for chunk in &process.output {
                         match chunk.stream {
                             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                                stdout.extend_from_slice(&chunk.chunk);
+                                stdout.extend_from_slice(&chunk.chunk.0);
                             }
-                            ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk),
+                            ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk.0),
                         }
-                        aggregated.extend_from_slice(&chunk.chunk);
+                        aggregated.extend_from_slice(&chunk.chunk.0);
                     }
                     let exec_output = ExecToolCallOutput {
                         exit_code,
@@ -1249,6 +1245,20 @@ mod tests {
     use crate::protocol::NetworkPolicyRequestParams;
     #[cfg(not(target_os = "windows"))]
     use crate::protocol::NetworkPolicyRequestResponse;
+
+    #[cfg(target_os = "linux")]
+    #[ctor::ctor]
+    fn initialize_spawn_helper() {
+        use std::os::unix::ffi::OsStringExt;
+        let command_line = std::fs::read("/proc/self/cmdline").expect("test command line");
+        codex_utils_pty::init_spawn_helper(
+            command_line
+                .strip_suffix(&[0])
+                .unwrap_or(&command_line)
+                .split(|byte| *byte == 0)
+                .map(|arg| std::ffi::OsString::from_vec(arg.to_vec())),
+        );
+    }
 
     fn test_exec_params(env: HashMap<String, String>) -> ExecParams {
         ExecParams {
@@ -1708,10 +1718,10 @@ mod tests {
                 panic!("process should be running");
             };
             running.output = (1..=retained_chunk_count)
-                .map(|seq| RetainedOutputChunk {
+                .map(|seq| ProcessOutputChunk {
                     seq,
                     stream: ExecOutputStream::Stdout,
-                    chunk: vec![b'x'],
+                    chunk: vec![b'x'].into(),
                 })
                 .collect();
             running.retained_bytes = RETAINED_OUTPUT_CHUNKS_PER_PROCESS;
@@ -1818,6 +1828,7 @@ mod tests {
             .expect("build remote network proxy config");
         let state = NetworkProxyState::from_remote_launch_config(
             RemoteNetworkProxyLaunchConfig::new(proxy_config),
+            codex_utils_path_uri::Platform::native(),
         )
         .expect("build network proxy state");
         let proxy = NetworkProxy::builder()

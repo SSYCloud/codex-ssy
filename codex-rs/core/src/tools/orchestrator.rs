@@ -23,12 +23,16 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::default_exec_approval_requirement;
+use crate::tools::sandboxing::ensure_native_sandbox;
 use crate::tools::sandboxing::sandbox_override_for_first_attempt;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::PROTECTED_METADATA_PATH_NAMES;
+use codex_protocol::permissions::file_system_root;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxManager;
@@ -62,6 +66,7 @@ impl ToolOrchestrator {
         let network_approval = match begin_network_approval(
             &tool_ctx.session,
             &tool_ctx.step_context.turn,
+            &tool_ctx.step_context.environments,
             attempt.enforce_managed_network,
             network_approval_spec,
         )
@@ -79,6 +84,7 @@ impl ToolOrchestrator {
             tool_name: tool_ctx.tool_name.clone(),
         };
         let attempt_with_network_approval = SandboxAttempt {
+            sandbox_override: attempt.sandbox_override,
             sandbox: attempt.sandbox,
             sandbox_requested: attempt.sandbox_requested,
             permissions: attempt.permissions,
@@ -87,10 +93,10 @@ impl ToolOrchestrator {
             manager: attempt.manager,
             sandbox_cwd: attempt.sandbox_cwd,
             workspace_roots: attempt.workspace_roots,
-            codex_linux_sandbox_exe: attempt.codex_linux_sandbox_exe,
+            sandbox_exe: attempt.sandbox_exe,
             use_legacy_landlock: attempt.use_legacy_landlock,
+            windows_sandbox_type: attempt.windows_sandbox_type,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             network_denial_cancellation_token: network_approval
                 .as_ref()
                 .map(ActiveNetworkApproval::cancellation_token),
@@ -132,11 +138,7 @@ impl ToolOrchestrator {
         let otel = turn_ctx.session_telemetry.clone();
         let otel_tn = flat_tool_name(&tool_ctx.tool_name).into_owned();
         let otel_ci = &tool_ctx.call_id;
-        let strict_auto_review = tool_ctx
-            .session
-            .active_turn_context_and_strict_auto_review()
-            .await
-            .is_some_and(|(_, _, strict_auto_review)| strict_auto_review);
+        let strict_auto_review = turn_ctx.strict_auto_review_enabled();
         // 1) Approval
         let mut already_approved = false;
 
@@ -151,16 +153,6 @@ impl ToolOrchestrator {
         );
         let sandbox_config = environment.config();
         let owner_network_policy = sandbox_config.network_policy.is_some();
-        if owner_network_policy
-            && tool
-                .sandbox_permissions(req)
-                .requires_escalated_permissions()
-        {
-            return Err(ToolError::Rejected(
-                "attachment-owned network policy cannot be bypassed by sandbox escalation"
-                    .to_string(),
-            ));
-        }
         let workspace_roots = environment.workspace_roots();
         let executor_managed_process_sandbox = tool.uses_executor_managed_process_sandbox(req);
         let permission_profile = environment.permission_profile();
@@ -234,20 +226,78 @@ impl ToolOrchestrator {
         }
 
         // 2) First attempt under the selected sandbox.
-        let unsandboxed_allowed =
-            !owner_network_policy && unsandboxed_execution_allowed(&file_system_sandbox_policy);
-        let sandbox_override = if unsandboxed_allowed {
-            sandbox_override_for_first_attempt(
-                tool.sandbox_permissions(req),
-                &requirement,
-                &file_system_sandbox_policy,
-            )
+        let unsandboxed_allowed = unsandboxed_execution_allowed(&file_system_sandbox_policy);
+        let sandbox_override = sandbox_override_for_first_attempt(
+            tool.sandbox_permissions(req),
+            &requirement,
+            &file_system_sandbox_policy,
+            already_approved,
+        );
+        let (escalated_profile, writable_root_metadata) = if sandbox_override
+            == SandboxOverride::EscalatedSandboxWithRestrictions
+        {
+            let context = environment.sandbox_context(/*additional_permissions*/ None);
+            let policy_context = context.policy_context();
+            let baseline = permission_profile.file_system_sandbox_policy();
+            let file_system = baseline.for_approved_command(&policy_context);
+            let writable_root_metadata = file_system_root(&policy_context).is_some_and(|root| {
+                file_system.can_write_path(&root, &policy_context)
+                    && PROTECTED_METADATA_PATH_NAMES.iter().any(|name| {
+                        root.join_descendant(name)
+                            .is_ok_and(|path| file_system.can_write_path(&path, &policy_context))
+                    })
+            });
+            let escalated_profile = (file_system != baseline
+                && file_system
+                    != baseline.materialize_project_roots_with_path_uris(workspace_roots))
+            .then(|| {
+                PermissionProfile::from_runtime_permissions_with_enforcement(
+                    permission_profile.enforcement(),
+                    &file_system,
+                    permission_profile.network_sandbox_policy(),
+                )
+            });
+            (escalated_profile, writable_root_metadata)
         } else {
-            SandboxOverride::NoOverride
+            (None, false)
         };
+        if (escalated_profile.is_some() || writable_root_metadata)
+            && environment.environment.is_remote()
+        {
+            let info = environment.environment.info().await.map_err(|err| {
+                ToolError::Rejected(format!(
+                    "could not verify exec-server support for escalation with denied reads: {err}"
+                ))
+            })?;
+            if !matches!(info.platform_os.as_deref(), Some("windows" | "macos"))
+                && !info
+                    .capabilities
+                    .linux_approved_root_write_preserves_restrictions
+            {
+                return Err(ToolError::Rejected(
+                    "this exec-server cannot safely escalate with denied reads; upgrade the exec-server and retry"
+                        .to_string(),
+                ));
+            }
+        }
+        let escalated_local_profile = escalated_profile
+            .as_ref()
+            .filter(|_| !executor_managed_process_sandbox)
+            .map(|profile| {
+                profile
+                    .clone()
+                    .materialize_project_roots_with_path_uris(workspace_roots)
+            });
+        let initial_permissions = escalated_local_profile
+            .as_ref()
+            .or(escalated_profile.as_ref())
+            .unwrap_or(&permissions);
         let network_approval_spec = tool.network_approval_spec(req, tool_ctx);
-        // Offline owner attachments stay offline unless approved command permissions grant
-        // networking. Existing enabled controller proxies remain independently authoritative.
+        // An explicit owner proxy requirement permits filtered egress, like an enabled
+        // controller proxy. Traffic-only owner policies stay offline unless command
+        // permissions grant networking.
+        // Preserve this baseline even when escalation skips the execution proxy, so retained
+        // terminals still record that their launch bypassed network restrictions.
         let managed_network_active = if owner_network_policy {
             turn_ctx
                 .config
@@ -255,53 +305,76 @@ impl ToolOrchestrator {
                 .network
                 .as_ref()
                 .is_some_and(NetworkProxySpec::enabled)
-                || network_approval_spec.as_ref().is_some_and(|spec| {
-                    effective_network_sandbox_policy(
+                || sandbox_config
+                    .network_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.requires_proxy)
+                || (network_approval_spec.is_some()
+                    || tool
+                        .sandbox_permissions(req)
+                        .requires_escalated_permissions())
+                    && effective_network_sandbox_policy(
                         permission_profile.network_sandbox_policy(),
-                        spec.trigger.additional_permissions.as_ref(),
+                        network_approval_spec
+                            .as_ref()
+                            .and_then(|spec| spec.trigger.additional_permissions.as_ref()),
                     )
                     .is_enabled()
-                })
         } else {
             turn_ctx.network.is_some()
         };
         let sandbox_preference = tool.sandbox_preference();
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => sandbox_manager.should_sandbox(
-                &permissions,
-                sandbox_preference,
-                managed_network_active,
-            ),
+            SandboxOverride::NoOverride | SandboxOverride::EscalatedSandboxWithRestrictions => {
+                sandbox_manager.should_sandbox(
+                    initial_permissions,
+                    sandbox_preference,
+                    managed_network_active,
+                )
+            }
         };
+        let windows_sandbox_type = codex_protocol::sandbox::effective_windows_sandbox_type(
+            sandbox_config.windows_sandbox_type,
+            sandbox_config.windows_sandbox_level,
+        );
         let initial_sandbox = if sandbox_requested && !executor_managed_process_sandbox {
             sandbox_manager.select_initial(
-                &permissions,
+                initial_permissions,
                 sandbox_preference,
-                sandbox_config.windows_sandbox_level,
+                windows_sandbox_type,
                 managed_network_active,
             )
         } else {
             SandboxType::None
         };
+        if !executor_managed_process_sandbox {
+            ensure_native_sandbox(sandbox_override, initial_sandbox)?;
+        }
 
         let sandbox_policy_cwd = tool
             .sandbox_cwd(req)
             .cloned()
             .unwrap_or_else(|| environment.cwd().clone());
+        let codex_sandbox_exe = if cfg!(windows) {
+            turn_ctx.config.codex_self_exe.as_ref()
+        } else {
+            turn_ctx.config.codex_linux_sandbox_exe.as_ref()
+        };
         let initial_attempt = SandboxAttempt {
+            sandbox_override,
             sandbox: initial_sandbox,
             sandbox_requested,
-            permissions: &permissions,
-            exec_server_permissions: permission_profile,
+            permissions: initial_permissions,
+            exec_server_permissions: escalated_profile.as_ref().unwrap_or(permission_profile),
             enforce_managed_network: managed_network_active,
             manager: &sandbox_manager,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
-            codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
+            sandbox_exe: codex_sandbox_exe,
             use_legacy_landlock: sandbox_config.use_legacy_landlock,
+            windows_sandbox_type,
             windows_sandbox_level: sandbox_config.windows_sandbox_level,
-            windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
             network_denial_cancellation_token: None,
             network_proxy: None,
         };
@@ -443,39 +516,42 @@ impl ToolOrchestrator {
 
                 let retry_sandbox_requested = !unsandboxed_allowed
                     && sandbox_manager.should_sandbox(
-                        &permissions,
+                        initial_permissions,
                         sandbox_preference,
                         managed_network_active,
                     );
                 let retry_sandbox = if retry_sandbox_requested && !executor_managed_process_sandbox
                 {
                     sandbox_manager.select_initial(
-                        &permissions,
+                        initial_permissions,
                         sandbox_preference,
-                        sandbox_config.windows_sandbox_level,
+                        windows_sandbox_type,
                         managed_network_active,
                     )
                 } else {
                     SandboxType::None
                 };
-                let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
+                let retry_sandbox_exe = if unsandboxed_allowed {
                     None
                 } else {
-                    turn_ctx.config.codex_linux_sandbox_exe.as_ref()
+                    codex_sandbox_exe
                 };
                 let retry_attempt = SandboxAttempt {
+                    sandbox_override,
                     sandbox: retry_sandbox,
                     sandbox_requested: retry_sandbox_requested,
-                    permissions: &permissions,
-                    exec_server_permissions: permission_profile,
+                    permissions: initial_permissions,
+                    exec_server_permissions: escalated_profile
+                        .as_ref()
+                        .unwrap_or(permission_profile),
                     enforce_managed_network: managed_network_active,
                     manager: &sandbox_manager,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots,
-                    codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,
+                    sandbox_exe: retry_sandbox_exe,
                     use_legacy_landlock: sandbox_config.use_legacy_landlock,
+                    windows_sandbox_type,
                     windows_sandbox_level: sandbox_config.windows_sandbox_level,
-                    windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
                     network_denial_cancellation_token: None,
                     network_proxy: None,
                 };

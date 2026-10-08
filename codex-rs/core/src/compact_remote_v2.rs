@@ -7,15 +7,13 @@ use crate::client_common::ResponseEvent;
 use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact::InitialContextInjection;
-use crate::compact::build_compaction_initial_context;
+use crate::compact::build_compaction_replacement_history;
 use crate::compact::compaction_status_from_result;
-use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
-use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
+use crate::context::world_state::WorldState;
 use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -25,7 +23,8 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
-use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::responses_retry::handle_response_stream_error;
+use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -45,17 +44,17 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
+#[cfg(test)]
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::StreamExt;
-use tokio_util::sync::CancellationToken;
 
 #[path = "compact_remote_v2_attempt.rs"]
 mod attempt;
@@ -71,8 +70,6 @@ enum RetainedImageBudget {
     Enabled,
 }
 
-// Mirror the current /responses/compact retained-message default while the
-// server-side path remains the reference implementation.
 pub(crate) const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const MAX_RETAINED_AGENT_MESSAGE_TOKENS: i64 = 10_000;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
@@ -82,9 +79,9 @@ const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
-    fallback_step_context: Option<Arc<StepContext>>,
+    replacement_step_context: Arc<StepContext>,
     client_session: &mut ModelClientSession,
-    initial_context_injection: InitialContextInjection,
+    world_state: Arc<WorldState>,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -97,9 +94,9 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &step_context,
-        fallback_step_context.as_ref(),
+        &replacement_step_context,
         Some(client_session),
-        initial_context_injection,
+        world_state,
         compaction_metadata,
     )
     .await
@@ -107,21 +104,9 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 
 pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
+    world_state: Arc<WorldState>,
 ) -> CodexResult<()> {
-    // Standalone compaction is its own request boundary, so it captures a fresh step.
-    let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
-        .await?;
-    let start_event = EventMsg::TurnStarted(TurnStartedEvent {
-        turn_id: turn_context.sub_id.clone(),
-        trace_id: turn_context.trace_id.clone(),
-        started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
-        model_context_window: turn_context.model_context_window(),
-        collaboration_mode_kind: turn_context.mode(),
-    });
-    sess.send_event(&turn_context, start_event).await;
-
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
@@ -131,9 +116,9 @@ pub(crate) async fn run_remote_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &step_context,
-        /*fallback_step_context*/ None,
+        &step_context,
         /*client_session*/ None,
-        InitialContextInjection::DoNotInject,
+        world_state,
         compaction_metadata,
     )
     .await
@@ -142,9 +127,9 @@ pub(crate) async fn run_remote_compact_task(
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
-    fallback_step_context: Option<&Arc<StepContext>>,
+    replacement_step_context: &Arc<StepContext>,
     client_session: Option<&mut ModelClientSession>,
-    initial_context_injection: InitialContextInjection,
+    world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
@@ -184,9 +169,9 @@ async fn run_remote_compact_task_inner(
     let result = run_remote_compact_task_inner_impl(
         sess,
         step_context,
-        fallback_step_context,
+        replacement_step_context,
         client_session,
-        initial_context_injection,
+        world_state,
         compaction_metadata,
         &mut analytics_details,
     )
@@ -207,13 +192,21 @@ async fn run_remote_compact_task_inner(
         .await;
     match result {
         Ok(()) => Ok(()),
-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => Err(err),
+        Err(err)
+            if matches!(err.details(), CodexErrorDetails::TurnAborted)
+                || matches!(phase, CompactionPhase::PostTurn) =>
+        {
+            Err(err)
+        }
         Err(err) => {
             sess.track_turn_codex_error(turn_context, &err);
-            let event = EventMsg::Error(
-                err.to_error_event(Some("Error running remote compact task".to_string())),
-            );
-            sess.send_event(turn_context, event).await;
+            // Pre-turn failures are reported by run_turn after preserving the incoming prompt.
+            if !matches!(phase, CompactionPhase::PreTurn) {
+                let event = EventMsg::Error(
+                    err.to_error_event(Some("Error running remote compact task".to_string())),
+                );
+                sess.send_event(turn_context, event).await;
+            }
             Err(err)
         }
     }
@@ -222,9 +215,9 @@ async fn run_remote_compact_task_inner(
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
-    fallback_step_context: Option<&Arc<StepContext>>,
+    replacement_step_context: &Arc<StepContext>,
     mut client_session: Option<&mut ModelClientSession>,
-    initial_context_injection: InitialContextInjection,
+    world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
@@ -253,15 +246,12 @@ async fn run_remote_compact_task_inner_impl(
     let (attempt, compaction_turn_context) = match attempt {
         Ok(attempt) => (attempt, turn_context),
         Err(error) => {
-            let Some(fallback_step_context) = fallback_step_context else {
-                return Err(error);
-            };
-            if !should_retry_with_current_model(&error) {
+            let fallback_turn_context = &replacement_step_context.turn;
+            if !should_retry_with_current_model(&error, turn_context, fallback_turn_context) {
                 return Err(error);
             }
-            sess.set_last_known_step_context(fallback_step_context)
+            sess.set_last_known_step_context(replacement_step_context)
                 .await;
-            let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
@@ -271,7 +261,7 @@ async fn run_remote_compact_task_inner_impl(
                 );
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
-                fallback_step_context,
+                replacement_step_context,
                 client_session,
                 &fallback_compaction_trace,
                 compaction_metadata,
@@ -293,6 +283,7 @@ async fn run_remote_compact_task_inner_impl(
         }
     };
     let RemoteCompactV2Attempt {
+        input_goal_ids,
         trace_input_history,
         prompt_input,
         prompt_input_metadata,
@@ -302,7 +293,7 @@ async fn run_remote_compact_task_inner_impl(
         owned_client_session: _owned_client_session,
     } = attempt;
     if let Some(token_usage) = token_usage {
-        sess.record_rollout_budget_usage(&token_usage)?;
+        sess.record_rollout_budget_usage(&token_usage).await?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
@@ -321,17 +312,14 @@ async fn run_remote_compact_task_inner_impl(
     );
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
-    let new_history =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let (new_history, world_state_baseline) = build_compaction_replacement_history(
+        sess.as_ref(),
+        replacement_step_context,
+        &world_state,
+        compacted_history,
+    )
+    .await;
 
-    let reference_context_item = match initial_context_injection {
-        InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage { .. } => {
-            Some(compaction_turn_context.to_turn_context_item())
-        }
-    };
     if let Some(trace_input_history) = trace_input_history.as_deref() {
         let replacement_history = new_history
             .iter()
@@ -342,20 +330,37 @@ async fn run_remote_compact_task_inner_impl(
             replacement_history: &replacement_history,
         });
     }
+    let reviewer_compaction_hash = if crate::context::GuardianContextMode::from_history(
+        sess.conversation_history_snapshot().await.as_ref(),
+    ) == crate::context::GuardianContextMode::Legacy
+        && let Some(review_turn) = sess.turn_context_for_sub_id(&turn_context.sub_id).await
+    {
+        // Previous-model compaction must remain compatible with the continuing turn's
+        // reviewer, including model changes accepted while compaction was running.
+        let mut review_context = crate::guardian::GuardianReviewContext::from(&review_turn);
+        review_context.model_info = review_turn.capture_current_model_info();
+        let (_, reviewer) = crate::guardian::resolve_review_model(sess, &review_context).await;
+        reviewer.comp_hash.clone()
+    } else {
+        None
+    };
     sess.replace_compacted_history(
         new_history,
-        reference_context_item,
+        replacement_step_context.to_turn_context_item(),
         world_state_baseline,
         CompactedHistoryMetadata {
+            input_goal_ids,
             message: String::new(),
             window_number: new_window_number,
             window_ids: new_window_ids,
             compaction_response_id: Some(compaction_response_id),
             compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
+            reviewer_compaction_hash,
         },
     )
     .await;
-    sess.recompute_token_usage(compaction_turn_context).await;
+    sess.recompute_token_usage(&replacement_step_context.turn)
+        .await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
         .await;
@@ -388,7 +393,11 @@ async fn run_remote_compaction_request_v2(
                 prompt,
                 turn_context.model_info(),
                 &turn_context.session_telemetry,
-                turn_context.reasoning_effort().cloned(),
+                sess.reasoning_effort_for_request(
+                    &turn_context.initial_settings,
+                    RequestEffortUsage::Compaction,
+                )
+                .await,
                 turn_context.reasoning_summary(),
                 step_context.settings.service_tier.clone(),
                 responses_metadata,
@@ -402,15 +411,14 @@ async fn run_remote_compaction_request_v2(
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
-            Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
-                handle_retryable_response_stream_error(
+                handle_response_stream_error(
                     &mut retry_state,
                     max_retries,
                     err,
                     client_session,
                     sess,
-                    turn_context,
+                    step_context,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
                 .await?;
@@ -497,11 +505,8 @@ fn build_v2_compacted_history(
         .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
         .collect::<Vec<_>>();
     let retained = v2_history_item_groups(prompt_input)
-        .filter(|group| is_retained_for_remote_compaction_v2(&group.source.item))
         .filter(|group| {
-            should_keep_compacted_history_item(&group.source.item)
-                || (retain_client_developer_messages
-                    && is_client_authored_developer_message(&group.source))
+            is_retained_for_remote_compaction_v2(&group.source, retain_client_developer_messages)
         })
         .flat_map(HistoryItemGroup::into_items)
         .collect::<Vec<_>>();
@@ -537,7 +542,11 @@ fn v2_history_item_groups(
     })
 }
 
-fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
+fn is_retained_for_remote_compaction_v2(
+    envelope: &ResponseItemEnvelope,
+    retain_client_developer_messages: bool,
+) -> bool {
+    let item = &envelope.item;
     if let ResponseItem::AgentMessage {
         author,
         recipient,
@@ -552,6 +561,7 @@ fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
                 content.first(),
                 Some(AgentMessageInputContent::InputText { text })
                     if text.starts_with("Message Type: MESSAGE\n")
+                        || text.starts_with("Message Type: CHANNEL_POST\n")
             );
         let is_completion = matches!(
             content.first(),
@@ -567,7 +577,16 @@ fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
         return false;
     };
 
-    matches!(role.as_str(), "user" | "developer" | "system")
+    match role.as_str() {
+        "user" => matches!(
+            crate::event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
+        ),
+        "developer" => {
+            retain_client_developer_messages && is_client_authored_developer_message(envelope)
+        }
+        _ => false,
+    }
 }
 
 fn retained_input_image_count(item: &ResponseItem) -> usize {
@@ -745,6 +764,9 @@ fn truncate_message_text_to_token_budget(
     }
 
     set_annotated_content(&mut envelope.item, truncated_content)?;
+    if let Some(metadata) = &mut envelope.metadata {
+        metadata.mark_retained_sources_incomplete();
+    }
     Some(envelope)
 }
 
@@ -813,16 +835,22 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            interrupt: None,
             consumer_dropped: CancellationToken::new(),
         }
     }
 
     #[test]
     fn build_v2_compacted_history_filters_to_installed_retention_shape() {
+        let hook = codex_protocol::items::build_hook_prompt_message(&[
+            codex_protocol::items::HookPromptFragment::from_single_hook("hook", "hook-run"),
+        ])
+        .expect("hook prompt");
         let input = vec![
             message("developer", "dev", /*phase*/ None),
             message("system", "sys", /*phase*/ None),
             message("user", "user", /*phase*/ None),
+            hook.clone(),
             message("assistant", "commentary", Some(MessagePhase::Commentary)),
             message("assistant", "final", Some(MessagePhase::FinalAnswer)),
             ResponseItem::FunctionCall {
@@ -850,7 +878,7 @@ mod tests {
 
         assert_eq!(
             raw(history),
-            vec![message("user", "user", /*phase*/ None), output]
+            vec![message("user", "user", /*phase*/ None), hook, output]
         );
     }
 
@@ -969,11 +997,15 @@ mod tests {
                     text: "user".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,abc".to_string(),
+                    },
                     detail: None,
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,def".to_string(),
+                    },
                     detail: None,
                 },
             ],
@@ -1035,7 +1067,9 @@ mod tests {
                     text: "abcdef".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,abc".to_string(),
+                    },
                     detail: None,
                 },
                 ContentItem::OutputText {
@@ -1045,7 +1079,9 @@ mod tests {
                     text: "discarded after the text budget is exhausted".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,def".to_string(),
+                    },
                     detail: None,
                 },
             ],
@@ -1065,7 +1101,31 @@ mod tests {
             ),
         };
 
-        let truncated = truncate_without_metadata(vec![item], /*max_tokens*/ 3);
+        let source = codex_history::RetainedSource {
+            id: codex_history::RetainedSourceId {
+                message_id: "original".to_owned(),
+                turn_id: "parent".to_owned(),
+                role: codex_history::RetainedSourceRole::User,
+            },
+            revision: codex_protocol::ResponseItemId::from_server("revision-1".to_owned()),
+            complete: true,
+        };
+        let mut metadata = CodexHarnessMetadata {
+            retained_source: Some(source.clone()),
+            guardian_sources: vec![source],
+            ..Default::default()
+        };
+        let truncated = truncate_message_text_to_token_budget(
+            ResponseItemEnvelope {
+                item,
+                metadata: Some(metadata.clone()),
+            },
+            /*max_tokens*/ 3,
+        )
+        .unwrap();
+        metadata.mark_retained_sources_incomplete();
+        assert_eq!(truncated.metadata, Some(metadata));
+        let truncated = vec![truncated.item];
 
         assert_eq!(
             truncated,
@@ -1077,14 +1137,18 @@ mod tests {
                         text: "abcdef".to_string(),
                     },
                     ContentItem::InputImage {
-                        image_url: "data:image/png;base64,abc".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,abc".to_string()
+                        },
                         detail: None,
                     },
                     ContentItem::OutputText {
                         text: "uv…1 tokens truncated…yz".to_string(),
                     },
                     ContentItem::InputImage {
-                        image_url: "data:image/png;base64,def".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,def".to_string()
+                        },
                         detail: None,
                     },
                 ],
@@ -1111,7 +1175,9 @@ mod tests {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                },
                 detail: None,
             }],
             phase: None,
@@ -1135,7 +1201,9 @@ mod tests {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                },
                 detail: None,
             }],
             phase: None,

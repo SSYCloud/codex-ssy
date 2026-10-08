@@ -31,6 +31,7 @@ use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalRuntimeHandle;
 use codex_goal_extension::GoalService;
+use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
 use codex_goal_extension::install_with_backend;
@@ -38,7 +39,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
-use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -148,18 +149,39 @@ async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn goal_tools_hidden_for_ephemeral_threads() -> anyhow::Result<()> {
+async fn ephemeral_goal_tools_preserve_specs_but_reject_execution() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     let tools = installed_tools_with_start(
-        runtime,
+        runtime.clone(),
         thread_id,
         SessionSource::Cli,
         /*persistent_thread_state_available*/ false,
     )
     .await;
 
-    assert_eq!(Vec::<String>::new(), tool_names(&tools));
+    let parent_tools = installed_tools(runtime, ThreadId::new()).await;
+    assert_eq!(
+        tools.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
+        parent_tools
+            .iter()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>(),
+    );
+    for tool in tools {
+        let Err(error) = tool
+            .handle(tool_call(&tool.tool_name().name, "ephemeral", json!({})))
+            .await
+        else {
+            panic!("ephemeral goal execution should fail");
+        };
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "Goal tools require a persistent thread.".to_string()
+            )
+        );
+    }
     Ok(())
 }
 
@@ -242,6 +264,19 @@ async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Re
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    // A missing baseline must not panic or seed accounting with invented token usage.
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: "missing-baseline",
+                collaboration_mode: &default_collaboration_mode(),
+                token_usage_at_turn_start: None,
+                session_store: &harness.session_store,
+                thread_store: &harness.thread_store,
+                turn_store: &ExtensionData::new("missing-baseline"),
+            })
+            .await;
+    }
     harness
         .start_turn(
             "turn-1",
@@ -752,7 +787,7 @@ async fn turn_error_usage_limit_accounts_progress_and_clears_accounting() -> any
         )
         .await;
     harness
-        .notify_turn_error("turn-1", CodexErrorInfo::UsageLimitExceeded)
+        .notify_turn_error("turn-1", CodexErr::UsageNotIncluded)
         .await;
 
     let goal = runtime
@@ -823,7 +858,7 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
         .await?;
 
     harness
-        .notify_turn_error("turn-1", CodexErrorInfo::Other)
+        .notify_turn_error("turn-1", CodexErr::Fatal("test error".to_string()))
         .await;
 
     let goal = runtime
@@ -1050,84 +1085,158 @@ async fn usage_limit_stale_turn_does_not_stop_current_goal() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<()> {
+async fn update_goal_can_stop_and_accounts_final_progress() -> anyhow::Result<()> {
+    for (status, token_budget, expected_status, state_status) in [
+        (
+            ThreadGoalStatus::Blocked,
+            100_i64,
+            ThreadGoalStatus::Blocked,
+            codex_state::ThreadGoalStatus::Blocked,
+        ),
+        (
+            ThreadGoalStatus::Paused,
+            100,
+            ThreadGoalStatus::Paused,
+            codex_state::ThreadGoalStatus::Paused,
+        ),
+        (
+            ThreadGoalStatus::Paused,
+            20,
+            ThreadGoalStatus::BudgetLimited,
+            codex_state::ThreadGoalStatus::BudgetLimited,
+        ),
+    ] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+        harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+        let tools = harness.tools();
+        let create_tool = tool_by_name(&tools, "create_goal");
+        create_tool
+            .handle(tool_call(
+                "create_goal",
+                "call-create-goal",
+                json!({ "objective": "ship goal extension backend", "token_budget": token_budget }),
+            ))
+            .await?;
+        harness.sink.clear();
+
+        harness
+            .record_token_usage(
+                "turn-1",
+                &token_usage(
+                    /*input_tokens*/ 20, /*cached_input_tokens*/ 5,
+                    /*output_tokens*/ 8, /*reasoning_output_tokens*/ 2,
+                    /*total_tokens*/ 30,
+                ),
+            )
+            .await;
+        let update_tool = tool_by_name(&tools, "update_goal");
+        let invocation = tool_call(
+            "update_goal",
+            "call-update-goal",
+            json!({ "status": status }),
+        );
+        let output = update_tool.handle(invocation.clone()).await?;
+        let result = output.code_mode_result(&invocation.payload);
+
+        assert_eq!(
+            result,
+            json!({
+                "goal": {
+                    "threadId": thread_id,
+                    "objective": "ship goal extension backend",
+                    "status": expected_status,
+                    "tokenBudget": token_budget,
+                    "tokensUsed": 23,
+                    "timeUsedSeconds": 0,
+                    "createdAt": result["goal"]["createdAt"],
+                    "updatedAt": result["goal"]["updatedAt"],
+                },
+                "remainingTokens": (token_budget - 23).max(0),
+                "completionBudgetReport": serde_json::Value::Null,
+            })
+        );
+
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+        assert_eq!(23, goal.tokens_used);
+        assert_eq!(state_status, goal.status);
+
+        assert_eq!(
+            vec![
+                CapturedGoalEvent {
+                    event_id: "call-update-goal".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    status: if token_budget > 23 {
+                        ThreadGoalStatus::Active
+                    } else {
+                        ThreadGoalStatus::BudgetLimited
+                    },
+                    tokens_used: 23,
+                },
+                CapturedGoalEvent {
+                    event_id: "call-update-goal".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    status: expected_status,
+                    tokens_used: 23,
+                },
+            ],
+            harness.sink.goal_events()
+        );
+        harness
+            .record_token_usage(
+                "turn-1",
+                &token_usage(
+                    /*input_tokens*/ 40, /*cached_input_tokens*/ 5,
+                    /*output_tokens*/ 10, /*reasoning_output_tokens*/ 2,
+                    /*total_tokens*/ 52,
+                ),
+            )
+            .await;
+        harness
+            .notify_tool_finish("turn-1", "call-shell", "shell")
+            .await;
+        harness.stop_turn("turn-1").await;
+        assert_eq!(
+            Some(goal),
+            runtime.thread_goals().get_thread_goal(thread_id).await?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_rejects_resume_and_system_limit_statuses() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
-    harness.start_turn("turn-1", &TokenUsage::default()).await;
-
-    let tools = harness.tools();
-    let create_tool = tool_by_name(&tools, "create_goal");
-    create_tool
-        .handle(tool_call(
-            "create_goal",
-            "call-create-goal",
-            json!({ "objective": "ship goal extension backend" }),
-        ))
-        .await?;
-    harness.sink.clear();
-
-    harness
-        .record_token_usage(
-            "turn-1",
-            &token_usage(
-                /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
-                /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
-            ),
-        )
-        .await;
+    let tools = installed_tools(runtime, thread_id).await;
     let update_tool = tool_by_name(&tools, "update_goal");
-    let invocation = tool_call(
-        "update_goal",
-        "call-update-goal",
-        json!({ "status": "blocked" }),
-    );
-    let output = update_tool.handle(invocation.clone()).await?;
-    let result = output.code_mode_result(&invocation.payload);
-
-    assert_eq!(
-        result,
-        json!({
-            "goal": {
-                "threadId": thread_id,
-                "objective": "ship goal extension backend",
-                "status": "blocked",
-                "tokensUsed": 23,
-                "timeUsedSeconds": 0,
-                "createdAt": result["goal"]["createdAt"],
-                "updatedAt": result["goal"]["updatedAt"],
-            },
-            "remainingTokens": serde_json::Value::Null,
-            "completionBudgetReport": serde_json::Value::Null,
-        })
-    );
-
-    let goal = runtime
-        .thread_goals()
-        .get_thread_goal(thread_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
-    assert_eq!(23, goal.tokens_used);
-    assert_eq!(codex_state::ThreadGoalStatus::Blocked, goal.status);
-
-    assert_eq!(
-        vec![
-            CapturedGoalEvent {
-                event_id: "call-update-goal".to_string(),
-                turn_id: Some("turn-1".to_string()),
-                status: ThreadGoalStatus::Active,
-                tokens_used: 23,
-            },
-            CapturedGoalEvent {
-                event_id: "call-update-goal".to_string(),
-                turn_id: Some("turn-1".to_string()),
-                status: ThreadGoalStatus::Blocked,
-                tokens_used: 23,
-            },
-        ],
-        harness.sink.goal_events()
-    );
+    for status in ["active", "budgetLimited", "usageLimited"] {
+        let result = update_tool
+            .handle(tool_call(
+                "update_goal",
+                "call-update-goal",
+                json!({ "status": status }),
+            ))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("agent must not set {status}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "update_goal can only mark the existing goal complete, blocked, or paused at the user's explicit request; resume, budget-limited, and usage-limited status changes are controlled by the user or system".to_string()
+            )
+        );
+    }
     Ok(())
 }
 
@@ -1234,6 +1343,7 @@ async fn goal_service_external_set_active_preserves_concurrent_usage() -> anyhow
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 max_goal_token_budget: None,
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     harness
@@ -1308,7 +1418,7 @@ async fn thread_stop_unregisters_goal_runtime_from_service() -> anyhow::Result<(
     assert!(
         harness
             .goal_service
-            .clear_thread_goal(runtime.as_ref(), thread_id)
+            .clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
             .await?
     );
     assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
@@ -1375,17 +1485,28 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let api = GoalService::new();
 
-    let set = api
+    let request = GoalSetRequest {
+        thread_id,
+        objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
+        status: None,
+        token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
+        max_goal_token_budget: None,
+    };
+    let failure = GoalServiceError::Internal("instruction recording failed".to_owned());
+    let result = api
         .set_thread_goal(
             runtime.as_ref(),
-            GoalSetRequest {
-                thread_id,
-                objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
-                status: None,
-                token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
-                max_goal_token_budget: None,
-            },
+            request,
+            std::future::ready(Err(failure.clone())),
         )
+        .await;
+    assert_eq!(result.unwrap_err(), failure);
+    assert_eq!(
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?,
+        None
+    );
+    let set = api
+        .set_thread_goal(runtime.as_ref(), request, std::future::ready(Ok(())))
         .await?;
     let get = api
         .get_thread_goal(runtime.as_ref(), thread_id)
@@ -1402,12 +1523,32 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     assert_eq!(Some(123), get.token_budget);
     assert_eq!(Some("ship goal API ownership"), metadata.preview.as_deref());
 
-    assert!(api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert_eq!(
+        api.clear_thread_goal(
+            runtime.as_ref(),
+            thread_id,
+            std::future::ready(Err(failure.clone()))
+        )
+        .await,
+        Err(failure),
+    );
+    assert_eq!(
+        api.get_thread_goal(runtime.as_ref(), thread_id).await?,
+        Some(get)
+    );
+
+    assert!(
+        api.clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
+            .await?
+    );
     assert_eq!(
         None,
         api.get_thread_goal(runtime.as_ref(), thread_id).await?
     );
-    assert!(!api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert!(
+        !api.clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
+            .await?
+    );
     Ok(())
 }
 
@@ -1429,6 +1570,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(100));
@@ -1443,6 +1585,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(Some(101)),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await
         .expect_err("goal budget above the configured maximum should fail");
@@ -1469,6 +1612,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(Some(99)),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(99));
@@ -1483,6 +1627,7 @@ async fn goal_service_enforces_maximum_token_budget_on_creation_and_updates() ->
                 token_budget: GoalTokenBudgetUpdate::Set(None),
                 max_goal_token_budget: Some(100),
             },
+            std::future::ready(Ok(())),
         )
         .await?;
     assert_eq!(goal.goal.token_budget, Some(100));
@@ -1671,7 +1816,7 @@ impl GoalExtensionHarness {
                 .on_turn_start(TurnStartInput {
                     turn_id,
                     collaboration_mode: &collaboration_mode,
-                    token_usage_at_turn_start: usage,
+                    token_usage_at_turn_start: Some(usage),
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,
@@ -1779,13 +1924,14 @@ impl GoalExtensionHarness {
         }
     }
 
-    async fn notify_turn_error(&self, turn_id: &str, error: CodexErrorInfo) {
+    async fn notify_turn_error(&self, turn_id: &str, error: CodexErr) {
         let turn_store = ExtensionData::new(turn_id);
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_error(TurnErrorInput {
                     turn_id,
-                    error: error.clone(),
+                    error: error.to_codex_protocol_error(),
+                    error_details: error.details(),
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,

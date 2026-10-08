@@ -1,3 +1,5 @@
+use crate::app_package::registered_core_requested;
+use crate::app_package::verify_registered_core_runner;
 use crate::desktop::DesktopPolicy;
 use crate::desktop::shared_private_desktop_for_user;
 use crate::identity::SandboxCreds;
@@ -19,9 +21,10 @@ use crate::winutil::quote_windows_arg;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
-use std::ffi::c_void;
 use std::fs::File;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::mpsc;
@@ -35,6 +38,7 @@ use windows_sys::Win32::Foundation::ERROR_ACCOUNT_DISABLED;
 use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
 use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
@@ -42,6 +46,7 @@ use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
+use windows_sys::Win32::System::Threading::LOGON_WITH_PROFILE;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_FORCEOFFFEEDBACK;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
@@ -53,9 +58,21 @@ const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
 
+struct NonOwningHandle(HANDLE);
+
+// SAFETY: Pipe and thread handles are opaque process-wide tokens that may be
+// passed between threads. This wrapper does not own or extend their lifetime.
+unsafe impl Send for NonOwningHandle {}
+
+impl NonOwningHandle {
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
 #[derive(Debug)]
-struct RunnerLogonError {
-    code: u32,
+pub(crate) struct RunnerLogonError {
+    pub(crate) code: u32,
 }
 
 impl std::fmt::Display for RunnerLogonError {
@@ -142,11 +159,21 @@ pub(crate) fn retry_runner_spawn_once<T>(
     mut spawn: impl FnMut(SandboxCreds) -> Result<T>,
     refresh: impl FnOnce() -> Result<SandboxCreds>,
 ) -> Result<T> {
-    match spawn(sandbox_creds) {
+    let result = match spawn(sandbox_creds.clone()) {
         Ok(result) => Ok(result),
-        Err(err) if is_refreshable_sandbox_creds_error(&err, command) => spawn(refresh()?),
+        // No runner (and therefore no user command) started. Keep credentials unchanged.
+        Err(err)
+            if err
+                .downcast_ref::<RunnerLogonError>()
+                .is_some_and(|err| err.code == ERROR_SERVICE_ALREADY_RUNNING) =>
+        {
+            spawn(sandbox_creds)
+        }
+        Err(err) if is_refreshable_sandbox_creds_error(&err, command) => refresh().and_then(spawn),
         Err(err) => Err(err),
-    }
+    };
+    super::runner_metrics::record("startup", if result.is_ok() { "success" } else { "error" });
+    result
 }
 
 impl RunnerTransport {
@@ -212,12 +239,13 @@ fn connect_pipe_with_timeout(
     let pipe_label_for_thread = pipe_label.clone();
     let (thread_handle_tx, thread_handle_rx) = mpsc::sync_channel(1);
     let (connect_result_tx, connect_result_rx) = mpsc::sync_channel(1);
+    let h_pipe = NonOwningHandle(h_pipe);
     let mut connect_thread = Some(
         thread::Builder::new()
             .name(format!("codex-runner-connect-{pipe_label}"))
             .spawn(move || {
                 let current_process = unsafe { GetCurrentProcess() };
-                let mut thread_handle = 0;
+                let mut thread_handle = std::ptr::null_mut();
                 let duplicate_ok = unsafe {
                     DuplicateHandle(
                         current_process,
@@ -239,9 +267,9 @@ fn connect_pipe_with_timeout(
 
                 // Publish the helper thread HANDLE before the blocking pipe connect so the
                 // parent can cancel this specific operation if it times out.
-                let _ = thread_handle_tx.send(Ok(thread_handle));
+                let _ = thread_handle_tx.send(Ok(NonOwningHandle(thread_handle)));
 
-                let result = connect_pipe(h_pipe, expected_runner_pid)
+                let result = connect_pipe(h_pipe.raw(), expected_runner_pid)
                     .map_err(anyhow::Error::from)
                     .context(format!("connect {pipe_label_for_thread}"));
                 let _ = connect_result_tx.send(result);
@@ -262,12 +290,12 @@ fn connect_pipe_with_timeout(
             if let Some(result) = try_take_completed_connect_result(
                 &mut connect_thread,
                 &connect_result_rx,
-                thread_handle,
+                thread_handle.raw(),
                 &pipe_label,
             )? {
                 result
             } else {
-                let cancel_ok = unsafe { CancelSynchronousIo(thread_handle) };
+                let cancel_ok = unsafe { CancelSynchronousIo(thread_handle.raw()) };
                 if cancel_ok == 0 {
                     let err = unsafe { GetLastError() };
                     if err != ERROR_NOT_FOUND {
@@ -277,7 +305,7 @@ fn connect_pipe_with_timeout(
                     } else if let Some(result) = try_take_completed_connect_result(
                         &mut connect_thread,
                         &connect_result_rx,
-                        thread_handle,
+                        thread_handle.raw(),
                         &pipe_label,
                     )? {
                         result
@@ -309,7 +337,7 @@ fn connect_pipe_with_timeout(
     };
 
     unsafe {
-        CloseHandle(thread_handle);
+        CloseHandle(thread_handle.raw());
     }
 
     result
@@ -323,17 +351,43 @@ pub(crate) fn spawn_runner_transport(
     mut spawn_request: SpawnRequest,
     desktop_policy: Option<&DesktopPolicy>,
 ) -> Result<RunnerTransport> {
-    spawn_request.private_desktop_name = desktop_policy
-        .map(|policy| shared_private_desktop_for_user(&sandbox_creds.username, policy, log_dir))
-        .transpose()?;
+    let runner_exe = find_runner_exe(codex_home, log_dir)?;
+    let registered_alias = if registered_core_requested() {
+        Some(crate::app_package::registered_runner_alias(
+            codex_home,
+            &sandbox_creds.username,
+        )?)
+    } else {
+        None
+    };
+    if let Some(policy) = desktop_policy {
+        spawn_request.private_desktop_name = Some(shared_private_desktop_for_user(
+            &sandbox_creds.username,
+            policy,
+            log_dir,
+        )?);
+    }
     let (pipe_in_name, pipe_out_name) = pipe_pair();
-    let h_pipe_in =
-        create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
-    let h_pipe_out =
-        create_named_pipe(&pipe_out_name, PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
+    let pipe_write = unsafe {
+        File::from_raw_handle(create_named_pipe(
+            &pipe_in_name,
+            PIPE_ACCESS_OUTBOUND,
+            &sandbox_creds.username,
+        )? as _)
+    };
+    let pipe_read = unsafe {
+        File::from_raw_handle(create_named_pipe(
+            &pipe_out_name,
+            PIPE_ACCESS_INBOUND,
+            &sandbox_creds.username,
+        )? as _)
+    };
+    let h_pipe_in = pipe_write.as_raw_handle() as HANDLE;
+    let h_pipe_out = pipe_read.as_raw_handle() as HANDLE;
 
-    let runner_exe = find_runner_exe(codex_home, log_dir);
-    let runner_cmdline = runner_exe
+    let runner_cmdline = registered_alias
+        .as_deref()
+        .unwrap_or(&runner_exe)
         .to_str()
         .map(str::to_owned)
         .unwrap_or_else(|| "codex-command-runner.exe".to_string());
@@ -353,101 +407,73 @@ pub(crate) fn spawn_runner_transport(
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     si.dwFlags = STARTF_FORCEOFFFEEDBACK;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let env_block: Option<Vec<u16>> = None;
 
     let previous_error_mode = unsafe { SetErrorMode(RUNNER_ERROR_MODE_FLAGS) };
-    // Sandbox users have no profile state that commands should inherit.
+    // Execution aliases require the registered account's profile.
+    // Other launches retain their existing profile-free behavior.
     let spawn_res = unsafe {
         CreateProcessWithLogonW(
             user_w.as_ptr(),
             domain_w.as_ptr(),
             password_w.as_ptr(),
-            /*dwlogonflags*/ 0,
+            if registered_alias.is_some() {
+                LOGON_WITH_PROFILE
+            } else {
+                0
+            },
             exe_w.as_ptr(),
             cmdline_vec.as_mut_ptr(),
             windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
                 | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
-            env_block
-                .as_ref()
-                .map(|block| block.as_ptr() as *const c_void)
-                .unwrap_or(ptr::null()),
+            ptr::null(),
             cwd_w.as_ptr(),
             &si,
             &mut pi,
         )
     };
+    // Preserve the failure code before SetErrorMode can overwrite it.
+    let spawn_error = (spawn_res == 0).then(|| unsafe { GetLastError() });
     unsafe {
         SetErrorMode(previous_error_mode);
     }
-    if spawn_res == 0 {
-        let err = unsafe { GetLastError() };
-        unsafe {
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
+    if let Some(err) = spawn_error {
         return Err(RunnerLogonError { code: err }.into());
     }
+    // Keep the process pinned through the entire startup handshake. Pipes close
+    // automatically on every error, including failure to create the second pipe.
+    let _runner_process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
+    let _runner_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
     let expected_runner_pid = pi.dwProcessId;
-
-    let connect_result = (|| -> Result<()> {
-        connect_pipe_with_timeout(h_pipe_in, expected_runner_pid, "pipe-in")?;
-        connect_pipe_with_timeout(h_pipe_out, expected_runner_pid, "pipe-out")?;
-        Ok(())
-    })();
-
-    unsafe {
-        if pi.hThread != 0 {
-            CloseHandle(pi.hThread);
-        }
-    }
-
-    if let Err(err) = connect_result {
-        unsafe {
-            // Keep the process handle alive until the pipe handshake finishes. If the handshake
-            // fails after the runner process has already launched, we still need a way to stop
-            // that child instead of leaking a stray `codex-command-runner.exe`.
-            if pi.hProcess != 0 {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
-        return Err(err);
-    }
-
     let mut transport = RunnerTransport {
-        // Once the pipe connect phase succeeds we can transfer the raw HANDLEs into `File`s.
-        // From here on, the `RunnerTransport` owns closing the pipes on every success/error path.
-        pipe_write: unsafe { File::from_raw_handle(h_pipe_in as _) },
-        pipe_read: unsafe { File::from_raw_handle(h_pipe_out as _) },
+        pipe_write,
+        pipe_read,
     };
     let startup_result = (|| -> Result<()> {
-        // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
-        // That way, a later `send_spawn_request` or `spawn_ready` failure can still terminate the
-        // runner instead of leaving a stray `codex-command-runner.exe` behind.
+        // An update can retarget the alias after setup. Check the selected image
+        // and authenticate its pipes before sending it the command.
+        if registered_alias.is_some() {
+            verify_registered_core_runner(pi.hProcess, &runner_exe)?;
+        }
+        connect_pipe_with_timeout(h_pipe_in, expected_runner_pid, "pipe-in")?;
+        connect_pipe_with_timeout(h_pipe_out, expected_runner_pid, "pipe-out")?;
         transport.send_spawn_request(spawn_request)?;
         transport.read_spawn_ready()?;
         Ok(())
     })();
     if let Err(err) = startup_result {
         unsafe {
-            if pi.hProcess != 0 {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
+            let _ = TerminateProcess(pi.hProcess, 1);
         }
-        drop(transport);
         return Err(err);
     }
 
-    unsafe {
-        if pi.hProcess != 0 {
-            // The runner has now connected both pipes *and* acknowledged the spawn request, so
-            // startup is complete. At that point the transport pipes become the only lifetime
-            // anchor we need to keep the session alive.
-            CloseHandle(pi.hProcess);
-        }
+    if registered_alias.is_some() {
+        crate::logging::debug_log(
+            &format!(
+                "registered_core_runner_ready pid={expected_runner_pid} package_verified=true pipes_authenticated=true"
+            ),
+            log_dir,
+        );
     }
 
     Ok(transport)
@@ -458,6 +484,8 @@ mod tests {
     use super::RunnerLogonError;
     use super::RunnerStartupError;
     use super::is_refreshable_sandbox_creds_error;
+    use super::retry_runner_spawn_once;
+    use crate::identity::SandboxCreds;
     use crate::ipc_framed::ErrorPayload;
     use crate::ipc_framed::ErrorStage;
     use pretty_assertions::assert_eq;
@@ -465,6 +493,97 @@ mod tests {
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+
+    #[test]
+    fn logon_service_already_running_retries_once_without_refresh() {
+        let mut attempts = 0;
+        let result = retry_runner_spawn_once(
+            SandboxCreds {
+                username: "sandbox-user".into(),
+                password: "test-only".into(),
+            },
+            &[],
+            |creds| {
+                attempts += 1;
+                assert_eq!(
+                    (creds.username.as_str(), creds.password.as_str()),
+                    ("sandbox-user", "test-only")
+                );
+                if attempts == 1 {
+                    Err(anyhow::Error::new(RunnerLogonError {
+                        code: ERROR_SERVICE_ALREADY_RUNNING,
+                    })
+                    .context("runner launch failed"))
+                } else {
+                    Ok(42)
+                }
+            },
+            || panic!("1056 must not refresh credentials"),
+        );
+        assert_eq!((result.unwrap(), attempts), (42, 2));
+    }
+
+    #[test]
+    fn logon_service_already_running_stops_after_two_failures() {
+        let mut attempts = 0;
+        let err = retry_runner_spawn_once::<()>(
+            SandboxCreds {
+                username: "sandbox-user".into(),
+                password: "test-only".into(),
+            },
+            &[],
+            |_| {
+                attempts += 1;
+                Err(RunnerLogonError {
+                    code: ERROR_SERVICE_ALREADY_RUNNING,
+                }
+                .into())
+            },
+            || panic!("1056 must not refresh credentials"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (
+                attempts,
+                err.downcast_ref::<RunnerLogonError>().unwrap().code
+            ),
+            (2, ERROR_SERVICE_ALREADY_RUNNING)
+        );
+    }
+
+    #[test]
+    fn child_service_already_running_does_not_replay_command() {
+        let mut attempts = 0;
+        let err = retry_runner_spawn_once::<()>(
+            SandboxCreds {
+                username: "sandbox-user".into(),
+                password: "test-only".into(),
+            },
+            &[],
+            |_| {
+                attempts += 1;
+                Err(RunnerStartupError::new(ErrorPayload {
+                    message: "child startup failed".into(),
+                    stage: ErrorStage::SpawnChild,
+                    windows_error_code: Some(ERROR_SERVICE_ALREADY_RUNNING),
+                })
+                .into())
+            },
+            || panic!("1056 must not refresh credentials"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (
+                attempts,
+                err.downcast_ref::<RunnerStartupError>()
+                    .unwrap()
+                    .payload
+                    .windows_error_code,
+            ),
+            (1, Some(ERROR_SERVICE_ALREADY_RUNNING))
+        );
+    }
 
     #[test]
     fn refreshable_sandbox_creds_error_recognizes_credential_and_child_start_failures() {

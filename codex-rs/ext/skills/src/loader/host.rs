@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemEnvironmentAccessor;
 use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadFileOptions;
 use codex_protocol::protocol::SkillScope;
@@ -114,7 +115,7 @@ impl HostSkillRoot {
 pub(crate) struct HostSkillRootSnapshot {
     pub(crate) root: AbsolutePathBuf,
     pub(crate) skills: Vec<SkillMetadata>,
-    pub(crate) skill_discovery_path_by_path: Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
+    pub(crate) skill_discovery_path_by_path: Arc<HashMap<PathUri, PathUri>>,
     pub(crate) errors: Vec<SkillError>,
     pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
     pub(crate) is_agent_plugin: bool,
@@ -147,10 +148,13 @@ async fn load_skills_under_root(
     root: &AbsolutePathBuf,
 ) -> (
     Vec<SkillMetadata>,
-    Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
+    Arc<HashMap<PathUri, PathUri>>,
     Vec<SkillError>,
 ) {
     let file_system = skill_root.file_system.as_ref();
+    // TODO(anp): Bind discovery to turn permissions when host skill roots accept an accessor;
+    // until then, keep using the same unrestricted filesystem that supplied the root.
+    let discovery_access = FileSystemEnvironmentAccessor::unrestricted(&skill_root.file_system);
     let plugin_identity = skill_root.plugin_identity();
     let plugin_root = match skill_root.plugin_root() {
         Some(plugin_root) => Some(canonicalize_for_skill_identity(file_system, plugin_root).await),
@@ -167,7 +171,7 @@ async fn load_skills_under_root(
         mut namespace_roots,
         warnings,
     } = discover_skills(
-        file_system,
+        &discovery_access,
         &PathUri::from_abs_path(root),
         SkillDiscoveryOptions {
             directory_symlinks,
@@ -270,7 +274,7 @@ async fn load_skills_under_root(
             Some(namespace) => SkillNamespaceResolver::with_provided_namespace(namespace),
             None => {
                 SkillNamespaceResolver::discover(
-                    file_system,
+                    &discovery_access,
                     &root_uri,
                     &skill_paths,
                     plugin_roots,
@@ -320,8 +324,10 @@ async fn load_skills_under_root(
         });
         match result {
             Ok(skill) => {
-                skill_discovery_path_by_path
-                    .insert(skill.path_to_skills_md.clone(), discovery_path);
+                skill_discovery_path_by_path.insert(
+                    skill.path_to_skills_md.clone(),
+                    PathUri::from_abs_path(&discovery_path),
+                );
                 loaded_skills.push(skill);
             }
             Err(message) if skill_root.scope != SkillScope::System => {
@@ -380,7 +386,7 @@ async fn parse_skill_file(
         interface,
         dependencies,
         policy,
-        path_to_skills_md: path.clone(),
+        path_to_skills_md: path_uri.clone(),
         scope,
         plugin_id: plugin_identity.map(|identity| identity.plugin_id.clone()),
         remote_plugin_id: plugin_identity.and_then(|identity| identity.remote_plugin_id.clone()),

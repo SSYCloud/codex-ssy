@@ -77,8 +77,12 @@ async fn test_step(
             .await
             .expect("create in-process MCP client"),
     );
-    let tool_catalog = Arc::new(ClientToolCatalog::new(vec![tool.clone()]));
+    let tool_catalog = Arc::new(ClientToolCatalog::new(
+        vec![tool.clone()],
+        /*updates*/ None,
+    ));
     let managed_client = Arc::new(ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: McpServerInfo {
             name: label.to_string(),
@@ -109,12 +113,15 @@ async fn test_step(
     config
         .server_permission_profiles
         .insert(SERVER_NAME.to_string(), config.permission_profile.clone());
+    config
+        .environment_use_mxc
+        .insert(format!("{label}-environment"), label == "new");
     let config = Arc::new(config);
     let prepared = PreparedMcpCall::new(
         Arc::clone(&connections),
         managed_client,
         Arc::clone(&config),
-        /*catalog_revision*/ 0,
+        tool_catalog.read(Arc::new).await,
         tool.clone(),
         McpServerMetadata {
             environment_id: format!("{label}-environment"),
@@ -219,19 +226,26 @@ async fn prepared_call_keeps_captured_connection_and_authority_after_refresh() -
             old_call.config().approval_policy.value(),
             old_call.permission_profile(),
             old_call.config().approvals_reviewer,
+            old_call.config().environment_use_mxc.get("old-environment"),
         ),
         (
             AskForApproval::Never,
             &PermissionProfile::Disabled,
             ApprovalsReviewer::User,
+            Some(&false),
         )
     );
     assert_eq!(
         (
             new_call.config().approval_policy.value(),
             new_call.config().approvals_reviewer,
+            new_call.config().environment_use_mxc.get("new-environment"),
         ),
-        (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview)
+        (
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::AutoReview,
+            Some(&true)
+        )
     );
 
     drop(old.step);

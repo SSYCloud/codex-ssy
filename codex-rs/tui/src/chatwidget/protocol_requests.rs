@@ -95,6 +95,8 @@ impl ChatWidget {
         };
 
         self.on_guardian_assessment(GuardianAssessmentEvent {
+            review_reason: None,
+            model_context: None,
             id,
             target_item_id: None,
             plugin_id: None,

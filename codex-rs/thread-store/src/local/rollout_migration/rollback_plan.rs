@@ -12,11 +12,14 @@ use std::collections::HashSet;
 
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::UserMessageImageKind;
 use codex_rollout::CompactedItem;
 use codex_rollout::RetainedContextEntry;
+use codex_rollout::RetainedInputSource;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 
@@ -42,7 +45,8 @@ struct PendingUserResponse {
 struct InstructionBoundary {
     record_index: usize,
     message_id: Option<ResponseItemId>,
-    acceptance_order: Option<u64>,
+    input_source: RetainedInputSource,
+    is_communication: bool,
     alive: bool,
 }
 
@@ -103,6 +107,7 @@ pub(super) struct RollbackPlanner {
     pending_user_response: Option<PendingUserResponse>,
     pending_delivery_boundary: Option<usize>,
     turn_boundaries: HashMap<String, usize>,
+    turn_initial_boundaries: HashMap<String, usize>,
     call_boundaries: HashMap<(String, String), Option<usize>>,
     retained_fact_sources: Vec<RetainedFactSource>,
     compactions: Vec<CompactionFrame>,
@@ -121,6 +126,7 @@ impl RollbackPlanner {
             pending_user_response: None,
             pending_delivery_boundary: None,
             turn_boundaries: HashMap::new(),
+            turn_initial_boundaries: HashMap::new(),
             call_boundaries: HashMap::new(),
             retained_fact_sources: Vec::new(),
             compactions: Vec::new(),
@@ -155,16 +161,29 @@ impl RollbackPlanner {
         match &line.item {
             RolloutItem::SessionMeta(_) => self.record_boundaries[index] = None,
             RolloutItem::ResponseItem(response) => {
+                if matches!(&response.item, ResponseItem::Message { role, .. } if role == "assistant")
+                    || matches!(&response.item, ResponseItem::FunctionCall { .. })
+                {
+                    self.retained_fact_sources.push(RetainedFactSource {
+                        record_index: index,
+                        turn_id: response.turn_id().unwrap_or_default().to_owned(),
+                        acceptance_order: response
+                            .metadata
+                            .as_ref()
+                            .filter(|metadata| !metadata.inherited_user_message)
+                            .and_then(|metadata| metadata.user_input_order),
+                    });
+                }
                 if let Some(boundary) = paired_delivery_boundary {
                     self.record_boundaries[index] = Some(boundary);
                     self.boundaries[boundary].message_id = response.id().cloned();
+                    self.boundaries[boundary].input_source = response.metadata.as_ref().into();
                 } else if rollback::counts_as_boundary(&response.item) {
                     let boundary = self.start_boundary(index);
                     self.boundaries[boundary].message_id = response.id().cloned();
-                    self.boundaries[boundary].acceptance_order = response
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.user_input_order);
+                    self.boundaries[boundary].input_source = response.metadata.as_ref().into();
+                    self.boundaries[boundary].is_communication =
+                        matches!(response.item, ResponseItem::AgentMessage { .. });
                     if let ResponseItem::Message { role, content, .. } = &response.item
                         && role == "user"
                     {
@@ -225,10 +244,12 @@ impl RollbackPlanner {
                 self.assign_targeted_record(index, explicit_event_turn_id(event));
             }
             RolloutItem::InterAgentCommunication(_) => {
-                self.start_boundary(index);
+                let boundary = self.start_boundary(index);
+                self.boundaries[boundary].is_communication = true;
             }
             RolloutItem::InterAgentCommunicationMetadata { .. } => {
                 let boundary = self.start_boundary(index);
+                self.boundaries[boundary].is_communication = true;
                 self.pending_delivery_boundary = Some(boundary);
             }
             RolloutItem::Compacted(item) => {
@@ -278,6 +299,53 @@ impl RollbackPlanner {
                     acceptance_order: *acceptance_order,
                 });
             }
+            RolloutItem::RetainedContext(
+                codex_rollout::RetainedContextEvent::DeliveredAssistantMessage {
+                    message,
+                    acceptance_order,
+                },
+            ) => {
+                // Nested calls have no response item; match them to instructions by acceptance order.
+                let ordered = self
+                    .boundary_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|boundary| {
+                        self.boundaries[*boundary]
+                            .input_source
+                            .acceptance_order()
+                            .is_some_and(|order| order <= *acceptance_order)
+                    })
+                    .or_else(|| {
+                        // An unsequenced legacy instruction is safe only when it is the
+                        // sole boundary. A later unsequenced steer has ambiguous order.
+                        (self.boundary_stack.len() == 1)
+                            .then(|| self.boundary_stack[0])
+                            .filter(|boundary| {
+                                self.boundaries[*boundary]
+                                    .input_source
+                                    .acceptance_order()
+                                    .is_none()
+                            })
+                    });
+                // Older communication records have no order, but can still own the turn they started.
+                let communication = self
+                    .turn_initial_boundaries
+                    .get(&message.turn_id)
+                    .copied()
+                    .filter(|boundary| {
+                        let boundary = &self.boundaries[*boundary];
+                        boundary.is_communication
+                            && boundary.input_source.acceptance_order().is_none()
+                    });
+                self.record_boundaries[index] = ordered.max(communication);
+                self.retained_fact_sources.push(RetainedFactSource {
+                    record_index: index,
+                    turn_id: message.turn_id.clone(),
+                    acceptance_order: Some(*acceptance_order),
+                });
+            }
             RolloutItem::SecurityRiskScore(_) => self.record_boundaries[index] = None,
         }
 
@@ -323,7 +391,8 @@ impl RollbackPlanner {
         self.boundaries.push(InstructionBoundary {
             record_index: index,
             message_id: None,
-            acceptance_order: None,
+            input_source: RetainedInputSource::Local(None),
+            is_communication: false,
             alive: true,
         });
         let had_prior_boundary = !self.boundary_stack.is_empty();
@@ -346,6 +415,9 @@ impl RollbackPlanner {
     fn bind_active_turn(&mut self, boundary: usize) {
         if let Some(turn_id) = self.active_turn_id.as_ref() {
             self.turn_boundaries.insert(turn_id.clone(), boundary);
+            self.turn_initial_boundaries
+                .entry(turn_id.clone())
+                .or_insert(boundary);
         }
     }
 
@@ -380,7 +452,8 @@ impl RollbackPlanner {
         }
         if let Some(boundary) = first_removed_boundary {
             let source = &self.boundaries[boundary];
-            if let Some(order) = source.acceptance_order {
+            let acceptance_order = source.input_source.acceptance_order();
+            if let Some(order) = acceptance_order {
                 // An answer may have been persisted before the queued instruction
                 // accepted ahead of it. Both are removed at that acceptance boundary.
                 for fact in &self.retained_fact_sources {
@@ -411,18 +484,18 @@ impl RollbackPlanner {
             // including in checkpoints. Legacy evidence uses the recorded boundary.
             // Later checkpoints have not been observed yet and already reflect this rollback.
             for frame in self.compactions.iter_mut().rev().take_while(|frame| {
-                source.acceptance_order.is_some() || frame.record_index >= source.record_index
+                acceptance_order.is_some() || frame.record_index >= source.record_index
             }) {
                 if let Some(context) = &mut frame.item.retained_context {
-                    if source.acceptance_order.is_some()
+                    if acceptance_order.is_some()
                         || context
                             .ordered_entries()
-                            .any(|entry| matches!(entry, RetainedContextEntry::UserMessage(_)))
+                            .any(|(_, entry)| matches!(entry, RetainedContextEntry::UserMessage(_)))
                     {
                         context.rollback(
                             &removed_turns,
                             source.message_id.as_ref().map(ResponseItemId::as_str),
-                            source.acceptance_order,
+                            source.input_source,
                         );
                     } else {
                         // Checkpoints written without instruction retention keep the legacy
@@ -489,19 +562,39 @@ fn explicit_event_turn_id(event: &EventMsg) -> Option<&str> {
 fn user_response_matches_event(content: &[ContentItem], event: &UserMessageEvent) -> bool {
     let mut text = String::new();
     let mut images = Vec::new();
+    let mut file_ids = Vec::new();
+    let mut image_order = Vec::new();
     let mut audio = Vec::new();
     for item in content {
         match item {
             ContentItem::InputText { text: item_text } => text.push_str(item_text),
-            ContentItem::InputImage { image_url, .. } => images.push(image_url.as_str()),
+            ContentItem::InputImage { image, .. } => match image {
+                ImageReference::Inline { image_url } => {
+                    image_order.push(UserMessageImageKind::Inline);
+                    images.push(image_url.as_str());
+                }
+                ImageReference::File { file_id } => {
+                    image_order.push(UserMessageImageKind::File);
+                    file_ids.push(file_id.as_str());
+                }
+            },
             ContentItem::InputAudio { audio_url } => audio.push(audio_url.as_str()),
             ContentItem::OutputText { .. } => return false,
         }
     }
     text == event.message
+        && (!event.has_complete_image_order() || image_order == event.image_order)
         && images
             == event
                 .images
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        && file_ids
+            == event
+                .file_ids
                 .as_deref()
                 .unwrap_or_default()
                 .iter()

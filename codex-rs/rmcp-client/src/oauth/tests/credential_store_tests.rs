@@ -36,8 +36,9 @@ async fn mutations_require_and_retain_the_transaction_guard() -> Result<()> {
         save_oauth_tokens_to_file(&initial)?;
         let store = OAuthCredentialStore::new(
             initial.clone(),
-            ResolvedOAuthCredentialStore::File,
+            ResolvedOAuthCredentialStore::file(),
             MockKeyringStore::default(),
+            /*oauth_config*/ None,
         );
         let guard = store.acquire_transaction_guard().await?;
         let credentials = store.load().await?.unwrap();
@@ -96,7 +97,7 @@ async fn save_publishes_only_persisted_credentials() -> Result<()> {
         let _env = TempCodexHome::new();
         let initial = sample_tokens();
         let keyring = MockKeyringStore::default();
-        let authority = ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct);
+        let authority = ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct);
         authority.save(&keyring, &initial.server_name, &initial)?;
         let mut fallback = initial.clone();
         fallback
@@ -104,7 +105,12 @@ async fn save_publishes_only_persisted_credentials() -> Result<()> {
             .0
             .set_access_token(AccessToken::new("fallback-token".into()));
         save_oauth_tokens_to_file(&fallback)?;
-        let store = OAuthCredentialStore::new(initial.clone(), authority, keyring.clone());
+        let store = OAuthCredentialStore::new(
+            initial.clone(),
+            authority,
+            keyring.clone(),
+            /*oauth_config*/ None,
+        );
         let _guard = store.acquire_transaction_guard().await?;
         let mut credentials = store.load().await?.expect("stored credentials");
         let token_response = credentials
@@ -161,8 +167,9 @@ async fn pinned_read_failure_does_not_adopt_fallback_credentials() -> Result<()>
     keyring.set_error(&key, KeyringError::Invalid("test".into(), "load".into()));
     let store = OAuthCredentialStore::new(
         initial.clone(),
-        ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct),
+        ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct),
         keyring,
+        /*oauth_config*/ None,
     );
     let cached = store.load().await?.expect("cached credentials");
     assert_eq!(
@@ -187,8 +194,9 @@ async fn replacement_or_removal_does_not_acknowledge_a_new_runtime_snapshot() ->
     save_oauth_tokens_to_file(&initial)?;
     let store = OAuthCredentialStore::new(
         initial.clone(),
-        ResolvedOAuthCredentialStore::File,
+        ResolvedOAuthCredentialStore::file(),
         MockKeyringStore::default(),
+        /*oauth_config*/ None,
     );
     let original_snapshot = store.stored_credentials().await;
     for (client_id, issuer) in [
@@ -230,8 +238,9 @@ async fn storage_roundtrip_preserves_absolute_and_unknown_expiry() -> Result<()>
     save_oauth_tokens_to_file(&initial)?;
     let store = OAuthCredentialStore::new(
         initial.clone(),
-        ResolvedOAuthCredentialStore::File,
+        ResolvedOAuthCredentialStore::file(),
         MockKeyringStore::default(),
+        /*oauth_config*/ None,
     );
     let future_received_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let future_deadline = (future_received_at + 120) * 1000;

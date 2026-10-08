@@ -21,6 +21,7 @@ import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputCo
 import type { DynamicToolCallStatus } from "./DynamicToolCallStatus";
 import type { FileUpdateChange } from "./FileUpdateChange";
 import type { HookPromptFragment } from "./HookPromptFragment";
+import type { McpAppUi } from "./McpAppUi";
 import type { McpToolCallAppContext } from "./McpToolCallAppContext";
 import type { McpToolCallError } from "./McpToolCallError";
 import type { McpToolCallResult } from "./McpToolCallResult";
@@ -70,9 +71,13 @@ exitCode: number | null,
  */
 durationMs: number | null, } | { "type": "fileChange", id: string, changes: Array<FileUpdateChange>, status: PatchApplyStatus, } | { "type": "mcpToolCall", id: string, server: string, tool: string, status: McpToolCallStatus, arguments: JsonValue, appContext: McpToolCallAppContext | null,
 /**
- * Deprecated: use `appContext.resourceUri` instead.
+ * Legacy compatibility field; prefer `mcpAppUi.resourceUri` when available.
  */
-mcpAppResourceUri?: string, pluginId: string | null, readOnlyHint: boolean | null, result: McpToolCallResult | null, error: McpToolCallError | null,
+mcpAppResourceUri?: string,
+/**
+ * Presentation captured from the invoked descriptor; absent in older history.
+ */
+mcpAppUi: McpAppUi | null, pluginId: string | null, readOnlyHint: boolean | null, result: McpToolCallResult | null, error: McpToolCallError | null,
 /**
  * The duration of the MCP tool call in milliseconds.
  */
@@ -117,4 +122,12 @@ reasoningEffort: ReasoningEffort | null,
 /**
  * Last known status of the target agents, when available.
  */
-agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "subAgentActivity", id: string, kind: SubAgentActivityKind, agentThreadId: string, agentPath: string, } | { "type": "webSearch" } & WebSearchItem | { "type": "imageView", id: string, path: LegacyAppPathString, } | { "type": "sleep" } & SleepItem | { "type": "imageGeneration" } & ImageGenerationItem | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };
+agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "subAgentActivity",
+/**
+ * Resolved model at sub-agent creation; absent from older records and other activities.
+ */
+model: string | null,
+/**
+ * Resolved reasoning effort at sub-agent creation, when known.
+ */
+reasoningEffort: ReasoningEffort | null, id: string, kind: SubAgentActivityKind, agentThreadId: string, agentPath: string, } | { "type": "webSearch" } & WebSearchItem | { "type": "imageView", id: string, path: LegacyAppPathString, } | { "type": "sleep" } & SleepItem | { "type": "imageGeneration" } & ImageGenerationItem | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };

@@ -130,6 +130,20 @@
       ],
       "type": "string"
     },
+    "BrowserUseExtensionRequirements": {
+      "properties": {
+        "requestHeaders": {
+          "items": {
+            "$ref": "#/definitions/RequestHeader"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "BrowserUseOriginPolicy": {
       "properties": {
         "access": {
@@ -235,6 +249,16 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "extension": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BrowserUseExtensionRequirements"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "origins": {
@@ -414,6 +438,16 @@
             "null"
           ]
         },
+        "allowedLoginMethods": {
+          "description": "Effective login methods after managed, forced-login, and workspace restrictions. An empty list permits no login method. Older servers may omit this field.",
+          "items": {
+            "$ref": "#/definitions/ForcedLoginMethod"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "allowedPermissionProfiles": {
           "additionalProperties": {
             "type": "boolean"
@@ -443,7 +477,7 @@
         },
         "allowedWindowsSandboxImplementations": {
           "items": {
-            "$ref": "#/definitions/WindowsSandboxSetupMode"
+            "$ref": "#/definitions/WindowsSandboxImplementation"
           },
           "type": [
             "array",
@@ -559,6 +593,21 @@
             "null"
           ]
         },
+        "modelProvider": {
+          "description": "Exact provider selection required by managed policy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelProviders": {
+          "additionalProperties": true,
+          "description": "Complete required provider definitions, using config.toml field names.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "models": {
           "anyOf": [
             {
@@ -572,12 +621,6 @@
         "sqliteHome": {
           "type": [
             "string",
-            "null"
-          ]
-        },
-        "windowsSandboxPrivateDesktop": {
-          "type": [
-            "boolean",
             "null"
           ]
         }
@@ -746,6 +789,13 @@
         }
       },
       "type": "object"
+    },
+    "ForcedLoginMethod": {
+      "enum": [
+        "chatgpt",
+        "api"
+      ],
+      "type": "string"
     },
     "InAppBrowserRequirements": {
       "properties": {
@@ -1030,6 +1080,21 @@
       "minLength": 1,
       "type": "string"
     },
+    "RequestHeader": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
     "ResidencyRequirement": {
       "enum": [
         "us"
@@ -1053,10 +1118,11 @@
       ],
       "type": "string"
     },
-    "WindowsSandboxSetupMode": {
+    "WindowsSandboxImplementation": {
       "enum": [
         "elevated",
-        "unelevated"
+        "unelevated",
+        "mxc"
       ],
       "type": "string"
     }
@@ -1072,6 +1138,14 @@
         }
       ],
       "description": "Null if no requirements are configured (e.g. no requirements.toml/MDM entries)."
+    },
+    "supportsIndependentSpeedModes": {
+      "default": null,
+      "description": "Whether Fast and Ultra Fast requirements are enforced independently. Older servers omit this field and use Fast mode as a shared speed gate.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     }
   },
   "title": "ConfigRequirementsReadResponse",

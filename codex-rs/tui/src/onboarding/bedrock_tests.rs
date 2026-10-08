@@ -1,14 +1,95 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
-fn render_visible(state: &BedrockState) -> String {
+#[test]
+fn gov_cloud_guidance_requires_acknowledgement() {
+    let mut state = BedrockState::discovering(RequestId::Integer(1));
+    state.view = BedrockView::CheckingGovCloud(RequestId::Integer(2));
+    insta::assert_snapshot!("gov_cloud_checking", render_visible(&state));
+    assert!(
+        state
+            .handle_key_event(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+
+    state.view = BedrockView::GovCloudWarning(Arc::default());
+    insta::assert_snapshot!("gov_cloud_warning", render_visible(&state));
+    assert!(
+        state
+            .handle_key_event(&KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ))
+            .is_none()
+    );
+    assert!(matches!(
+        state.handle_key_event(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(BedrockAction::ContinueAfterGovCloudWarning)
+    ));
+
     let area = Rect::new(0, 0, 72, 24);
+    let mut buffer = Buffer::empty(area);
+    state.render(area, &mut buffer, /*error*/ None);
+    assert!(
+        buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol().contains(GOV_CLOUD_GUIDANCE_URL))
+    );
+}
+
+#[test]
+fn gov_cloud_guidance_scrolls_in_short_panes() {
+    let mut state = BedrockState::discovering(RequestId::Integer(1));
+    state.view = BedrockView::GovCloudWarning(Arc::default());
+    let area = Rect::new(0, 0, 24, 6);
+    let initial = render_visible_at(&state, area);
+    insta::assert_snapshot!("gov_cloud_warning_short", initial);
+
+    // Even a one-row disclosure viewport must expose every line and the link.
+    for height in [6, 2] {
+        let area = Rect::new(0, 0, 24, height);
+        let mut seen = String::new();
+        for _ in 0..20 {
+            let mut buffer = Buffer::empty(area);
+            state.render(area, &mut buffer, /*error*/ None);
+            seen.extend(buffer.content.iter().map(ratatui::buffer::Cell::symbol));
+            assert!(render_visible_at(&state, area).contains("Acknowledge"));
+            assert!(
+                state
+                    .handle_key_event(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                    .is_none()
+            );
+        }
+        assert!(seen.contains("Using Codex with AWS"));
+        assert!(seen.contains("proceeding."));
+        assert!(seen.contains(GOV_CLOUD_GUIDANCE_URL));
+        for _ in 0..20 {
+            state.handle_key_event(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            render_visible_at(&state, area);
+        }
+        assert!(render_visible_at(&state, area).starts_with("Using Codex with AWS"));
+    }
+    assert_eq!(render_visible_at(&state, area), initial);
+    state.handle_key_event(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    render_visible(&state);
+    assert_eq!(render_visible_at(&state, area), initial);
+}
+
+fn render_visible(state: &BedrockState) -> String {
+    render_visible_at(state, Rect::new(0, 0, 72, 24))
+}
+
+fn render_visible_at(state: &BedrockState, area: Rect) -> String {
     let mut buffer = Buffer::empty(area);
     state.render(area, &mut buffer, /*error*/ None);
     let mut rows = (area.top()..area.bottom())
         .map(|row| {
             (area.left()..area.right())
-                .map(|column| buffer[(column, row)].symbol())
+                .map(|column| {
+                    crate::terminal_hyperlinks::strip_osc8(buffer[(column, row)].symbol())
+                })
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -158,7 +239,7 @@ fn discovery_prioritizes_profiles_and_keeps_bedrock_api_key_last() {
             BedrockMethod::EnvironmentInstructions,
         ]
     );
-    insta::assert_snapshot!(render_visible(&profile_and_bearer), @r###"
+    insta::assert_snapshot!(render_visible(&profile_and_bearer), @r"
     > Set up Amazon Bedrock
 
       Choose how you authenticate with AWS.
@@ -170,12 +251,12 @@ fn discovery_prioritizes_profiles_and_keeps_bedrock_api_key_last() {
          Enter an access key ID and secret access key
 
       3. Environment variables
-         Configure AWS credentials in your environment, then return here.
+         Configure AWS credentials in your environment, then return here
 
 
       Press enter to continue
       Press esc to go back
-    "###);
+    ");
 
     let profile_state = BedrockState::discovered(BedrockDiscoverResponse {
         profiles: vec![profile],
@@ -263,7 +344,7 @@ fn discovery_prioritizes_profiles_and_keeps_bedrock_api_key_last() {
         profiles: Vec::new(),
         environment_credentials: Vec::new(),
     });
-    insta::assert_snapshot!(render_visible(&empty_state), @r###"
+    insta::assert_snapshot!(render_visible(&empty_state), @r"
     > Set up Amazon Bedrock
 
       No AWS credentials found.
@@ -276,7 +357,7 @@ fn discovery_prioritizes_profiles_and_keeps_bedrock_api_key_last() {
          Enter an access key ID and secret access key
 
       3. Environment variables
-         Configure AWS credentials in your environment, then return here.
+         Configure AWS credentials in your environment, then return here
 
       4. Bedrock API key
          Enter a Bedrock API key
@@ -284,7 +365,7 @@ fn discovery_prioritizes_profiles_and_keeps_bedrock_api_key_last() {
 
       Press enter to continue
       Press esc to go back
-    "###);
+    ");
 
     let mut many_profiles = BedrockState::discovered(BedrockDiscoverResponse {
         profiles: (0..12)

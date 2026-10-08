@@ -68,6 +68,8 @@ use tokio_util::sync::CancellationToken;
 
 mod clients_tests;
 mod pairing_tests;
+#[path = "tests/retry_tests.rs"]
+mod retry_tests;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const TEST_REMOTE_CONTROL_URL: &str = "http://127.0.0.1:1/backend-api/wham/remote/control";
@@ -138,6 +140,55 @@ async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime>
 }
 
 #[tokio::test]
+async fn committed_disable_prevents_later_enrollment_from_restoring_preference() {
+    let home = TempDir::new().expect("temp dir");
+    let state_db = remote_control_state_runtime(&home).await;
+    let session = remote_control_handle_with_current_enrollment(
+        TEST_REMOTE_CONTROL_URL,
+        remote_control_auth_manager(),
+    );
+    let enrollment = session.current_enrollment.snapshot().expect("enrollment");
+    session
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        });
+    session
+        .set_preference(
+            &state_db,
+            &enrollment.remote_control_target,
+            &enrollment.account_id,
+            /*client_name*/ None,
+            /*enabled*/ false,
+            Some(&enrollment),
+        )
+        .await
+        .expect("disable commits");
+    // This is the window before the disable RPC resumes and publishes its status.
+    let error = persistence::save_enrollment(
+        &session.auth_manager,
+        &session.persistence,
+        &state_db,
+        &enrollment,
+        /*client_name*/ None,
+        &session.desired_state_tx,
+    )
+    .await
+    .expect_err("enrollment cannot re-enable a committed disable");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    let saved = state_db
+        .get_remote_control_enrollment(
+            &enrollment.remote_control_target.websocket_url,
+            &enrollment.account_id,
+            /*app_server_client_name*/ None,
+        )
+        .await
+        .expect("read preference")
+        .expect("saved enrollment");
+    assert_eq!(saved.remote_control_enabled, Some(false));
+}
+
+#[tokio::test]
 async fn plain_start_resolves_persisted_remote_control_preference() {
     let cases = [
         ("enabled", Some(Some(true))),
@@ -183,7 +234,7 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
             server_name: test_server_name(),
         },
         Some(state_db),
-        remote_control_auth_manager(),
+        auth::RemoteControlAuth::capture(remote_control_auth_manager()).0,
         RemoteControlChannels {
             transport_event_tx,
             status_publisher: RemoteControlStatusPublisher::new(status_tx),
@@ -191,7 +242,7 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
                 /*enrollment*/ None,
             )),
             pairing_persistence_key: watch::channel(None).0,
-            desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+            persistence: RemoteControlPersistence::default(),
         },
         CancellationToken::new(),
         desired_state_tx.clone(),
@@ -250,8 +301,8 @@ async fn explicit_disabled_start_ignores_persisted_enable() {
     .expect("remote control should start disabled");
 
     assert_eq!(
-        *remote_handle.desired_state_tx.borrow(),
-        RemoteControlDesiredState::Disabled
+        remote_handle.status().status,
+        RemoteControlConnectionStatus::Disabled
     );
     assert_eq!(
         state_db
@@ -382,7 +433,7 @@ fn test_server_name() -> String {
 pub(super) fn remote_control_handle_with_current_enrollment(
     remote_control_url: &str,
     auth_manager: Arc<AuthManager>,
-) -> RemoteControlHandle {
+) -> RemoteControlSession {
     let (desired_state_tx, _desired_state_rx) =
         watch::channel(RemoteControlDesiredState::Enabled {
             persistence_preference: None,
@@ -410,19 +461,19 @@ pub(super) fn remote_control_handle_with_current_enrollment(
             next_refresh_at: None,
         },
     )));
-    RemoteControlHandle {
+    RemoteControlSession {
         policy: RemoteControlPolicy::Allowed,
         shutdown_token: CancellationToken::new(),
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
-        desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+        persistence: RemoteControlPersistence::default(),
         status_tx: Arc::new(status_tx),
         state_db: None,
         remote_control_url: remote_control_url.to_string(),
         current_enrollment,
         pairing_persistence_key: watch::channel(None).0,
         pairing_persistence_key_required: false,
-        auth_manager,
+        auth_manager: auth::RemoteControlAuth::capture(auth_manager).0,
     }
 }
 
@@ -1086,7 +1137,8 @@ async fn remote_control_transport_reconnects_after_disconnect() {
     drop(first_websocket);
 
     let (second_handshake_request, mut second_websocket) =
-        accept_remote_control_backend_connection(&listener).await;
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
     assert_eq!(
         second_handshake_request.headers.get("authorization"),
         Some(&format!("Bearer {TEST_REMOTE_CONTROL_SERVER_TOKEN}"))
@@ -1187,7 +1239,8 @@ async fn remote_control_transport_refreshes_server_token_after_websocket_unautho
     );
     respond_with_status(websocket_request.stream, "401 Unauthorized", "").await;
 
-    let refresh_request = accept_http_request(&listener).await;
+    let refresh_request =
+        accept_http_request_with_timeout(&listener, Duration::from_secs(45)).await;
     assert_eq!(
         refresh_request.request_line,
         "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
@@ -1632,7 +1685,8 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
         .expect("first websocket should close");
     drop(first_websocket);
 
-    let mut second_websocket = accept_remote_control_connection(&listener).await;
+    let mut second_websocket =
+        accept_remote_control_connection_with_timeout(&listener, Duration::from_secs(45)).await;
     send_client_event(
         &mut second_websocket,
         ClientEnvelope {
@@ -2290,15 +2344,18 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
     )
     .expect("account B auth should save");
     auth_manager.reload().await;
-    websocket
-        .close(None)
+    let closed = timeout(Duration::from_secs(1), websocket.next())
         .await
-        .expect("backend websocket should close");
+        .expect("account switch should close the backend websocket");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+    ));
 
-    let mut desired_state_rx = remote_handle.desired_state_tx.subscribe();
+    let mut desired_state_rx = remote_handle.status_receiver();
     timeout(
         Duration::from_secs(1),
-        desired_state_rx.wait_for(|state| *state == RemoteControlDesiredState::Disabled),
+        desired_state_rx.wait_for(|state| state.status == RemoteControlConnectionStatus::Disabled),
     )
     .await
     .expect("account B missing preference should disable remote control")
@@ -2561,7 +2618,10 @@ async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() 
     )
     .await;
 
-    let (handshake_request, _websocket) = accept_remote_control_backend_connection(&listener).await;
+    // Re-enrollment is followed by reconnect backoff, so allow time for that delay.
+    let (handshake_request, _websocket) =
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
     expect_remote_control_status(
         &mut status_rx,
         /*expected_status*/ None,
@@ -2660,7 +2720,8 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
     );
     respond_with_status(enroll_request.stream, "500 Internal Server Error", "failed").await;
 
-    let retry_refresh_request = accept_http_request(&listener).await;
+    let retry_refresh_request =
+        accept_http_request_with_timeout(&listener, Duration::from_secs(45)).await;
     assert_eq!(
         retry_refresh_request.request_line,
         "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
@@ -2674,6 +2735,8 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
     .await;
 
     let current_enrollment = remote_handle
+        .inner
+        .session()
         .current_enrollment
         .lock()
         .await
@@ -2825,7 +2888,9 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
         Some(stale_enrollment.clone())
     );
 
-    let (handshake_request, _websocket) = accept_remote_control_backend_connection(&listener).await;
+    let (handshake_request, _websocket) =
+        accept_remote_control_backend_connection_with_timeout(&listener, Duration::from_secs(45))
+            .await;
     assert_eq!(
         handshake_request.headers.get("x-codex-server-id"),
         Some(&stale_enrollment.server_id)
@@ -2891,7 +2956,14 @@ struct CapturedWebSocketRequest {
 }
 
 async fn accept_remote_control_connection(listener: &TcpListener) -> WebSocketStream<TcpStream> {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_remote_control_connection_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_remote_control_connection_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> WebSocketStream<TcpStream> {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("remote control should connect in time")
         .expect("listener accept should succeed");
@@ -2901,7 +2973,14 @@ async fn accept_remote_control_connection(listener: &TcpListener) -> WebSocketSt
 }
 
 async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_http_request_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_http_request_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> CapturedHttpRequest {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("HTTP request should arrive in time")
         .expect("listener accept should succeed");
@@ -2988,7 +3067,14 @@ async fn respond_with_status_and_headers(
 async fn accept_remote_control_backend_connection(
     listener: &TcpListener,
 ) -> (CapturedWebSocketRequest, WebSocketStream<TcpStream>) {
-    let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+    accept_remote_control_backend_connection_with_timeout(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_remote_control_backend_connection_with_timeout(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+) -> (CapturedWebSocketRequest, WebSocketStream<TcpStream>) {
+    let (stream, _) = timeout(accept_timeout, listener.accept())
         .await
         .expect("websocket request should arrive in time")
         .expect("listener accept should succeed");

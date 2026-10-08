@@ -12,7 +12,6 @@ use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
-use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesOptions;
 use codex_client::HttpTransport;
 use codex_client::Request;
@@ -308,22 +307,28 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn responses_client_uses_guardian_path() -> Result<()> {
+async fn responses_client_sends_extra_headers() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());
-    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth))
-        .with_endpoint(ResponsesEndpoint::Guardian);
-
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
+    let headers = HeaderMap::from_iter([(
+        http::HeaderName::from_static("x-custom-request"),
+        HeaderValue::from_static("example"),
+    )]);
     let _stream = client
         .stream(
             serde_json::json!({ "echo": true }),
-            HeaderMap::new(),
+            headers,
             Compression::None,
             /*turn_state*/ None,
         )
         .await?;
-
-    assert_path_ends_with(&state.take_stream_requests(), "/guardian");
+    let requests = state.take_stream_requests();
+    assert_path_ends_with(&requests, "/responses");
+    assert_eq!(
+        requests[0].headers.get("x-custom-request"),
+        Some(&HeaderValue::from_static("example")),
+    );
     Ok(())
 }
 
@@ -334,7 +339,6 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
         input: vec![ResponseItem::Message {
             id: Some(ResponseItemId::with_suffix("msg", "1")),
             role: "user".into(),
@@ -371,10 +375,67 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         serde_json::from_slice(prepared.body.as_deref().expect("body should be JSON"))?;
     assert_eq!(body, expected);
     assert_eq!(body["input"][0]["id"], "msg_1");
+    assert_eq!(body.get("service_tier"), None);
     assert_eq!(
         prepared.headers.get(http::header::CONTENT_TYPE),
         Some(&HeaderValue::from_static("application/json"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_client_stream_request_sends_routing_fields_ahead_of_large_input() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
+    // Exercise the customer gateway case where routing fields must be available without
+    // buffering a potentially multi-megabyte prompt first.
+    let large_input = "x".repeat(2 * 1024 * 1024);
+    let request = ResponsesApiRequest {
+        model: "gpt-test".into(),
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: large_input }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        tools: None,
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: Some("priority".into()),
+        prompt_cache_key: None,
+        text: None,
+        client_metadata: None,
+        access_programs: None,
+    };
+    let expected = serde_json::to_value(&request)?;
+
+    let _stream = client
+        .stream_request(request, ResponsesOptions::default())
+        .await?;
+
+    let requests = state.take_stream_requests();
+    assert_eq!(requests.len(), 1);
+    let body = std::str::from_utf8(request_body_bytes(&requests[0]))?;
+    let input_position = body.find(r#""input":"#).expect("input should be present");
+    for routing_field in [r#""model":"#, r#""stream":"#, r#""service_tier":"#] {
+        assert!(
+            body.find(routing_field)
+                .is_some_and(|position| position < input_position),
+            "{routing_field} should precede input"
+        );
+    }
+    assert!(body.starts_with(
+        r#"{"model":"gpt-test","stream":true,"service_tier":"priority","input":[{"type":"message""#
+    ));
+    assert!(body.len() > 2 * 1024 * 1024);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(body)?, expected);
     Ok(())
 }
 
@@ -428,7 +489,6 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
         input: Vec::new(),
         tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
@@ -543,7 +603,6 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
         input: vec![ResponseItem::Message {
             id: Some(ResponseItemId::with_suffix("msg", "1")),
             role: "user".into(),

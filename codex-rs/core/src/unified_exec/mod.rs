@@ -43,7 +43,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
-use crate::shell::ShellType;
+use crate::shell::ShellInvocation;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use codex_core_plugins::PluginMetricsSidecar;
 
@@ -81,6 +81,12 @@ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 
+const MAX_TRACE_ID_BYTES: usize = 256;
+
+fn trace_id(id: &str) -> Option<&str> {
+    (!id.is_empty() && id.len() <= MAX_TRACE_ID_BYTES).then_some(id)
+}
+
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub step_context: Arc<StepContext>,
@@ -107,7 +113,7 @@ impl UnifiedExecContext {
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
     pub command: Vec<String>,
-    pub shell_type: ShellType,
+    pub shell: ShellInvocation,
     pub hook_command: String,
     pub process_id: i32,
     pub yield_time_ms: u64,
@@ -154,7 +160,9 @@ pub(crate) struct ProcessStore {
 
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
-        self.reserved_process_ids.remove(&process_id);
+        if !process_manager::should_use_deterministic_process_ids() {
+            self.reserved_process_ids.remove(&process_id);
+        }
         self.processes.remove(&process_id)
     }
 }

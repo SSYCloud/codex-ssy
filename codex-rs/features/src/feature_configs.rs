@@ -1,10 +1,26 @@
 use crate::FeatureConfig;
 use crate::FeatureToml;
+use codex_network_proxy::CredentialProviderConfig;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_utils_redacted_string::RedactedString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+
+/// Connection to a board provisioned by the research host.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMessageBoardConfigToml {
+    pub url: String,
+    /// Board credential supplied directly by a runtime config override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<RedactedString>,
+    /// Read the credential from this environment variable instead of bearer_token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +41,15 @@ pub struct CodeModeConfigToml {
     /// Default yield timeout for code-mode exec calls, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_exec_yield_time_ms: Option<u64>,
+    /// Show handler duration, code-mode host duration, and harness overhead
+    /// in each code-mode cell response.
+    /// Experimental: this option and the response format may change or be removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_show_cell_overhead: Option<bool>,
+    /// Maximum UTF-8 bytes per rendered tool input type, with a 16,000-byte minimum and default.
+    /// For ordinary MCP tools, this is also at least their server's explicitly configured input limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
@@ -124,13 +149,23 @@ pub struct GuardianV2ReviewScopeConfigToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianV2ConfigToml {
+    /// Transcript encoding for synchronous Guardian review and asynchronous scoring. Defaults to line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_mode: Option<codex_protocol::TranscriptFormat>,
+    /// Classifier experiment override. Otherwise use the model default, then snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_classifier_mode: Option<codex_protocol::openai_models::AsyncClassifierMode>,
+    /// Reset retained async history when the next request exceeds this token estimate.
+    /// Defaults to 100,000. Fresh requests remain subject to the model's input limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub async_classifier_conversation_token_limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Route Guardian review and classification through the unmetered Codex endpoints.
+    /// Legacy setting retained for config compatibility; the backend now controls Guardian billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_guardian: Option<bool>,
-    /// Use thread-owned context for sync and async Guardian. Defaults to false.
-    /// Independent of the Guardian v2 `enabled` toggle.
+    /// Deprecated and ignored; thread-owned Guardian context is always enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_context: Option<bool>,
     /// Persist reviewed actions and risk scores to rollout files for debugging.
@@ -191,6 +226,11 @@ where
     }
 
     let transcript = config.transcript.as_ref();
+    if config.async_classifier_conversation_token_limit == Some(0) {
+        return Err(serde::de::Error::custom(
+            "Guardian v2 async_classifier_conversation_token_limit must be positive",
+        ));
+    }
     let message_entry = transcript.and_then(|value| value.max_message_entry_tokens);
     let tool_entry = transcript.and_then(|value| value.max_tool_entry_tokens);
     let message_total = transcript.and_then(|value| value.max_message_transcript_tokens);
@@ -287,6 +327,15 @@ pub struct MultiAgentV2ConfigToml {
     /// Expose the multi-agent v2 `wait_agent` tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_agent_enabled: Option<bool>,
+    /// Disable the model's direct-message tools; spawning and automatic child results remain available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_direct_message: Option<bool>,
+    /// Keep the message board in memory for a training session, including ephemeral sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_in_memory: Option<bool>,
+    /// Use a session-scoped remote board instead of local storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_remote: Option<RemoteMessageBoardConfigToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
 }
@@ -474,10 +523,15 @@ pub struct NetworkProxyConfigToml {
     pub domains: Option<BTreeMap<String, NetworkProxyDomainPermissionToml>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unix_sockets: Option<BTreeMap<String, NetworkProxyUnixSocketPermissionToml>>,
+    /// Permits local servers and direct host-loopback connections and skips the proxy's
+    /// additional private-network destination checks. Proxy domain rules still apply.
+    /// Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_local_binding: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_broker: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<BTreeMap<String, CredentialProviderConfig>>,
 }
 
 impl FeatureConfig for NetworkProxyConfigToml {

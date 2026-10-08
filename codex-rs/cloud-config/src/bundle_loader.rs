@@ -8,25 +8,8 @@ use codex_login::AuthConfig;
 use codex_login::AuthManager;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
-
-fn refresher_task_slot() -> &'static Mutex<Option<AbortHandle>> {
-    static REFRESHER_TASK: OnceLock<Mutex<Option<AbortHandle>>> = OnceLock::new();
-    REFRESHER_TASK.get_or_init(|| Mutex::new(None))
-}
-
-pub(crate) fn replace_refresh_task(slot: &Mutex<Option<AbortHandle>>, next: AbortHandle) {
-    let mut guard = slot.lock().unwrap_or_else(|err| {
-        tracing::warn!("cloud config bundle refresher task slot was poisoned");
-        err.into_inner()
-    });
-    if let Some(previous) = guard.replace(next) {
-        previous.abort();
-    }
-}
 
 struct CloudConfigBundleLoaderLifetime<C> {
     service: Arc<CloudConfigBundleService<C>>,
@@ -54,8 +37,7 @@ pub fn cloud_config_bundle_loader(
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let (loader, refresh_task) = cloud_config_bundle_loader_for_service(service);
-    replace_refresh_task(refresher_task_slot(), refresh_task);
+    let (loader, _) = cloud_config_bundle_loader_for_service(service);
     loader
 }
 
@@ -77,9 +59,15 @@ where
         refresh_task,
     });
 
+    let snapshot_lifetime = Arc::clone(&lifetime);
+    let policy = lifetime.service.policy.clone();
     let loader = CloudConfigBundleLoader::from_getter(move || {
         let lifetime = Arc::clone(&lifetime);
         async move { lifetime.service.get_latest().await }
+    })
+    .with_ema_policy_snapshots(policy, move || {
+        let lifetime = Arc::clone(&snapshot_lifetime);
+        async move { lifetime.service.get_latest_snapshot().await }
     });
     (loader, abort_handle)
 }
@@ -90,8 +78,7 @@ pub async fn cloud_config_bundle_loader_for_storage(
 ) -> std::io::Result<CloudConfigBundleLoader> {
     let service =
         cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env).await?;
-    let (loader, refresh_task) = cloud_config_bundle_loader_for_service(service);
-    replace_refresh_task(refresher_task_slot(), refresh_task);
+    let (loader, _) = cloud_config_bundle_loader_for_service(service);
     Ok(loader)
 }
 

@@ -13,11 +13,13 @@ use crate::metrics::emit_fetch_attempt_metric;
 use crate::metrics::emit_fetch_final_metric;
 use crate::metrics::emit_load_metric;
 use crate::validation::validate_bundle;
+use codex_async_utils::backoff;
 use codex_config::AbsolutePathBuf;
 use codex_config::CloudConfigBundle;
 use codex_config::CloudConfigBundleLoadError;
 use codex_config::CloudConfigBundleLoadErrorCode;
-use codex_core::util::backoff;
+use codex_config::CloudConfigBundlePolicy;
+use codex_config::CloudConfigBundleSnapshot;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
@@ -32,7 +34,7 @@ use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
-pub(crate) const CLOUD_CONFIG_BUNDLE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CLOUD_CONFIG_BUNDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS: usize = 5;
 const CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -82,7 +84,8 @@ pub(crate) struct CloudConfigBundleService<C> {
     cache_enabled: bool,
     codex_home: AbsolutePathBuf,
     timeout: Duration,
-    latest_bundle: OnceCell<Mutex<Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
+    latest_bundle: OnceCell<Mutex<CloudConfigBundleSnapshot>>,
+    pub(crate) policy: CloudConfigBundlePolicy,
 }
 
 impl<C> CloudConfigBundleService<C>
@@ -104,6 +107,7 @@ where
             codex_home,
             timeout,
             latest_bundle: OnceCell::new(),
+            policy: CloudConfigBundlePolicy::default(),
         }
     }
 
@@ -115,12 +119,24 @@ where
     pub(crate) async fn get_latest(
         &self,
     ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
+        self.get_latest_snapshot().await.bundle
+    }
+
+    pub(crate) async fn get_latest_snapshot(&self) -> CloudConfigBundleSnapshot {
+        self.latest_snapshot().await.lock().await.clone()
+    }
+
+    async fn latest_snapshot(&self) -> &Mutex<CloudConfigBundleSnapshot> {
         self.latest_bundle
-            .get_or_init(|| async { Mutex::new(self.load_startup_bundle_with_timeout().await) })
+            .get_or_init(|| async {
+                let mut snapshot = CloudConfigBundleSnapshot {
+                    bundle: self.load_startup_bundle_with_timeout().await,
+                    binding: None,
+                };
+                self.policy.publish_snapshot(&mut snapshot);
+                Mutex::new(snapshot)
+            })
             .await
-            .lock()
-            .await
-            .clone()
     }
 
     pub(crate) async fn load_startup_bundle_with_timeout(
@@ -254,6 +270,13 @@ where
                         .validate_and_cache_remote_bundle(&auth, trigger, attempt, bundle)
                         .await;
                 }
+                Err(BundleRequestError::Policy(denied)) => {
+                    return Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::RequestFailed,
+                        /*status_code*/ None,
+                        denied.to_string(),
+                    ));
+                }
                 Err(BundleRequestError::Retryable(status)) => {
                     last_status_code = status.status_code();
                     if self
@@ -319,6 +342,7 @@ where
         bundle: CloudConfigBundle,
     ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
         emit_fetch_attempt_metric(trigger, attempt, "success", /*status_code*/ None);
+        let revision = self.policy.observe_remote_bundle(&bundle);
         if let Err(err) = validate_bundle(&bundle, &self.codex_home) {
             emit_fetch_final_metric(
                 trigger,
@@ -333,15 +357,19 @@ where
 
         let (chatgpt_user_id, account_id) = auth_identity(auth);
         if self.cache_enabled
-            && let Err(err) = self
-                .cache
-                .save(chatgpt_user_id, account_id, bundle.clone())
-                .await
+            && let Some(revision) = revision
         {
-            tracing::warn!(
-                error = %err,
-                "Failed to write cloud config bundle cache"
-            );
+            let result = match self
+                .cache
+                .prepare(chatgpt_user_id, account_id, bundle.clone())
+                .await
+            {
+                Ok(staged) => staged.publish_if_current(revision).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "Failed to write cloud config bundle cache");
+            }
         }
 
         emit_fetch_final_metric(
@@ -416,6 +444,13 @@ where
                     *auth = refreshed_auth;
                     return Ok(UnauthorizedRecoveryAction::RetrySameAttempt);
                 }
+                Err(RefreshTokenError::Policy(error)) => {
+                    return Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Auth,
+                        status_code,
+                        error.to_string(),
+                    ));
+                }
                 Err(RefreshTokenError::Permanent(failed)) => {
                     tracing::warn!(
                         error = %failed,
@@ -474,7 +509,7 @@ where
             let mut refresh_interval = CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL;
             if let Some(latest_bundle) = self.latest_bundle.get()
                 && matches!(
-                    &*latest_bundle.lock().await,
+                    &latest_bundle.lock().await.bundle,
                     Err(error) if error.code() == CloudConfigBundleLoadErrorCode::Timeout
                 )
             {
@@ -491,6 +526,12 @@ where
                         "Timed out refreshing cloud config bundle cache from remote; keeping existing cache"
                     );
                     emit_load_metric("refresh", "error", /*bundle*/ None);
+                    self.publish_refresh_result(Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Timeout,
+                        /*status_code*/ None,
+                        "timed out refreshing cloud config bundle",
+                    )))
+                    .await;
                 }
             }
         }
@@ -510,9 +551,7 @@ where
         {
             Ok(bundle) => {
                 emit_load_metric("refresh", "success", bundle.as_ref());
-                if let Some(latest_bundle) = self.latest_bundle.get() {
-                    *latest_bundle.lock().await = Ok(bundle);
-                }
+                self.publish_refresh_result(Ok(bundle)).await;
             }
             Err(err) => {
                 tracing::error!(
@@ -521,15 +560,30 @@ where
                     "Failed to refresh cloud config bundle cache from remote"
                 );
                 emit_load_metric("refresh", "error", /*bundle*/ None);
-                if let Some(latest_bundle) = self.latest_bundle.get() {
-                    let mut latest_bundle = latest_bundle.lock().await;
-                    if latest_bundle.is_err() {
-                        *latest_bundle = Err(err);
-                    }
-                }
+                self.publish_refresh_result(Err(err)).await;
             }
         }
         true
+    }
+
+    async fn publish_refresh_result(
+        &self,
+        result: Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>,
+    ) {
+        let Some(latest) = self.latest_bundle.get() else {
+            return;
+        };
+        let mut latest = latest.lock().await;
+        if result.is_ok() {
+            *latest = CloudConfigBundleSnapshot {
+                bundle: result,
+                binding: None,
+            };
+            self.policy.publish_snapshot(&mut latest);
+        } else if latest.bundle.is_err() {
+            latest.bundle = result;
+            latest.binding = None;
+        }
     }
 }
 

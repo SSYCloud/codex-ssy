@@ -111,10 +111,7 @@ impl LegacyAppPathString {
         })?;
         let is_windows = convention == PathConvention::Windows;
         let path = self.as_str();
-        let home_relative = path
-            .strip_prefix("~/")
-            .or_else(|| (path == "~").then_some(""))
-            .or_else(|| is_windows.then(|| path.strip_prefix(r"~\")).flatten());
+        let home_relative = convention.home_relative_suffix(path);
         if let Some(suffix) = home_relative {
             let home =
                 user_home_dir.ok_or_else(|| LegacyAppPathStringError::MissingHomeDirectory {
@@ -165,9 +162,11 @@ impl LegacyAppPathString {
 
     /// Infers the path convention of an absolute API path from its spelling.
     ///
-    /// Relative paths and ambiguous spellings return `None`. In particular,
-    /// slash-prefixed paths are treated as POSIX even when they could also be
-    /// interpreted as slash-delimited Windows UNC paths.
+    /// Two leading separators select Windows UNC or namespace syntax, including
+    /// forward and mixed slashes, independently of the current host. This favors
+    /// UNC paths over ambiguous double-slash POSIX paths. Call [`Self::to_path_uri`]
+    /// with an explicit POSIX convention to preserve that interpretation.
+    /// Relative paths return `None`; inferred prefixes still require validation.
     pub fn infer_absolute_path_convention(&self) -> Option<PathConvention> {
         let bytes = self.0.as_bytes();
         let has_windows_drive_root = matches!(
@@ -175,7 +174,12 @@ impl LegacyAppPathString {
             [drive, b':', separator, ..]
                 if drive.is_ascii_alphabetic() && is_windows_separator_byte(*separator)
         );
-        if has_windows_drive_root || self.0.starts_with(r"\\") {
+        let has_windows_unc_root = matches!(
+            bytes,
+            [first, second, ..]
+                if is_windows_separator_byte(*first) && is_windows_separator_byte(*second)
+        );
+        if has_windows_drive_root || has_windows_unc_root {
             Some(PathConvention::Windows)
         } else if self.0.starts_with('/') {
             Some(PathConvention::Posix)
@@ -412,6 +416,11 @@ pub enum LegacyAppPathStringError {
     InvalidNativePath {
         path: String,
         convention: Option<PathConvention>,
+    },
+    #[error("unsupported configuration path {path:?} using {convention} path syntax")]
+    UnsupportedConfigPath {
+        path: String,
+        convention: PathConvention,
     },
     #[error("path URI `{cwd}` has no path convention")]
     MissingBaseConvention { cwd: String },

@@ -3,6 +3,66 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn promoted_banner_uses_picker_hints_and_preserves_the_draft() {
+    let width = 40;
+    for confirm in [false, true] {
+        let (tx, mut rx) = unbounded_channel();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.list.accept = vec![crate::key_hint::plain(KeyCode::F(/*n*/ 3))];
+        keymap.list.cancel = vec![crate::key_hint::plain(KeyCode::F(/*n*/ 2))];
+        pane.set_keymap_bindings(&keymap);
+        pane.set_composer_text("draft in progress".into(), Vec::new(), Vec::new());
+        pane.handle_key_event(KeyEvent::from(KeyCode::Left));
+        let draft = pane.composer.draft_snapshot();
+        pane.show_actionable_banner(ActionableBanner {
+            title: "Usage limit reached".into(),
+            description: "Review your usage or keep working with another model.".into(),
+            actions: vec![SelectionItem {
+                name: "View usage".into(),
+                dismiss_on_select: true,
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenUrlInBrowser {
+                        url: "https://example.com/usage".into(),
+                    });
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            width,
+            pane.desired_height(width),
+        );
+        let rendered = render_snapshot(&pane, area);
+        assert!(rendered.contains("View usage"), "{rendered}");
+        assert!(rendered.contains("f3 select · f2 back"), "{rendered}");
+        if confirm {
+            assert_snapshot!(format!("promoted_action_banner_{width}"), rendered);
+        }
+        assert_eq!(pane.composer.draft_snapshot(), draft);
+
+        let key = if confirm {
+            KeyCode::F(/*n*/ 3)
+        } else {
+            KeyCode::F(/*n*/ 2)
+        };
+        pane.handle_key_event(KeyEvent::from(key));
+        assert!(pane.view_stack.is_empty());
+        assert_eq!(pane.composer.draft_snapshot(), draft);
+        if confirm {
+            assert!(
+                matches!(rx.try_recv(), Ok(AppEvent::OpenUrlInBrowser { url })
+                    if url == "https://example.com/usage")
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
 fn hidden_banner_preserves_input_before_render_and_after_resize() {
     let (tx, mut rx) = unbounded_channel();
     let mut pane = test_pane_with_disable_paste_burst(
@@ -38,9 +98,17 @@ fn hidden_banner_preserves_input_before_render_and_after_resize() {
 
     // Keys remain composer input before the first frame and after resizing a
     // previously visible banner out of view.
-    for render_hidden in [false, true] {
+    for (render_hidden, composer_gap) in [
+        (false, None),
+        (true, None),
+        (true, Some(super::super::ComposerGap::default())),
+    ] {
         if render_hidden {
-            let rendered = render_snapshot(&pane, hidden_area);
+            let renderable = pane.as_renderable_with_options(ComposerRenderOptions {
+                composer_gap: composer_gap.as_ref(),
+                ..Default::default()
+            });
+            let rendered = render_snapshot(&renderable, hidden_area);
             assert!(!rendered.contains("View usage"));
         }
         pane.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
@@ -50,7 +118,22 @@ fn hidden_banner_preserves_input_before_render_and_after_resize() {
         assert!(pane.is_normal_backtrack_mode());
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        let rendered = render_snapshot(&pane, visible_area);
+        let rendered = {
+            let renderable = pane.as_renderable_with_options(ComposerRenderOptions {
+                composer_gap: composer_gap.as_ref(),
+                ..Default::default()
+            });
+            render_snapshot(
+                &renderable,
+                Rect {
+                    height: renderable.desired_height(width),
+                    ..visible_area
+                },
+            )
+        };
+        if composer_gap.is_some() {
+            assert_snapshot!("actionable_banner_with_composer_gap", rendered);
+        }
         assert!(rendered.contains("View usage"));
         assert!(!pane.is_normal_backtrack_mode());
         pane.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
@@ -75,15 +158,21 @@ fn partially_clipped_banner_preserves_hidden_action_shortcuts() {
     );
     pane.set_inline_banner(Some(ActionableBanner {
         title: "Usage limit reached".into(),
-        actions: vec![SelectionItem {
-            name: "View usage".into(),
-            actions: vec![Box::new(|tx| {
-                tx.send(AppEvent::OpenUrlInBrowser {
-                    url: "https://example.com/usage".into(),
-                });
-            })],
-            ..Default::default()
-        }],
+        actions: vec![
+            SelectionItem {
+                name: "Keep working".into(),
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "View usage".into(),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenUrlInBrowser {
+                        url: "https://example.com/usage".into(),
+                    });
+                })],
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     }));
     let width = 70;
@@ -95,9 +184,10 @@ fn partially_clipped_banner_preserves_hidden_action_shortcuts() {
     );
 
     let rendered = render_snapshot(&pane, footer_only_area);
+    assert!(rendered.contains("Keep working"));
     assert!(!rendered.contains("View usage"));
-    pane.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
-    assert_eq!(pane.composer_text(), "1");
+    pane.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(pane.composer_text(), "2");
     assert!(rx.try_recv().is_err());
 }
 
@@ -167,4 +257,40 @@ fn information_banner_preserves_input_and_honors_dismissal() {
         pane.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(pane.composer_text(), "1");
     }
+}
+
+#[test]
+fn banner_copy_preserves_wrapped_url_destinations() {
+    let url = "https://github.com/openai/codex/pull/12345?diff=split";
+    let (tx, _rx) = unbounded_channel();
+    let mut pane = test_pane(AppEventSender::new(tx));
+    pane.set_inline_banner(Some(ActionableBanner {
+        title: "Review the release".into(),
+        description: format!("Open {url} before continuing."),
+        ..Default::default()
+    }));
+    let area = Rect::new(0, 0, 40, pane.desired_height(/*width*/ 40));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    pane.render(area, &mut buf);
+    let linked = buf
+        .content
+        .iter()
+        .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+        .map(|cell| {
+            assert!(cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")));
+            crate::terminal_hyperlinks::strip_osc8(cell.symbol())
+        })
+        .collect::<String>();
+    assert_eq!(linked, url);
+    let visible = buf
+        .content
+        .chunks(usize::from(area.width))
+        .map(|row| {
+            row.iter()
+                .map(|cell| crate::terminal_hyperlinks::strip_osc8(cell.symbol()))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("banner_wrapped_url", visible);
 }

@@ -316,6 +316,7 @@ async fn apply_change_set(
 INSERT INTO thread_turns (
     thread_id,
     turn_id,
+    root_turn_id,
     rollout_ordinal,
     rollout_byte_offset,
     rollout_end_ordinal,
@@ -325,8 +326,9 @@ INSERT INTO thread_turns (
     started_at,
     completed_at,
     duration_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id, turn_id) DO UPDATE SET
+    root_turn_id = COALESCE(thread_turns.root_turn_id, excluded.root_turn_id),
     rollout_end_ordinal = excluded.rollout_end_ordinal,
     rollout_end_byte_offset = excluded.rollout_end_byte_offset,
     status = excluded.status,
@@ -340,6 +342,7 @@ WHERE thread_turns.rollout_end_ordinal IS NULL
         )
         .bind(thread_id)
         .bind(turn_id.as_str())
+        .bind(turn.root_turn_id)
         .bind(rollout_ordinal)
         .bind(rollout_byte_offset)
         .bind(terminal_ordinal)
@@ -450,11 +453,15 @@ INSERT INTO thread_items (
     rollout_ordinal,
     updated_at_ordinal,
     created_at_ms,
+    started_at_ms,
+    completed_at_ms,
     item_type,
     item_json
-) VALUES (?, ?, ?, ?, ?, ?, json_extract(?, '$.type'), ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, json_extract(?, '$.type'), ?)
 ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET
     updated_at_ordinal = excluded.updated_at_ordinal,
+    started_at_ms = COALESCE(thread_items.started_at_ms, excluded.started_at_ms),
+    completed_at_ms = COALESCE(thread_items.completed_at_ms, excluded.completed_at_ms),
     item_type = excluded.item_type,
     item_json = excluded.item_json
             "#,
@@ -465,6 +472,8 @@ ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET
         .bind(rollout_ordinal)
         .bind(rollout_ordinal)
         .bind(created_at_ms)
+        .bind(item.started_at_ms)
+        .bind(item.completed_at_ms)
         .bind(item_json.as_str())
         .bind(item_json)
         .execute(&mut **transaction)
@@ -514,7 +523,7 @@ WHERE thread_id = ?
                 .map_err(thread_history_error)?;
             }
             ThreadItem::AgentMessage {
-                phase: Some(MessagePhase::Commentary) | None,
+                phase: Some(MessagePhase::Commentary | MessagePhase::PartialAnswer) | None,
                 ..
             }
             | ThreadItem::HookPrompt { .. }

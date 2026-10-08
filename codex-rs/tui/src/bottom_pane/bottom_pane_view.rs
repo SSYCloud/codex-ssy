@@ -16,8 +16,21 @@ pub(crate) enum ViewCompletion {
     Cancelled,
 }
 
+/// How a view is placed over the preceding view in the bottom-pane stack.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ViewPresentation {
+    #[default]
+    Inline,
+    Centered,
+}
+
 /// Trait implemented by every view that can be shown in the bottom pane.
 pub(crate) trait BottomPaneView: Renderable {
+    /// Centered views preserve the preceding view as their backdrop.
+    fn presentation(&self) -> ViewPresentation {
+        ViewPresentation::Inline
+    }
+
     /// Handle a key event while the view is active. A redraw is always
     /// scheduled after this call.
     fn handle_key_event(&mut self, _key_event: KeyEvent) {}
@@ -142,6 +155,11 @@ pub(crate) trait BottomPaneView: Renderable {
         request: McpServerElicitationFormRequest,
     ) -> Option<McpServerElicitationFormRequest> {
         Some(request)
+    }
+
+    /// Return true when this view already presents the matching app-server request.
+    fn matches_app_server_request(&self, _request: &ResolvedAppServerRequest) -> bool {
+        false
     }
 
     /// Dismiss a request that was resolved by another client.

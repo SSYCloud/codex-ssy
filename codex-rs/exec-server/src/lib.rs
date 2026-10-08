@@ -3,21 +3,25 @@ mod capability_discovery;
 mod capability_discovery_cache;
 mod client;
 mod client_api;
+mod client_error;
 mod client_telemetry;
 mod client_transport;
 mod connection;
+#[path = "discoverV2/mod.rs"]
+mod discover_v2;
 mod environment;
 mod environment_bootstrap;
 mod environment_config;
 mod environment_provider;
 mod environment_registry;
 mod environment_toml;
-mod file_read;
+mod file_handle;
 mod forward;
 mod fs_helper;
 mod fs_helper_main;
 mod fs_sandbox;
 mod local_file_system;
+mod local_file_system_read;
 mod local_process;
 mod network_policy_decisions;
 mod no_follow;
@@ -35,15 +39,26 @@ mod remote_process;
 mod resolved_capability;
 mod rpc;
 mod rpc_server_requests;
-mod runtime_paths;
+mod rpc_timing;
+mod runtime_options;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod sandbox_integrity;
+mod sandbox_selection;
 mod sandboxed_file_open;
 mod sandboxed_file_system;
 mod server;
 #[cfg(unix)]
 mod shell_snapshot;
+#[cfg(unix)]
+mod shell_snapshot_file;
+#[cfg(unix)]
+mod shell_snapshot_process;
 mod telemetry;
 mod trace_context;
 mod websocket_pong_watchdog;
+
+// Shared limits for inbound executor messages across all transports.
+mod client_inbound_request_limit;
 
 use codex_exec_server_protocol as protocol;
 
@@ -70,10 +85,15 @@ pub use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 pub use codex_exec_server_protocol::ProcessId;
 pub use codex_file_system::CopyOptions;
 pub use codex_file_system::CreateDirectoryOptions;
+pub use codex_file_system::EnvironmentAccess;
+pub use codex_file_system::EnvironmentAccessExt;
+pub use codex_file_system::EnvironmentAccessKey;
 pub use codex_file_system::ExecutorFileSystem;
 pub use codex_file_system::ExecutorFileSystemFuture;
 pub use codex_file_system::FILE_READ_CHUNK_SIZE;
+pub use codex_file_system::FILE_WRITE_CHUNK_SIZE;
 pub use codex_file_system::FileMetadata;
+pub use codex_file_system::FileSystemEnvironmentAccessor;
 pub use codex_file_system::FileSystemReadStream;
 pub use codex_file_system::FileSystemResult;
 pub use codex_file_system::FileSystemSandboxContext;
@@ -86,6 +106,7 @@ pub use codex_file_system::WalkEntryKind;
 pub use codex_file_system::WalkError;
 pub use codex_file_system::WalkOptions;
 pub use codex_file_system::WalkOutcome;
+pub use codex_file_system::WindowsSandboxSelection;
 pub use codex_file_system::WriteFileOptions;
 pub use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 pub use environment::CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR;
@@ -126,12 +147,15 @@ pub use process::ExecProcessEventReceiver;
 pub use process::ExecProcessFuture;
 pub use process::StartedExecProcess;
 pub use protocol::ByteChunk;
+pub use protocol::CAPABILITIES_DISCOVER_V2_METHOD;
 pub use protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
 pub use protocol::CapabilityRootDiscoverRequest;
 pub use protocol::CapabilityRootDiscovery;
 pub use protocol::CapabilityRootsDiscoverParams;
 pub use protocol::CapabilityRootsDiscoverResponse;
 pub use protocol::CapabilityTextFile;
+pub use protocol::DiscoverV2CapabilitiesRequest;
+pub use protocol::DiscoverV2CapabilitiesResponse;
 pub use protocol::DiscoveredPluginFiles;
 pub use protocol::DiscoveredSkillFiles;
 pub use protocol::EnvironmentCapabilities;
@@ -153,6 +177,8 @@ pub use protocol::ExecResponse;
 pub use protocol::ExecServerNetworkPolicyDecision;
 pub use protocol::ExecServerNetworkPolicyRequest;
 pub use protocol::ExecServerNetworkProtocol;
+pub use protocol::ExecutorPlugin;
+pub use protocol::ExecutorSkill;
 pub use protocol::FsCanonicalizeParams;
 pub use protocol::FsCanonicalizeResponse;
 pub use protocol::FsCloseParams;
@@ -163,6 +189,7 @@ pub use protocol::FsCreateDirectoryParams;
 pub use protocol::FsCreateDirectoryResponse;
 pub use protocol::FsGetMetadataParams;
 pub use protocol::FsGetMetadataResponse;
+pub use protocol::FsOpenMode;
 pub use protocol::FsOpenParams;
 pub use protocol::FsOpenResponse;
 pub use protocol::FsReadBlockParams;
@@ -176,6 +203,8 @@ pub use protocol::FsRemoveParams;
 pub use protocol::FsRemoveResponse;
 pub use protocol::FsWalkParams;
 pub use protocol::FsWalkResponse;
+pub use protocol::FsWriteBlockParams;
+pub use protocol::FsWriteBlockResponse;
 pub use protocol::FsWriteFileParams;
 pub use protocol::FsWriteFileResponse;
 pub use protocol::HttpHeader;
@@ -208,7 +237,7 @@ pub use remote::run_remote_environment_forward_until_shutdown;
 pub use remote::run_remote_environment_until_shutdown;
 pub use resolved_capability::ResolvedSelectedCapabilityRoot;
 pub use resolved_capability::SelectedCapabilityRootsStatus;
-pub use runtime_paths::ExecServerRuntimePaths;
+pub use runtime_options::ExecServerRuntimeOptions;
 pub use server::ConcurrentRequestLimit;
 pub use server::DEFAULT_LISTEN_URL;
 pub use server::ExecServerListenUrlParseError;
@@ -216,3 +245,9 @@ pub use server::RequestDispatchMode;
 pub use server::run_main;
 pub use server::run_main_with_telemetry;
 pub use telemetry::ExecServerTelemetry;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub use sandbox_integrity::run_integrity_checks;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub async fn run_integrity_checks(_request: &codex_sandboxing::SandboxExecRequest) {}

@@ -3,8 +3,11 @@ use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
+use codex_protocol::permissions::windows_deny_read_glob_scan;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -13,6 +16,9 @@ mod walker;
 
 use walker::DirectoryScanMode;
 use walker::collect_existing_glob_directory_matches;
+
+/// External scanner used by deny-glob expansion and its dependency inventory.
+pub const GLOB_SCAN_PROGRAM: &str = "rg";
 
 #[derive(Debug, Eq, PartialEq)]
 struct GlobScanPlan {
@@ -31,6 +37,27 @@ struct GlobScanPlan {
 pub fn resolve_windows_deny_read_paths(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
+) -> Result<Vec<AbsolutePathBuf>, String> {
+    resolve_deny_read_paths(file_system_sandbox_policy, cwd, |_| {})
+}
+
+/// Resolve deny paths with the launcher's scanner in an explicit command environment.
+/// The supplied environment replaces inheritance, including when it is empty.
+pub fn resolve_windows_deny_read_paths_in_environment(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+    env: &HashMap<String, String>,
+    command_cwd: &Path,
+) -> Result<Vec<AbsolutePathBuf>, String> {
+    resolve_deny_read_paths(file_system_sandbox_policy, cwd, |command| {
+        command.env_clear().envs(env).current_dir(command_cwd);
+    })
+}
+
+fn resolve_deny_read_paths(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+    configure: impl Fn(&mut Command),
 ) -> Result<Vec<AbsolutePathBuf>, String> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
@@ -71,7 +98,7 @@ pub fn resolve_windows_deny_read_paths(
             continue;
         }
 
-        let directory_scan_mode = if let Some(file_paths) = ripgrep_files(&scan_plan)? {
+        let directory_scan_mode = if let Some(file_paths) = ripgrep_files(&scan_plan, &configure)? {
             for path in file_paths {
                 if matcher.is_local_path_read_denied(&path) {
                     push_absolute_path(&mut paths, &mut seen, path)?;
@@ -98,8 +125,12 @@ pub fn resolve_windows_deny_read_paths(
     Ok(paths)
 }
 
-fn ripgrep_files(scan_plan: &GlobScanPlan) -> Result<Option<Vec<PathBuf>>, String> {
-    let mut command = Command::new("rg");
+fn ripgrep_files(
+    scan_plan: &GlobScanPlan,
+    configure: &impl Fn(&mut Command),
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let mut command = codex_utils_process::background_command(GLOB_SCAN_PROGRAM);
+    configure(&mut command);
     command
         .arg("--files")
         .arg("--hidden")
@@ -211,39 +242,11 @@ fn glob_scan_plans(
 }
 
 fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobScanPlan {
-    // Start scanning at the deepest literal directory prefix before the first
-    // glob metacharacter. For example, `C:\repo\**\*.env` only scans `C:\repo`
-    // instead of the current directory or drive root.
-    let first_glob = pattern
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '*' | '?' | '['))
-        .map(|(index, _)| index)
-        .unwrap_or(pattern.len());
-    let literal_prefix = &pattern[..first_glob];
-    let Some(separator_index) = literal_prefix.rfind(['/', '\\']) else {
-        return GlobScanPlan {
-            root: PathBuf::from("."),
-            max_depth: effective_glob_scan_max_depth(pattern, configured_max_depth),
-            globs: vec![ripgrep_glob(pattern)],
-        };
-    };
-    let pattern_suffix = &pattern[separator_index + 1..];
-    let is_drive_root_separator = separator_index > 0
-        && literal_prefix
-            .as_bytes()
-            .get(separator_index - 1)
-            .is_some_and(|ch| *ch == b':');
-    if separator_index == 0 || is_drive_root_separator {
-        return GlobScanPlan {
-            root: PathBuf::from(&literal_prefix[..=separator_index]),
-            max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
-            globs: vec![ripgrep_glob(pattern_suffix)],
-        };
-    }
+    let scan = windows_deny_read_glob_scan(pattern, configured_max_depth);
     GlobScanPlan {
-        root: PathBuf::from(literal_prefix[..separator_index].to_string()),
-        max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
-        globs: vec![ripgrep_glob(pattern_suffix)],
+        root: PathBuf::from(scan.root),
+        max_depth: scan.max_depth,
+        globs: vec![ripgrep_glob(scan.pattern_suffix)],
     }
 }
 
@@ -283,22 +286,6 @@ fn ripgrep_glob(pattern: &str) -> String {
     } else {
         format!("**/{escaped}")
     }
-}
-
-fn effective_glob_scan_max_depth(
-    pattern_suffix: &str,
-    configured_max_depth: Option<usize>,
-) -> Option<usize> {
-    let components = pattern_suffix
-        .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    if components.contains(&"**") {
-        return configured_max_depth;
-    }
-    Some(configured_max_depth.map_or(components.len(), |max_depth| {
-        max_depth.min(components.len())
-    }))
 }
 
 #[cfg(test)]
@@ -556,11 +543,14 @@ mod tests {
             tmp.path().display()
         ))]);
 
-        if let Some(paths) = super::ripgrep_files(&GlobScanPlan {
-            root: tmp.path().to_path_buf(),
-            max_depth: None,
-            globs: vec!["**/*.env".to_string()],
-        })
+        if let Some(paths) = super::ripgrep_files(
+            &GlobScanPlan {
+                root: tmp.path().to_path_buf(),
+                max_depth: None,
+                globs: vec!["**/*.env".to_string()],
+            },
+            &|_| {},
+        )
         .expect("case-insensitive ripgrep scan")
         {
             assert!(paths.contains(&uppercase_env));

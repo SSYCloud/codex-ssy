@@ -139,7 +139,7 @@ fn archive_failure_preserves_session_and_reports_server_error() {
 #[test]
 fn archive_shortcut_preserves_configured_list_binding() {
     let (mut state, _requests) = archive_picker_state();
-    state.list_keymap.move_up.push(KeyBinding::new(
+    state.keymap.list.move_up.push(KeyBinding::new(
         KeyCode::Char('\u{0001}'),
         KeyModifiers::NONE,
     ));
@@ -157,9 +157,9 @@ fn archive_footer_shows_shortcut_for_resume_sessions() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    insta::assert_snapshot!(footer, @r"
-     enter resume   ctrl+a archive   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
-     ctrl+o dense view   ctrl+t transcript   ctrl+e expand   ↑/↓ browse
+    insta::assert_snapshot!(footer, @"
+    enter resume   ⌃a archive   esc start new   ⌃c quit   tab focus sort/filter   ←/→ change option
+    ⌃o dense view   ⌃t transcript   ⌃e expand   ↑/↓ browse
     ");
 }
 
@@ -207,13 +207,13 @@ fn archived_status_preserves_directory_filter_and_hides_archive_shortcut() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    insta::assert_snapshot!(footer, @r"
-     enter restore   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
-     ctrl+o dense view   ctrl+t transcript   ctrl+e expand   ↑/↓ browse
+    insta::assert_snapshot!(footer, @"
+    enter restore   esc start new   ⌃c quit   tab focus sort/filter   ←/→ change option
+    ⌃o dense view   ⌃t transcript   ⌃e expand   ↑/↓ browse
     ");
     insta::assert_snapshot!(
         super::super::toolbar_line(&state, /*compact*/ true).to_string(),
-        @"Filter:[Cwd] [Archived] Sort:[Updated]"
+        @"Filter: Cwd   Archived  Sort: Updated "
     );
 
     state.toggle_filter_mode();
@@ -258,6 +258,7 @@ async fn archived_session_restore_resumes_after_completion() {
         Ok(SessionTarget {
             path: None,
             thread_id,
+            cwd: None,
             history_mode: None,
         }),
     );
@@ -267,6 +268,7 @@ async fn archived_session_restore_resumes_after_completion() {
         Some(SessionSelection::Resume(SessionTarget {
             path: None,
             thread_id: resumed_thread_id,
+            cwd: None,
             history_mode: None,
         })) if resumed_thread_id == thread_id
     ));

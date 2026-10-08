@@ -4,6 +4,7 @@ use codex_core::config::CurrentTimeReminderConfig;
 use codex_core::config::RolloutBudgetConfig;
 use codex_core::config::TokenBudgetConfig;
 use codex_features::Feature;
+use codex_protocol::models::ImageReference;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
@@ -75,6 +76,8 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
     test.codex
         .submit(Op::ApproveGuardianDeniedAction {
             event: GuardianAssessmentEvent {
+                review_reason: None,
+                model_context: None,
                 id: "guardian-review".to_string(),
                 target_item_id: None,
                 plugin_id: None,
@@ -110,7 +113,9 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
                     text_elements: Vec::new(),
                 },
                 UserInput::Image {
-                    image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
+                    },
                     detail: None,
                 },
                 UserInput::Audio {
@@ -145,8 +150,8 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
     let mut guardian_item = request
         .input()
         .into_iter()
-        .next()
-        .expect("guardian approval should be the first context item");
+        .nth(1)
+        .expect("guardian approval should follow the base instructions");
     guardian_item
         .as_object_mut()
         .expect("guardian approval should be an object")
@@ -201,6 +206,7 @@ async fn first_request_item_types_roles_and_content_annotations() -> Result<()> 
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(items, @r#"
+    message developer ["model.base_instructions"]
     message developer ["guardian.approved_action"]
     message developer ["generic.developer_instructions","token_budget.context_window_guidance","permissions.instructions","environments.instructions"]
     message developer ["token_budget.context_window"]

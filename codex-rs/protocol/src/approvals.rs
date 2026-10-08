@@ -204,6 +204,14 @@ pub enum GuardianReviewReason {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct GuardianAssessmentEvent {
+    /// Request-scoped trigger; absent in events recorded by older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_reason: Option<GuardianReviewReason>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub model_context: Option<crate::items::ModelInvocationContext>,
     /// Stable identifier for this guardian review lifecycle.
     pub id: String,
     /// Thread item being reviewed, when the review maps to a concrete item.
@@ -260,6 +268,10 @@ pub enum ExecApprovalKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ExecApprovalRequestEvent {
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub model_context: Option<crate::items::ModelInvocationContext>,
     /// Missing on older events, which retain command approval semantics.
     #[serde(default)]
     pub kind: ExecApprovalKind,
@@ -390,6 +402,16 @@ impl ExecApprovalRequestEvent {
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[ts(tag = "mode")]
 pub enum ElicitationRequest {
+    #[serde(rename = "openai/userVerification")]
+    #[ts(rename = "openai/userVerification")]
+    UserVerification {
+        #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, rename = "_meta")]
+        meta: Option<JsonValue>,
+        title: String,
+        description: String,
+        challenge: String,
+    },
     Form {
         #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
         #[ts(optional, rename = "_meta")]
@@ -423,6 +445,14 @@ pub enum ElicitationRequest {
         url: String,
         elicitation_id: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct ElicitationAbandonedEvent {
+    pub server_name: String,
+    /// Original Core-generated response token of the unanswered request.
+    #[ts(type = "string | number")]
+    pub id: RequestId,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

@@ -1,4 +1,4 @@
-//! Before activation, verification never prompts or prevents the enclosing tool/turn completing.
+//! Configured MCP servers cannot activate verification or hold a turn waiting for proof.
 
 use anyhow::Result;
 use codex_core::StartThreadOptions;
@@ -66,9 +66,9 @@ enum CapabilitySource {
 }
 
 #[test_case(CapabilitySource::HostProjection; "host_projection_does_not_advertise_verification")]
-#[test_case(CapabilitySource::ExplicitSession; "explicit_session_cancels_without_ui")]
+#[test_case(CapabilitySource::ExplicitSession; "explicit_session_cannot_enable_configured_server")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_user_verification_before_activation(source: CapabilitySource) -> Result<()> {
+async fn mcp_user_verification_rejects_configured_servers(source: CapabilitySource) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
     let server = responses::start_mock_server().await;
@@ -82,8 +82,7 @@ async fn mcp_user_verification_before_activation(source: CapabilitySource) -> Re
             Some(&declarations),
             /*legacy_openai_form_elicitation*/ false,
         ),
-        // Exercise the manager's fail-closed route even if a host directly supplies
-        // this capability before the typed transport/UI activation stage lands.
+        // Even an explicitly enabled session cannot grant this capability to a configured server.
         CapabilitySource::ExplicitSession => ClientMcpExtensions::new(declarations),
     };
     let mut config = test.config.clone();
@@ -97,7 +96,7 @@ async fn mcp_user_verification_before_activation(source: CapabilitySource) -> Re
         .thread_manager
         .start_thread(StartThreadOptions {
             client_mcp_extensions,
-            environments: Some(vec![test.executor_environment().selection().clone()]),
+            environments: Some(vec![test.executor_environment().request()]),
             ..StartThreadOptions::new(config)
         })
         .await?
@@ -133,7 +132,7 @@ async fn mcp_user_verification_before_activation(source: CapabilitySource) -> Re
     wait_for_event(&thread, |event| {
         assert!(
             !matches!(event, EventMsg::ElicitationRequest(_)),
-            "verification must not prompt before activation"
+            "configured servers must not prompt for verification"
         );
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -146,26 +145,15 @@ async fn mcp_user_verification_before_activation(source: CapabilitySource) -> Re
             .as_str()
             .expect("MCP wire response"),
     )?;
-    match source {
-        CapabilitySource::HostProjection => {
-            assert!(
-                echoed["extensions"][OPENAI_ELICITATION_EXTENSION_ID]
-                    .get("userVerification")
-                    .is_none()
-            );
-            assert_eq!(
-                echoed["response"],
-                json!({"code": -32601, "message": "openai/elicitation/create"})
-            );
-        }
-        CapabilitySource::ExplicitSession => {
-            assert_eq!(
-                echoed["extensions"][OPENAI_ELICITATION_EXTENSION_ID],
-                json!({"userVerification": {}})
-            );
-            assert_eq!(echoed["response"], json!({"action": "cancel"}));
-        }
-    }
+    assert!(
+        echoed["extensions"][OPENAI_ELICITATION_EXTENSION_ID]
+            .get("userVerification")
+            .is_none()
+    );
+    assert_eq!(
+        echoed["response"],
+        json!({"code": -32601, "message": "openai/elicitation/create"})
+    );
     thread.shutdown_and_wait().await?;
     test.codex.shutdown_and_wait().await?;
     Ok(())

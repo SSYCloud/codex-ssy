@@ -14,7 +14,10 @@ use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
+use crate::shell::ShellInvocation;
 use crate::shell::ShellType;
+use crate::shell_snapshot::ShellSnapshotSandbox;
+use crate::shell_snapshot::snapshot_read_permissions;
 use crate::tools::flat_tool_name;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
@@ -22,7 +25,7 @@ use crate::tools::runtimes::RuntimePathPrepends;
 use crate::tools::runtimes::apply_zsh_fork_path_prepend;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
-use crate::tools::runtimes::prepare_powershell_command_for_elevated_windows_sandbox;
+use crate::tools::runtimes::prepare_powershell_command_for_windows_sandbox;
 use crate::tools::runtimes::zsh_fork;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -32,6 +35,7 @@ use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
+use crate::tools::sandboxing::executor_windows_sandbox_selection;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::unified_exec::NoopSpawnLifecycle;
@@ -41,6 +45,8 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_core_plugins::PluginMetricsSidecar;
+use codex_features::Feature;
+use codex_network_proxy::CREDENTIAL_BROKER_ACTIVE_ENV_KEY;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
@@ -57,6 +63,11 @@ use std::io;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod launch;
+mod snapshot_metrics;
+
+use launch::with_launch_failure_events;
+
 // Allow 5s for Guardian cleanup and 5s for controller processing after review.
 const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
 
@@ -65,7 +76,7 @@ const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct UnifiedExecRequest {
     pub command: Vec<String>,
-    pub shell_type: ShellType,
+    pub(crate) shell: ShellInvocation,
     pub hook_command: String,
     pub process_id: i32,
     pub cwd: PathUri,
@@ -225,9 +236,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             req.sandbox_permissions,
             &file_system_sandbox_policy,
         );
-        let network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions)
-                .cloned();
+        // Explicit full escalation bypasses controller and attachment-owned network proxies.
+        // Denied-read restrictions above can still require a sandboxed launch.
+        if sandbox_permissions.requires_escalated_permissions() {
+            return None;
+        }
+        let network = req.network.clone();
         // No-proxy fast path; owners still need a spec for execution-only proxies.
         if network.is_none() && req.turn_environment.config().network_policy.is_none() {
             return None;
@@ -259,24 +273,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         ctx: &ToolCtx,
     ) -> Result<UnifiedExecAttempt, ToolError> {
         let base_command = &req.command;
+        let requested_shell = &req.shell.shell;
         let windows_sandbox_proxy_settings_mode = ctx.session.windows_sandbox_proxy_settings_mode;
         let session_shell = ctx.session.user_shell();
-        let shell = req
+        let environment_shell = req
             .turn_environment
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
-        let environment_is_remote = req.turn_environment.environment.is_remote();
-        let shell_snapshot_location = if environment_is_remote {
-            None
-        } else {
-            // TODO(anp): Make shell snapshot lookup accept PathUri.
-            let native_cwd = req
-                .cwd
-                .to_abs_path()
-                .map_err(|err| ToolError::Rejected(err.to_string()))?;
-            req.turn_environment.shell_snapshot(&native_cwd)
-        };
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -286,16 +290,93 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             req.network.as_ref(),
             launch_sandbox_permissions,
         ));
-        let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
+        let environment_is_remote = req.turn_environment.environment.is_remote();
+        let credential_broker_available = !environment_is_remote
+            && req.network.is_some()
+            && ctx
+                .step_context
+                .turn
+                .config
+                .permissions
+                .network
+                .as_ref()
+                .is_some_and(crate::config::NetworkProxySpec::credential_broker_enabled);
+        if credential_broker_available
+            && managed_network.is_some()
+            && matches!(self.shell_mode, UnifiedExecShellMode::ZshFork(_))
+        {
+            return Err(ToolError::Rejected(
+                "credential brokerage does not yet support shell_zsh_fork; disable shell_zsh_fork to use the broker".to_string(),
+            ));
+        }
+        let shell = if credential_broker_available {
+            requested_shell
+        } else {
+            environment_shell
+        };
+        let snapshot_metrics = snapshot_metrics::SnapshotMetrics::start(
+            req,
+            &ctx.step_context.turn.config,
+            &self.shell_mode,
+        );
+        let shell_snapshot = if environment_is_remote
+            || credential_broker_available
+                && launch_sandbox_permissions.requires_escalated_permissions()
+        {
+            None
+        } else {
+            // TODO(anp): Make shell snapshot lookup accept PathUri.
+            let native_cwd = req
+                .cwd
+                .to_abs_path()
+                .map_err(|err| ToolError::Rejected(err.to_string()))?;
+            req.turn_environment
+                .shell_snapshot(
+                    &native_cwd,
+                    base_command,
+                    shell,
+                    &ctx.step_context.turn.config,
+                    Some(ShellSnapshotSandbox::new(
+                        attempt,
+                        managed_network,
+                        &req.turn_environment.selection.environment_id,
+                        req.additional_permissions.as_ref(),
+                    )),
+                )
+                .await
+        };
+        let snapshot_wait = snapshot_metrics
+            .as_ref()
+            .map(|metrics| metrics.started_at.elapsed());
+        let shell_snapshot_location = shell_snapshot.as_ref().map(|snapshot| snapshot.path());
+        let mut env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
+        let snapshot_credential_context = if let Some(snapshot) = shell_snapshot.as_ref()
+            && (managed_network.is_some() || req.shell.is_posix_login())
+        {
+            Some(
+                snapshot
+                    .restore_credentials(&mut env, req.turn_environment.shell_environment_policy()),
+            )
+        } else {
+            None
+        };
         let (mut env, managed_network_context, network_proxy_launch) = match managed_network {
             Some(network) if environment_is_remote => {
-                let mut launch = network.remote_launch_config().await.map_err(|err| {
-                    ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
-                })?;
+                let mut launch = network
+                    .remote_launch_config(crate::windows_sandbox::local_binding_policy_for_sandbox(
+                        req.turn_environment.config().windows_sandbox_type,
+                        req.turn_environment.executor_platform_os.as_deref(),
+                    ))
+                    .await
+                    .map_err(|err| {
+                        ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
+                    })?;
                 if routes_approval_policy_to_guardian(
                     ctx.step_context.settings.approval_policy(),
                     ctx.step_context.settings.approvals_reviewer(),
-                ) && network.remote_policy_decider().is_some()
+                ) && network
+                    .remote_policy_decider(launch.proxy.allow_local_binding)
+                    .is_some()
                 {
                     let timeout = ctx
                         .session
@@ -334,8 +415,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 }
             }
             Some(network) => {
-                let prepared = network
-                    .prepare_for_optional_environment(
+                let prepared = snapshot_credential_context
+                    .unwrap_or_default()
+                    .prepare_child_environment(
+                        network,
                         env,
                         Some(&req.turn_environment.selection.environment_id),
                     )
@@ -349,7 +432,65 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             }
             None => (env, None, None),
         };
-        let explicit_env_overrides = req.explicit_env_overrides.clone();
+        if let Some(snapshot) = shell_snapshot.as_ref() {
+            snapshot.restore_fail_open_aliases(
+                &mut env,
+                Some(&req.turn_environment.selection.environment_id),
+            );
+        }
+        if managed_network.is_some()
+            && !environment_is_remote
+            && shell.shell_type == ShellType::Sh
+            && env
+                .get(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                .is_some_and(|active| active == "1")
+            && let Some(startup_env) = shell_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.protected_startup_env())
+        {
+            env.insert(
+                super::SNAPSHOT_ORIGINAL_POSIX_ENV_ENV_KEY.to_string(),
+                startup_env.to_string(),
+            );
+        }
+        super::prepare_brokered_shell_snapshot_env(
+            &mut env,
+            shell_snapshot_location.as_ref(),
+            shell,
+        );
+        if env
+            .get(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+            .is_some_and(|active| active == "1")
+            && let Some(snapshot) = shell_snapshot.as_ref()
+        {
+            for key in snapshot.startup_credential_keys() {
+                if !super::is_valid_shell_variable_name(key) {
+                    continue;
+                }
+                let (prefix, value) = match env.get(key) {
+                    Some(value) => (super::SNAPSHOT_BROKERED_VALUE_ENV_PREFIX, value.clone()),
+                    None => (super::SNAPSHOT_BROKERED_UNSET_ENV_PREFIX, "1".to_string()),
+                };
+                env.insert(format!("{prefix}{key}"), value);
+            }
+        }
+        let mut explicit_env_overrides = req.explicit_env_overrides.clone();
+        if let Some(network) = managed_network
+            && !environment_is_remote
+        {
+            let broker = network.credential_broker_environment(&env);
+            for key in broker
+                .credential_keys
+                .into_iter()
+                .chain(broker.context_keys)
+            {
+                if !codex_network_proxy::is_credential_broker_provider_env_key(&key)
+                    && let Some(value) = env.get(&key)
+                {
+                    explicit_env_overrides.insert(key, value.clone());
+                }
+            }
+        }
         let metrics_sidecar = sidecar_for_command(
             ctx,
             &req.command,
@@ -380,18 +521,64 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         };
         #[cfg(not(unix))]
         let runtime_path_prepends = RuntimePathPrepends::default();
-        let mut command = if environment_is_remote {
-            base_command.to_vec()
-        } else {
-            maybe_wrap_shell_lc_with_snapshot(
-                base_command,
+        // Restore the executor's PATH directories inside the shell so nested commands can
+        // still find bundled tools even if login startup clears the inherited PATH.
+        // `base_command` already carries the requested login mode; keep it if setup is unavailable.
+        // `hook_command` is the raw script the helper needs to prepend setup inside that same shell.
+        let mut command = base_command.to_vec();
+        if ctx.session.enabled(Feature::LoginShellPackagePath)
+            && req.shell.is_posix_login()
+            && !explicit_env_overrides.contains_key("PATH")
+            && let Ok(info) = req.turn_environment.environment.info().await
+            && let Some(command_with_path_prepends) = req
+                .shell
+                .derive_exec_args_with_path_prepends(&req.hook_command, &info.prepend_path_dirs)
+        {
+            command = command_with_path_prepends;
+        }
+        let mut snapshot_used = false;
+        if !environment_is_remote {
+            let wrapped = maybe_wrap_shell_lc_with_snapshot(
+                &command,
                 shell,
                 shell_snapshot_location.as_ref(),
                 &explicit_env_overrides,
                 &env,
                 &runtime_path_prepends,
-            )
-        };
+            );
+            snapshot_used = wrapped != command;
+            command = wrapped;
+        }
+        let brokered_shell_snapshot_missing = !environment_is_remote
+            && managed_network.is_some()
+            && env
+                .get(codex_network_proxy::CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                .is_some_and(|active| active == "1")
+            && command
+                .get(1)
+                .is_some_and(|flag| matches!(flag.as_str(), "-lc" | "-c"))
+            && !shell_snapshot_location
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.exists());
+        if brokered_shell_snapshot_missing && let Some(network) = managed_network {
+            if cfg!(unix)
+                && matches!(
+                    shell.shell_type,
+                    ShellType::Bash | ShellType::Zsh | ShellType::Sh
+                )
+            {
+                return Err(ToolError::Rejected(
+                    "credential brokerage could not create a protected shell snapshot".to_string(),
+                ));
+            }
+            network.restore_and_disable_brokered_credentials(&mut env, &mut command);
+        }
+        if let Some(metrics) = snapshot_metrics
+            && let Some(wait) = snapshot_wait
+        {
+            let outcome = if snapshot_used { "used" } else { "fallback" };
+            metrics.record(&ctx.step_context.session_telemetry, wait, outcome);
+        }
         if req.shell_snapshot.is_some() {
             let exports =
                 runtime_path_prepends.shell_exports_after_snapshot(&explicit_env_overrides);
@@ -401,14 +588,29 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 *script = format!("{exports}\n{script}");
             }
         }
-        let command = prepare_powershell_command_for_elevated_windows_sandbox(
+        if !environment_is_remote
+            && matches!(shell.shell_type, ShellType::PowerShell | ShellType::Cmd)
+            && env
+                .get(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                .is_some_and(|active| active == "1")
+            && let Some(network) = managed_network
+        {
+            network.restore_and_disable_brokered_credentials(&mut env, &mut command);
+        }
+        // The executor selection is Disabled for non-Windows target paths, so this
+        // preparation is a no-op for PowerShell on other platforms.
+        let command = prepare_powershell_command_for_windows_sandbox(
             &command,
-            Some(&req.shell_type),
+            Some(&requested_shell.shell_type),
             attempt.sandbox_requested,
-            attempt.windows_sandbox_level,
+            executor_windows_sandbox_selection(
+                attempt.windows_sandbox_type,
+                attempt.windows_sandbox_level,
+                attempt.sandbox_cwd,
+            ),
             environment_is_remote,
         );
-        let command = if matches!(req.shell_type, ShellType::PowerShell) {
+        let command = if matches!(requested_shell.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command
@@ -416,9 +618,25 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         let sidecar_permissions = metrics_sidecar
             .as_ref()
             .map(PluginMetricsSidecar::additional_permissions);
+        let snapshot_permissions = shell_snapshot_location
+            .as_ref()
+            .filter(|_| {
+                env.get(codex_network_proxy::CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                    .is_some_and(|active| active == "1")
+            })
+            .and_then(|path| {
+                snapshot_read_permissions(
+                    path,
+                    &req.turn_environment
+                        .permission_profile_with_workspace_roots(),
+                    attempt.sandbox_cwd,
+                )
+            });
+        let internal_permissions =
+            merge_permission_profiles(sidecar_permissions.as_ref(), snapshot_permissions.as_ref());
         let additional_permissions = merge_permission_profiles(
             req.additional_permissions.as_ref(),
-            sidecar_permissions.as_ref(),
+            internal_permissions.as_ref(),
         );
         let permissions = TerminalPermissions::for_launch(
             &req.turn_environment,
@@ -434,8 +652,19 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 SandboxPermissions::UseDefault
             },
             req.additional_permissions.as_ref(),
-            sidecar_permissions.as_ref(),
+            internal_permissions.as_ref(),
         );
+        let baseline_file_system = req
+            .turn_environment
+            .permission_profile()
+            .file_system_sandbox_policy();
+        let permissions = if baseline_file_system.has_denied_read_restrictions()
+            && attempt.exec_server_permissions.file_system_sandbox_policy() != baseline_file_system
+        {
+            permissions.with_filesystem_escalation()
+        } else {
+            permissions
+        };
 
         if let UnifiedExecShellMode::ZshFork(zsh_fork_config) = &self.shell_mode {
             let command = build_unified_exec_sandbox_command(
@@ -459,6 +688,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                     managed_network,
                     Some(&req.turn_environment.selection.environment_id),
                 )
+                .await
                 .map_err(ToolError::Codex)?;
             exec_env.exec_server_env_config = req.exec_server_env_config.clone();
             match zsh_fork::maybe_prepare_unified_exec(req, attempt, ctx, exec_env, zsh_fork_config)
@@ -492,7 +722,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                                 }))
                             }
                             other => ToolError::Rejected(other.to_string()),
-                        })?;
+                        });
+                    let mut process = with_launch_failure_events(process, req, ctx).await?;
+                    process._shell_snapshot = shell_snapshot;
                     return Ok(UnifiedExecAttempt {
                         process,
                         metrics_sidecar,
@@ -538,7 +770,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),
             )
-            .await?;
+            .await;
+        let mut process = with_launch_failure_events(process, req, ctx).await?;
+        process._shell_snapshot = shell_snapshot;
         Ok(UnifiedExecAttempt {
             process,
             metrics_sidecar,
@@ -553,6 +787,7 @@ mod tests {
     use crate::config::PermissionProfileSnapshot;
     use crate::environment_selection::EnvironmentConfigOrigin;
     use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
+    use crate::shell::Shell;
     use crate::tools::sandboxing::ToolRuntime;
     use codex_exec_server::Environment;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
@@ -572,6 +807,7 @@ mod tests {
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {
         TurnEnvironment::new(
             TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 cwd,
                 workspace_roots: Vec::new(),
@@ -579,7 +815,7 @@ mod tests {
                     allow_login_shell: true,
                     workspace_roots: Vec::new(),
                     windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                    windows_sandbox_private_desktop: true,
+                    windows_sandbox_type: codex_sandboxing::SandboxType::None,
                     use_legacy_landlock: false,
                     permission_profile: PermissionProfileSnapshot::legacy(
                         PermissionProfile::read_only(),
@@ -656,7 +892,13 @@ mod tests {
         let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
         let request = UnifiedExecRequest {
             command: vec!["pwd".to_string()],
-            shell_type: ShellType::Sh,
+            shell: ShellInvocation {
+                shell: Shell {
+                    shell_type: ShellType::Sh,
+                    shell_path: "sh".into(),
+                },
+                use_login_shell: false,
+            },
             hook_command: "pwd".to_string(),
             process_id: 1000,
             cwd: cwd.into(),
@@ -759,7 +1001,13 @@ mod tests {
             .expect("current dir is absolute");
         UnifiedExecRequest {
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
-            shell_type: ShellType::Zsh,
+            shell: ShellInvocation {
+                shell: Shell {
+                    shell_type: ShellType::Zsh,
+                    shell_path: "zsh".into(),
+                },
+                use_login_shell: false,
+            },
             hook_command: "echo hi".to_string(),
             process_id: 1000,
             cwd: cwd.clone().into(),

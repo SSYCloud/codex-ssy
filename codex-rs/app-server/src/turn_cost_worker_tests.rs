@@ -87,7 +87,9 @@ async fn handle_observes_only_matching_model_provider() {
     let event = Event {
         id: "turn-1".to_string(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: "turn-1".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,

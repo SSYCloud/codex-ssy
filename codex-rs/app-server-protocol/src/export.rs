@@ -25,7 +25,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_history::RolloutLine;
 use schemars::schema_for;
-use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -39,6 +38,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
+
+#[path = "export_user_verification.rs"]
+mod user_verification;
 
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
@@ -272,6 +274,11 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
+    let elicitation_path = out_dir.join("v2/McpServerElicitationRequestParams.ts");
+    if elicitation_path.exists() {
+        let content = fs::read_to_string(&elicitation_path)?;
+        fs::write(elicitation_path, user_verification::filter_ts(&content))?;
+    }
     Ok(())
 }
 
@@ -296,6 +303,11 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     }
 
     for (path, content) in tree.iter_mut() {
+        if path.file_stem().and_then(|stem| stem.to_str())
+            == Some("McpServerElicitationRequestParams")
+        {
+            *content = user_verification::filter_ts(content);
+        }
         let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -340,7 +352,7 @@ fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]
     let filtered_arms: Vec<String> = arms
         .into_iter()
         .filter(|arm| {
-            extract_method_from_arm(arm)
+            extract_discriminator_from_arm(arm, "method")
                 .is_none_or(|method| !experimental_methods.contains(method.as_str()))
         })
         .collect();
@@ -426,6 +438,7 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
     remove_experimental_method_type_definitions(bundle);
+    user_verification::filter_json(bundle);
     Ok(())
 }
 
@@ -805,14 +818,14 @@ fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String> {
     parts
 }
 
-fn extract_method_from_arm(arm: &str) -> Option<String> {
+fn extract_discriminator_from_arm(arm: &str, discriminator: &str) -> Option<String> {
     let (open, close) = find_top_level_brace_span(arm)?;
     let inner = &arm[open + 1..close];
     for field in split_top_level(inner, ',') {
         let Some((name, value)) = parse_property(field.as_str()) else {
             continue;
         };
-        if name != "method" {
+        if name != discriminator {
             continue;
         }
         let value = value.trim_start();
@@ -1353,6 +1366,11 @@ where
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
             add_server_notification_emitted_at_to_json_schema(&mut schema_value)?;
         }
+        if let Some(Value::Object(error_schema)) =
+            schema_value.pointer_mut("/definitions/CodexErrorInfo")
+        {
+            keep_enum_open_ended(error_schema);
+        }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
     }
@@ -1382,6 +1400,13 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn keep_enum_open_ended(schema: &mut Map<String, Value>) {
+    if let Some(Value::Array(mut variants)) = schema.remove("oneOf") {
+        variants.push(serde_json::json!({ "type": ["string", "object"] }));
+        schema.insert("anyOf".to_string(), Value::Array(variants));
+    }
 }
 
 fn add_server_notification_emitted_at_to_json_schema(schema: &mut Value) -> Result<()> {
@@ -1571,8 +1596,11 @@ where
     write_json_schema_with_return::<T>(out_dir, name)
 }
 
-fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_vec_pretty(value)
+fn write_pretty_json(path: PathBuf, value: &Value) -> Result<()> {
+    let mut value = value.clone();
+    // Keep Cargo and Bazel output identical without changing meaningful array order.
+    value.sort_all_objects();
+    let json = serde_json::to_vec_pretty(&value)
         .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
     fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -2177,6 +2205,12 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
         )?;
         assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
+        let mcp_login_completion_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/McpServerOauthLoginCompletedNotification.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing MCP login completion fixture"))?,
+        )?;
+        assert!(mcp_login_completion_ts.contains("loginId?: string | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2370,14 +2404,18 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types, except the additive stable usage
-                // response field, which older servers omit and newer servers return as null.
-                let legacy_account_usage_response = path
+                // These are only allowed in *Params types, except additive stable fields
+                // that older servers omit and newer servers may return as null.
+                let legacy_optional_nullable_field = (path
                     == Path::new("v2/GetAccountTokenUsageResponse.ts")
-                    && field_prefix.trim() == "threadUsage?";
+                    && field_prefix.trim() == "threadUsage?")
+                    || (path == Path::new("v2/McpServerOauthLoginCompletedNotification.ts")
+                        && field_prefix.trim() == "loginId?")
+                    || (path == Path::new("v2/MisalignmentErrorDetails.ts")
+                        && field_prefix.trim() == "reviewTarget?");
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
-                    && !legacy_account_usage_response
+                    && !legacy_optional_nullable_field
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;

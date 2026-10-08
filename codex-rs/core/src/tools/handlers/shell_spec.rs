@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
-    pub allow_login_shell: bool,
+    pub include_login_parameter: bool,
     pub exec_permission_approvals_enabled: bool,
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         );
     }
-    if options.allow_login_shell {
+    if options.include_login_parameter {
         properties.insert(
             "login".to_string(),
             JsonSchema::boolean(Some(
@@ -110,7 +110,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             Some(vec!["cmd".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema()),
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 
@@ -154,7 +154,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
             Some(vec!["session_id".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema()),
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 

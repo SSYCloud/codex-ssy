@@ -284,7 +284,6 @@ async fn installed_agent_plugin_uses_isolated_data_root_for_stdio_mcp() {
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
         test_skill_root_loader().as_ref(),
-        &BTreeSet::new(),
     )
     .await;
 
@@ -398,6 +397,54 @@ fn configured_plugins_from_stack_merges_enabled_effective_layers() {
 }
 
 #[tokio::test]
+async fn legacy_ema_policy_disables_installed_and_selected_plugin_servers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"plugin","mcpServers":"./mcp.json"}"#,
+    );
+    write_file(
+        &plugin_root.join("mcp.json"),
+        r#"{"mcpServers":{"example":{"url":"https://resource.example/mcp"}}}"#,
+    );
+    for endpoint in ["https://resource.example/mcp", "https://other.example/mcp"] {
+        let stack = ConfigLayerStack::new(
+            vec![user_layer(
+                user_config_path(&temp_dir, "config.toml"),
+                &format!(
+                    "[plugins.\"plugin@market\".mcp_servers.example.ema_auth]\nurl = '{endpoint}'"
+                ),
+            )],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("legacy policy stack");
+        let policies = configured_plugin_mcp_server_policies(&stack);
+        let policy = policies.get("plugin@market").expect("plugin policy");
+        let installed = load_plugin_mcp_servers_with_policy(
+            &plugin_root,
+            /*auth_mode*/ None,
+            Some(policy),
+        )
+        .await;
+        let mut selected = load_plugin_mcp_servers(&plugin_root, /*auth_mode*/ None).await;
+        assert!(selected["example"].enabled);
+        apply_configured_plugin_mcp_server_policies(policy, &mut selected);
+        assert!(!installed["example"].enabled);
+        assert_eq!(installed, selected);
+
+        let round_trip: HashMap<String, PluginMcpServerConfig> =
+            toml::from_str(&toml::to_string(policy).expect("serialize policy"))
+                .expect("deserialize policy");
+        assert_eq!(
+            &round_trip, policy,
+            "serialization must preserve the denial"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hooks_only_scope_shares_plugin_resolution_without_loading_other_capabilities() {
     let temp_dir = TempDir::new().expect("tempdir");
     let plugin_root = temp_dir.path().join("plugins/cache/test/valid/local");
@@ -495,13 +542,11 @@ enabled = true
         Some(Product::Codex),
         /*remote_global_catalog_active*/ false,
         test_skill_root_loader().as_ref(),
-        &BTreeSet::new(),
     )
     .await;
     let hooks_only = load_plugins_from_layer_stack_with_scope(
         &stack,
         HashMap::new(),
-        &BTreeSet::new(),
         &store,
         /*remote_global_catalog_active*/ false,
         PluginLoadScope::HooksOnly,

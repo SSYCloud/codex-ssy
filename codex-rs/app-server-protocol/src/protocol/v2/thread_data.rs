@@ -286,7 +286,7 @@ pub struct Thread {
     /// Saved Daybreak choice, independent of turn execution. Null if unset.
     #[experimental("thread.daybreakEnabled")]
     pub daybreak_enabled: Option<bool>,
-    /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
+    /// Only populated on `thread/resume`, `thread/fork`, and `thread/read`
     /// (when `includeTurns` is true) responses.
     /// For all other responses and notifications returning a Thread,
     /// the turns field will be an empty list.
@@ -386,13 +386,17 @@ impl<'de> Deserialize<'de> for Thread {
 pub struct Turn {
     /// Identifier for this turn. Codex-generated turn IDs are UUIDv7.
     pub id: String,
+    /// ID of the first turn in the chain of work that led to this turn.
+    /// Pass this as `rootTurnId` when starting work on behalf of this turn.
+    /// May be null in older history or a `review/start` response.
+    pub root_turn_id: Option<String>,
     /// Thread items currently included in this turn payload.
     pub items: Vec<ThreadItem>,
     /// Describes how much of `items` has been loaded for this turn.
     #[serde(default)]
     pub items_view: TurnItemsView,
     pub status: TurnStatus,
-    /// Only populated when the Turn's status is failed.
+    /// Error associated with a failed or interrupted turn.
     pub error: Option<TurnError>,
     /// Unix timestamp (in seconds) when the turn started.
     #[ts(type = "number | null")]
@@ -442,6 +446,9 @@ pub struct MisalignmentErrorDetails {
     pub detailed_explanation: Option<String>,
     /// Instruction to submit as the next turn's user input if continuation is confirmed.
     pub steer: Option<MisalignmentSteer>,
+    /// Opaque server-issued block target. Presence alone does not enable target-based continuation.
+    #[ts(optional = nullable)]
+    pub review_target: Option<String>,
 }
 
 impl fmt::Debug for MisalignmentErrorDetails {
@@ -454,6 +461,7 @@ impl fmt::Debug for MisalignmentErrorDetails {
                 &self.detailed_explanation.is_some(),
             )
             .field("has_steer", &self.steer.is_some())
+            .field("has_review_target", &self.review_target.is_some())
             .finish()
     }
 }
@@ -464,6 +472,7 @@ impl From<CoreMisalignmentErrorDetails> for MisalignmentErrorDetails {
             error_type: value.error_type,
             detailed_explanation: value.detailed_explanation,
             steer: value.steer.map(Into::into),
+            review_target: value.review_target,
         }
     }
 }

@@ -10,6 +10,8 @@ mod bundled_bwrap;
 #[cfg(target_os = "linux")]
 mod bwrap;
 #[cfg(target_os = "linux")]
+mod daemon_mounts;
+#[cfg(target_os = "linux")]
 mod exec_util;
 #[cfg(target_os = "linux")]
 mod fd_mount;
@@ -23,6 +25,15 @@ mod linux_run_main;
 mod proxy_lifecycle;
 #[cfg(target_os = "linux")]
 mod proxy_routing;
+#[cfg(target_os = "linux")]
+mod wslg;
+
+#[cfg(target_os = "linux")]
+pub use bundled_bwrap::find_bundled_bwrap_for_exe;
+#[cfg(target_os = "linux")]
+pub use bwrap::GLOB_SCAN_PROGRAM;
+#[cfg(target_os = "linux")]
+pub use bwrap::expand_unreadable_globs_in_environment;
 
 /// Exit status returned when bundled bubblewrap fails digest verification.
 #[cfg(target_os = "linux")]

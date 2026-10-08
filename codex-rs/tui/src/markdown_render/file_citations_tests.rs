@@ -17,12 +17,14 @@ fn rendered_text(markdown: &str, cwd: Option<&Path>) -> String {
 fn file_citation_paths_preserve_markdown_significant_characters() {
     for path in [
         "/tmp/a*b*.txt",
+        "/tmp/$x$/report.md",
         "/tmp/a`b`.txt",
         "/tmp/a<b>.txt",
         "/tmp/report#L10",
         "/tmp/report:10",
         "/tmp/report%20final.xlsx",
         "/tmp/report?final.xlsx",
+        "file://[",
     ] {
         let markdown = format!(":codex-file-citation{{path=\"{path}\"}}");
         assert_eq!(rendered_text(&markdown, /*cwd*/ None), path);
@@ -158,6 +160,13 @@ fn multiple_file_citations_render_without_interpreting_encoded_source() {
 
 #[test]
 fn file_citations_preserve_adjacent_entities_and_escaped_punctuation() {
+    assert_eq!(
+        rendered_text(
+            r"$\alpha$:codex-file-citation{path=/tmp/$x$/report.md}$\beta$",
+            /*cwd*/ None
+        ),
+        "α/tmp/$x$/report.mdβ",
+    );
     let cwd = std::env::temp_dir();
     for (markdown, expected) in [
         (

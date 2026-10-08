@@ -10,6 +10,7 @@ use codex_protocol::protocol::SkillMetadata as CoreSkillMetadata;
 use codex_protocol::protocol::SkillScope as CoreSkillScope;
 use codex_protocol::protocol::SkillToolDependency as CoreSkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -477,7 +478,7 @@ pub struct SkillMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub dependencies: Option<SkillDependencies>,
-    pub path: AbsolutePathBuf,
+    pub path: LegacyAppPathString,
     pub scope: SkillScope,
     pub enabled: bool,
     /// Owning plugin ID, matching `PluginSummary.id`, when known.
@@ -761,6 +762,9 @@ pub struct PluginDetail {
     pub share_url: Option<String>,
     pub description: Option<String>,
     pub skills: Vec<SkillSummary>,
+    /// The declared onboarding skill, when the plugin and visible skill are enabled.
+    #[serde(default)]
+    pub onboarding_skill: Option<SkillSummary>,
     pub hooks: Vec<PluginHookSummary>,
     pub apps: Vec<AppSummary>,
     pub app_templates: Vec<AppTemplateSummary>,
@@ -855,7 +859,7 @@ pub struct SkillSummary {
     pub description: String,
     pub short_description: Option<String>,
     pub interface: Option<SkillInterface>,
-    pub path: Option<AbsolutePathBuf>,
+    pub path: Option<LegacyAppPathString>,
     pub enabled: bool,
 }
 
@@ -986,7 +990,7 @@ impl From<CoreSkillMetadata> for SkillMetadata {
             short_description: value.short_description,
             interface: value.interface.map(SkillInterface::from),
             dependencies: value.dependencies.map(SkillDependencies::from),
-            path: value.path,
+            path: value.path.into(),
             scope: value.scope.into(),
             enabled: true,
             plugin_id: None,

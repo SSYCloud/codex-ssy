@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use ts_rs::TS;
 
 mod absolutize;
+mod system_aliases;
 
 /// A path that is guaranteed to be absolute and normalized (though it is not
 /// guaranteed to be canonicalized or exist on the filesystem).
@@ -27,9 +28,7 @@ impl AbsolutePathBuf {
     fn maybe_expand_home_directory(path: &Path) -> PathBuf {
         if let Some(path_str) = path.to_str()
             && let Some(rest) = path_str.strip_prefix('~')
-            && let Some(home) = ABSOLUTE_PATH_HOME
-                .with(|cell| cell.borrow().clone())
-                .or_else(home_dir)
+            && let Some(home) = AbsolutePathBufGuard::home_directory()
         {
             if rest.is_empty() {
                 return home;
@@ -86,6 +85,10 @@ impl AbsolutePathBuf {
     /// Construct an absolute path from `path`, resolving relative paths against
     /// the process current working directory.
     pub fn relative_to_current_dir<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        if path.as_ref().is_absolute() {
+            return Self::from_absolute_path(path);
+        }
+
         Ok(Self::resolve_path_against_base(
             path,
             std::env::current_dir()?,
@@ -338,6 +341,23 @@ thread_local! {
 pub struct AbsolutePathBufGuard;
 
 impl AbsolutePathBufGuard {
+    /// Reads the native deserialization base and validates the guard requirement
+    /// before home expansion or namespace normalization. Does not look up cwd.
+    pub fn deserialization_base(path: &Path) -> Result<Option<PathBuf>, &'static str> {
+        let base = ABSOLUTE_PATH_BASE.with(|cell| cell.borrow().clone());
+        if base.is_none() && !path.is_absolute() {
+            return Err("AbsolutePathBuf deserialized without a base path");
+        }
+        Ok(base)
+    }
+
+    /// Reads the effective native home, including the thread-local override.
+    pub fn home_directory() -> Option<PathBuf> {
+        ABSOLUTE_PATH_HOME
+            .with(|cell| cell.borrow().clone())
+            .or_else(home_dir)
+    }
+
     pub fn new(base_path: &Path) -> Self {
         ABSOLUTE_PATH_BASE.with(|cell| {
             *cell.borrow_mut() = Some(base_path.to_path_buf());
@@ -379,15 +399,13 @@ impl<'de> Deserialize<'de> for AbsolutePathBuf {
         D: Deserializer<'de>,
     {
         let path = PathBuf::deserialize(deserializer)?;
-        ABSOLUTE_PATH_BASE.with(|cell| match cell.borrow().as_deref() {
+        match AbsolutePathBufGuard::deserialization_base(&path)
+            .map_err(SerdeError::custom)?
+            .as_deref()
+        {
             Some(base) => Ok(Self::resolve_path_against_base(path, base)),
-            None if path.is_absolute() => {
-                Self::from_absolute_path(path).map_err(SerdeError::custom)
-            }
-            None => Err(SerdeError::custom(
-                "AbsolutePathBuf deserialized without a base path",
-            )),
-        })
+            None => Self::from_absolute_path(path).map_err(SerdeError::custom),
+        }
     }
 }
 
@@ -414,9 +432,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn from_absolute_path_does_not_read_current_dir_when_path_is_absolute() {
+    fn absolute_paths_do_not_read_current_dir() {
         let status = Command::new(std::env::current_exe().expect("current test binary"))
-            .arg("from_absolute_path_with_removed_current_dir_child")
+            .arg("absolute_paths_with_removed_current_dir_child")
             .arg("--ignored")
             .env("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD", "1")
             .status()
@@ -428,7 +446,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[ignore]
-    fn from_absolute_path_with_removed_current_dir_child() {
+    fn absolute_paths_with_removed_current_dir_child() {
         if std::env::var_os("CODEX_ABSOLUTE_PATH_REMOVED_CWD_CHILD").is_none() {
             return;
         }
@@ -444,12 +462,17 @@ mod tests {
             "/tmp/codex/../codex-home/plugins/cache",
         ))
         .expect("absolute path should not require current dir");
+        let relative_to_current_dir_path = AbsolutePathBuf::relative_to_current_dir(test_path_buf(
+            "/tmp/codex/../codex-home/plugins/cache",
+        ))
+        .expect("absolute path should not require current dir");
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
         assert_eq!(
             path.as_path(),
             test_path_buf("/tmp/codex-home/plugins/cache")
         );
+        assert_eq!(relative_to_current_dir_path, path);
     }
 
     #[test]
