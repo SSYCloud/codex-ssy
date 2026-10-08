@@ -2,10 +2,12 @@
 // Unified entry point for the Codex CLI.
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "fs";
+import { existsSync, readFileSync, realpathSync, mkdirSync, chmodSync, createWriteStream, unlinkSync, rmSync } from "fs";
 import { createRequire } from "node:module";
 import path from "path";
 import { fileURLToPath } from "url";
+import https from "node:https";
+import readline from "node:readline";
 
 // __dirname equivalent in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -14,12 +16,12 @@ const require = createRequire(import.meta.url);
 const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
 
 const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-linux-musl": "@coohu/codex-linux-x64",
+  "aarch64-unknown-linux-musl": "@coohu/codex-linux-arm64",
+  "x86_64-apple-darwin": "@coohu/codex-darwin-x64",
+  "aarch64-apple-darwin": "@coohu/codex-darwin-arm64",
+  "x86_64-pc-windows-msvc": "@coohu/codex-win32-x64",
+  "aarch64-pc-windows-msvc": "@coohu/codex-win32-arm64",
 };
 
 const { platform, arch } = process;
@@ -76,7 +78,105 @@ if (!platformPackage) {
   throw new Error(`Unsupported target triple: ${targetTriple}`);
 }
 
-function findCodexExecutable() {
+// ============================================================================
+// CLEANUP LOGIC FOR UNINSTALL
+// ============================================================================
+if (process.argv[2] === '--cleanup-binary') {
+  try {
+    let vendorRoot;
+    try {
+      const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
+      vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
+    } catch {
+      vendorRoot = path.join(__dirname, "..", "vendor");
+    }
+    
+    if (existsSync(vendorRoot)) {
+      rmSync(vendorRoot, { recursive: true, force: true });
+      console.log(`\x1b[32m✅ Successfully removed downloaded binary directory: ${vendorRoot}\x1b[0m`);
+    } else {
+      console.log(`\x1b[33m[Codex] No local binary found to remove at ${vendorRoot}, skipping cleanup.\x1b[0m`);
+    }
+  } catch (err) {
+    console.error(`\x1b[31m❌ Failed to clean up downloaded binary:\x1b[0m`, err.message);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+// ============================================================================
+
+async function downloadBinary(destPath) {
+  const isWin = process.platform === "win32";
+  const assetName = isWin ? `codex-${targetTriple}.exe` : `codex-${targetTriple}`;
+  const url = `https://github.com/SSYCloud/codex-ssy/releases/latest/download/${assetName}`;
+  
+  // Ensure the directory exists
+  mkdirSync(path.dirname(destPath), { recursive: true });
+
+  // Add some terminal coloring and an emoji for better UX
+  console.log(`\x1b[36m🚀 [Codex] Local binary for ${targetTriple} not found.\x1b[0m`);
+  console.log(`\x1b[33m📦 Downloading from GitHub Releases...\x1b[0m`);
+
+  return new Promise((resolve, reject) => {
+    function fetch(downloadUrl) {
+      https.get(downloadUrl, (response) => {
+        // Handle redirects (GitHub uses 302 for release downloads)
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          return fetch(response.headers.location);
+        }
+        
+        if (response.statusCode !== 200) {
+          return reject(new Error(`Failed to download binary: HTTP ${response.statusCode} - ${response.statusMessage}`));
+        }
+
+        const totalBytes = parseInt(response.headers['content-length'], 10);
+        let downloadedBytes = 0;
+
+        const file = createWriteStream(destPath);
+        response.pipe(file);
+
+        // Listen to data chunks to update the progress bar
+        response.on('data', (chunk) => {
+          downloadedBytes += chunk.length;
+          
+          if (totalBytes) {
+            const percent = Math.round((downloadedBytes / totalBytes) * 100);
+            const barLength = 30; // Length of the progress bar in characters
+            const completedLength = Math.round((barLength * downloadedBytes) / totalBytes);
+            const bar = '█'.repeat(completedLength) + '░'.repeat(barLength - completedLength);
+            
+            const dlMb = (downloadedBytes / 1024 / 1024).toFixed(2);
+            const totMb = (totalBytes / 1024 / 1024).toFixed(2);
+            
+            // Clear the current line and update the progress
+            readline.cursorTo(process.stdout, 0);
+            process.stdout.write(`   \x1b[32m[${bar}]\x1b[0m ${percent}% | ${dlMb} MB / ${totMb} MB`);
+          } else {
+            // Fallback if content-length is missing
+            const dlMb = (downloadedBytes / 1024 / 1024).toFixed(2);
+            readline.cursorTo(process.stdout, 0);
+            process.stdout.write(`   \x1b[32mDownloading...\x1b[0m ${dlMb} MB downloaded`);
+          }
+        });
+        
+        file.on("finish", () => {
+          file.close(() => {
+            // Add a newline after the progress bar finishes
+            console.log('\n\x1b[32m✅ Download complete. Starting Codex...\x1b[0m\n');
+            if (!isWin) chmodSync(destPath, 0o755);
+            resolve();
+          });
+        });
+      }).on("error", (err) => {
+        if (existsSync(destPath)) unlinkSync(destPath);
+        reject(err);
+      });
+    }
+    fetch(url);
+  });
+}
+
+async function findCodexExecutable() {
   let vendorRoot;
   try {
     const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
@@ -91,25 +191,35 @@ function findCodexExecutable() {
     "bin",
     process.platform === "win32" ? "codex.exe" : "codex",
   );
+  
   if (existsSync(codexExecutable)) {
     return codexExecutable;
   }
 
-  const packageManager = detectPackageManager();
-  const updateCommand =
-    packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : packageManager === "pnpm"
-        ? "pnpm add -g @openai/codex@latest"
-        : packageManager === "vite-plus"
-          ? "vp install -g @openai/codex@latest"
-          : "npm install -g @openai/codex@latest";
-  throw new Error(
-    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
-  );
+  // Attempt to download the missing binary
+  try {
+    await downloadBinary(codexExecutable);
+    return codexExecutable;
+  } catch (downloadError) {
+    console.error("\n\x1b[31m❌ Failed to download the executable automatically:\x1b[0m", downloadError.message);
+    
+    // Fallback to the original instruction if download fails
+    const packageManager = detectPackageManager();
+    const updateCommand =
+      packageManager === "bun"
+        ? "bun install -g @coohu/codex@latest"
+        : packageManager === "pnpm"
+          ? "pnpm add -g @coohu/codex@latest"
+          : packageManager === "vite-plus"
+            ? "vp install -g @coohu/codex@latest"
+            : "npm install -g @coohu/codex@latest";
+    throw new Error(
+      `Missing optional dependency ${platformPackage} and download failed. Reinstall Codex: ${updateCommand}`,
+    );
+  }
 }
 
-const binaryPath = findCodexExecutable();
+const binaryPath = await findCodexExecutable();
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
@@ -124,7 +234,7 @@ function isPnpmOwnedCodexInstall(nodeModulesDir) {
 
   try {
     return (
-      realpathSync(path.join(nodeModulesDir, "@openai", "codex")) ===
+      realpathSync(path.join(nodeModulesDir, "@coohu", "codex")) ===
       codexPackageRoot
     );
   } catch {
@@ -139,24 +249,21 @@ function isVitePlusOwnedCodexInstall(packagesDir) {
 
   try {
     const metadata = JSON.parse(
-      readFileSync(path.join(packagesDir, "@openai", "codex.json"), "utf8"),
+      readFileSync(path.join(packagesDir, "@coohu", "codex.json"), "utf8"),
     );
-    if (metadata.name !== "@openai/codex") {
+    if (metadata.name !== "@coohu/codex") {
       return false;
     }
 
-    // Vite+ records the active global installation in packages/@openai/codex.json.
-    // Older installs have no ID or append a #-prefixed ID to the package name;
-    // newer installs put the ID in a subdirectory of the package prefix.
     const installId = metadata.installId || "";
     const installDir = installId.startsWith("#")
-      ? path.join(packagesDir, `@openai/codex${installId}`)
-      : path.join(packagesDir, "@openai/codex", installId);
+      ? path.join(packagesDir, `@coohu/codex${installId}`)
+      : path.join(packagesDir, "@coohu/codex", installId);
     for (const nodeModulesDir of [
       path.join(installDir, "lib", "node_modules"),
       path.join(installDir, "node_modules"),
     ]) {
-      const packageRoot = path.join(nodeModulesDir, "@openai", "codex");
+      const packageRoot = path.join(nodeModulesDir, "@coohu", "codex");
       if (
         existsSync(packageRoot) &&
         realpathSync(packageRoot) === codexPackageRoot
@@ -165,19 +272,11 @@ function isVitePlusOwnedCodexInstall(packagesDir) {
       }
     }
   } catch {
-    // Missing or unreadable ownership metadata must not prevent Codex starting.
   }
   return false;
 }
 
-/**
- * Use heuristics to detect the package manager that was used to install Codex
- * in order to give the user a hint about how to update it.
- */
 function detectPackageManager() {
-  // Package-manager ownership metadata can be several parents above the package.
-  // Search ancestors of both the canonical package root and lexical entrypoint
-  // because the package manager may link either path.
   const entrypointDir = path.dirname(path.resolve(process.argv[1]));
   for (const startDir of new Set([codexPackageRoot, entrypointDir])) {
     const filesystemRoot = path.parse(startDir).root;
@@ -244,18 +343,10 @@ const child = spawn(binaryPath, process.argv.slice(2), {
 });
 
 child.on("error", (err) => {
-  // Typically triggered when the binary is missing or not executable.
-  // Re-throwing here will terminate the parent with a non-zero exit code
-  // while still printing a helpful stack trace.
-  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });
 
-// Forward common termination signals to the child so that it shuts down
-// gracefully. In the handler we temporarily disable the default behavior of
-// exiting immediately; once the child has been signaled we simply wait for
-// its exit event which will in turn terminate the parent (see below).
 const forwardSignal = (signal) => {
   if (child.killed) {
     return;
@@ -263,7 +354,6 @@ const forwardSignal = (signal) => {
   try {
     child.kill(signal);
   } catch {
-    /* ignore */
   }
 };
 
@@ -271,11 +361,6 @@ const forwardSignal = (signal) => {
   process.on(sig, () => forwardSignal(sig));
 });
 
-// When the child exits, mirror its termination reason in the parent so that
-// shell scripts and other tooling observe the correct exit status.
-// Wrap the lifetime of the child process in a Promise so that we can await
-// its termination in a structured way. The Promise resolves with an object
-// describing how the child exited: either via exit code or due to a signal.
 const childResult = await new Promise((resolve) => {
   child.on("exit", (code, signal) => {
     if (signal) {
@@ -287,8 +372,6 @@ const childResult = await new Promise((resolve) => {
 });
 
 if (childResult.type === "signal") {
-  // Re-emit the same signal so that the parent terminates with the expected
-  // semantics (this also sets the correct exit code of 128 + n).
   process.kill(process.pid, childResult.signal);
 } else {
   process.exit(childResult.exitCode);

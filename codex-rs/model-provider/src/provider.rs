@@ -492,9 +492,8 @@ impl ModelProvider for ConfiguredModelProvider {
                     Some(auth)
                 })
                 .map(|auth| match &auth {
-                    CodexAuth::ApiKey(_) | CodexAuth::ShengSuanYun(_) => {
-                        Ok(ProviderAccount::ApiKey)
-                    }
+                    CodexAuth::ApiKey(_) => Ok(ProviderAccount::ApiKey),
+                    CodexAuth::ShengSuanYun(_) => Ok(ProviderAccount::ShengSuanYun),
                     CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_) => {
                         Err(ProviderAccountError::UnsupportedBedrockApiKeyAuth)
                     }

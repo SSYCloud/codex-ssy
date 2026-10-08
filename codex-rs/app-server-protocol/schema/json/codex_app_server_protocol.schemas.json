@@ -6585,6 +6585,22 @@
             ],
             "title": "AmazonBedrockAccount",
             "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "shengSuanYun"
+                ],
+                "title": "ShengSuanYunAccountType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "ShengSuanYunAccount",
+            "type": "object"
           }
         ]
       },
@@ -7852,6 +7868,13 @@
             "description": "Amazon Bedrock AWS access keys managed by Codex.",
             "enum": [
               "bedrockAccessKeys"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "ShengSuanYun API key managed by Codex.",
+            "enum": [
+              "shengSuanYunAccessKeys"
             ],
             "type": "string"
           }
@@ -11806,7 +11829,8 @@
       "ForcedLoginMethod": {
         "enum": [
           "chatgpt",
-          "api"
+          "api",
+          "shengsuanyun"
         ],
         "type": "string"
       },
@@ -13859,6 +13883,39 @@
             ],
             "title": "AmazonBedrockAccessKeysv2::LoginAccountParams",
             "type": "object"
+          },
+          {
+            "properties": {
+              "app_brand": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/LoginAppBrand"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "codex_streamlined_login": {
+                "type": "boolean"
+              },
+              "type": {
+                "enum": [
+                  "ShengSuanYun"
+                ],
+                "title": "ShengSuanYunv2::LoginAccountParamsType",
+                "type": "string"
+              },
+              "use_hosted_login_success_page": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "ShengSuanYunv2::LoginAccountParams",
+            "type": "object"
           }
         ],
         "title": "LoginAccountParams"
@@ -13967,6 +14024,31 @@
               "type"
             ],
             "title": "AmazonBedrockv2::LoginAccountResponse",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "auth_url": {
+                "description": "URL the client should open in a browser to initiate the OAuth flow.",
+                "type": "string"
+              },
+              "login_id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "shengSuanYun"
+                ],
+                "title": "ShengSuanYunv2::LoginAccountResponseType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "auth_url",
+              "login_id",
+              "type"
+            ],
+            "title": "ShengSuanYunv2::LoginAccountResponse",
             "type": "object"
           }
         ],

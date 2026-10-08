@@ -103,6 +103,31 @@
       ],
       "title": "AmazonBedrockv2::LoginAccountResponse",
       "type": "object"
+    },
+    {
+      "properties": {
+        "auth_url": {
+          "description": "URL the client should open in a browser to initiate the OAuth flow.",
+          "type": "string"
+        },
+        "login_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "shengSuanYun"
+          ],
+          "title": "ShengSuanYunv2::LoginAccountResponseType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "auth_url",
+        "login_id",
+        "type"
+      ],
+      "title": "ShengSuanYunv2::LoginAccountResponse",
+      "type": "object"
     }
   ],
   "title": "LoginAccountResponse"

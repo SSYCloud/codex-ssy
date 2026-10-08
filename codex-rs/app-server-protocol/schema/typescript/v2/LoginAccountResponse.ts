@@ -14,4 +14,8 @@ verificationUrl: string,
 /**
  * One-time code the user must enter after signing in.
  */
-userCode: string, } | { "type": "chatgptAuthTokens", } | { "type": "amazonBedrock", };
+userCode: string, } | { "type": "chatgptAuthTokens", } | { "type": "amazonBedrock", } | { "type": "shengSuanYun", login_id: string,
+/**
+ * URL the client should open in a browser to initiate the OAuth flow.
+ */
+auth_url: string, };

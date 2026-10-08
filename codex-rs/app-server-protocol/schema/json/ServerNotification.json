@@ -601,6 +601,13 @@
             "bedrockAccessKeys"
           ],
           "type": "string"
+        },
+        {
+          "description": "ShengSuanYun API key managed by Codex.",
+          "enum": [
+            "shengSuanYunAccessKeys"
+          ],
+          "type": "string"
         }
       ]
     },

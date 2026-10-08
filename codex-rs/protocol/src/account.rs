@@ -54,6 +54,7 @@ pub enum ProviderAccount {
     AmazonBedrock {
         uses_codex_managed_credentials: bool,
     },
+    ShengSuanYun,
 }
 
 impl PlanType {

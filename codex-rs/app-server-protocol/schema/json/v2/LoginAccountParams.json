@@ -172,6 +172,39 @@
       ],
       "title": "AmazonBedrockAccessKeysv2::LoginAccountParams",
       "type": "object"
+    },
+    {
+      "properties": {
+        "app_brand": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LoginAppBrand"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "codex_streamlined_login": {
+          "type": "boolean"
+        },
+        "type": {
+          "enum": [
+            "ShengSuanYun"
+          ],
+          "title": "ShengSuanYunv2::LoginAccountParamsType",
+          "type": "string"
+        },
+        "use_hosted_login_success_page": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "ShengSuanYunv2::LoginAccountParams",
+      "type": "object"
     }
   ],
   "title": "LoginAccountParams"

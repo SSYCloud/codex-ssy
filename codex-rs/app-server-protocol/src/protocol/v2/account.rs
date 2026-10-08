@@ -41,6 +41,10 @@ pub enum Account {
         #[serde(default)]
         uses_codex_managed_credentials: bool,
     },
+
+    #[serde(rename = "shengSuanYun", rename_all = "camelCase")]
+    #[ts(rename = "shengSuanYun", rename_all = "camelCase")]
+    ShengSuanYun {},
 }
 
 impl From<ProviderAccount> for Account {
@@ -53,6 +57,7 @@ impl From<ProviderAccount> for Account {
             } => Self::AmazonBedrock {
                 uses_codex_managed_credentials,
             },
+            ProviderAccount::ShengSuanYun => Self::ShengSuanYun {},
         }
     }
 }

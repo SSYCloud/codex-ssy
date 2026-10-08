@@ -642,6 +642,17 @@ impl AppServerSession {
                 FeedbackAudience::External,
                 false,
             ),
+            Some(Account::ShengSuanYun {}) => (
+                None,
+                Some(TelemetryAuthMode::ApiKey),
+                Some(StatusAccountDisplay::ShengSuanYun {
+                    name: None,
+                    plan: None,
+                }),
+                None,
+                FeedbackAudience::External,
+                false,
+            ),
             Some(Account::Chatgpt { email, plan_type }) => {
                 let feedback_audience = if email
                     .as_deref()
