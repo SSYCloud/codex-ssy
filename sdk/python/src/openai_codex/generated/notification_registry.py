@@ -64,6 +64,7 @@ from .v2_all import ThreadNameUpdatedNotification
 from .v2_all import ThreadPredictionUpdatedNotification
 from .v2_all import ThreadProjectUpdatedNotification
 from .v2_all import ThreadQueueChangedNotification
+from .v2_all import ThreadReadStateChangedNotification
 from .v2_all import ThreadRealtimeClosedNotification
 from .v2_all import ThreadRealtimeErrorNotification
 from .v2_all import ThreadRealtimeItemAddedNotification
@@ -76,6 +77,7 @@ from .v2_all import ThreadRealtimeStartedNotification
 from .v2_all import ThreadRealtimeTranscriptDeltaNotification
 from .v2_all import ThreadRealtimeTranscriptDoneNotification
 from .v2_all import ThreadRevertedNotification
+from .v2_all import ThreadSectionChangedNotification
 from .v2_all import ThreadSettingsUpdatedNotification
 from .v2_all import ThreadStartedNotification
 from .v2_all import ThreadStatusChangedNotification
@@ -148,6 +150,7 @@ KnownNotificationPayload: TypeAlias = (
     | ThreadPredictionUpdatedNotification
     | ThreadProjectUpdatedNotification
     | ThreadQueueChangedNotification
+    | ThreadReadStateChangedNotification
     | ThreadRealtimeClosedNotification
     | ThreadRealtimeErrorNotification
     | ThreadRealtimeItemAddedNotification
@@ -160,6 +163,7 @@ KnownNotificationPayload: TypeAlias = (
     | ThreadRealtimeTranscriptDeltaNotification
     | ThreadRealtimeTranscriptDoneNotification
     | ThreadRevertedNotification
+    | ThreadSectionChangedNotification
     | ThreadSettingsUpdatedNotification
     | ThreadStartedNotification
     | ThreadStatusChangedNotification
@@ -235,6 +239,7 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "thread/prediction/updated": ThreadPredictionUpdatedNotification,
     "thread/project/updated": ThreadProjectUpdatedNotification,
     "thread/queue/changed": ThreadQueueChangedNotification,
+    "thread/readState/changed": ThreadReadStateChangedNotification,
     "thread/realtime/closed": ThreadRealtimeClosedNotification,
     "thread/realtime/error": ThreadRealtimeErrorNotification,
     "thread/realtime/item/completed": ThreadRealtimeItemCompletedNotification,
@@ -247,6 +252,7 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "thread/realtime/transcript/delta": ThreadRealtimeTranscriptDeltaNotification,
     "thread/realtime/transcript/done": ThreadRealtimeTranscriptDoneNotification,
     "thread/reverted": ThreadRevertedNotification,
+    "thread/section/changed": ThreadSectionChangedNotification,
     "thread/settings/updated": ThreadSettingsUpdatedNotification,
     "thread/started": ThreadStartedNotification,
     "thread/status/changed": ThreadStatusChangedNotification,

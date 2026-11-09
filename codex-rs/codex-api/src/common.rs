@@ -10,6 +10,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::turn_input::CyberAccessProgram;
+use codex_protocol::turn_input::PromptCacheTtl;
 use futures::Stream;
 use serde::Deserialize;
 use serde::Serialize;
@@ -93,6 +94,8 @@ pub enum ResponseEvent {
     ModelVerifications(Vec<ModelVerification>),
     /// Emitted when the server includes moderation metadata for first-party turn presentation.
     TurnModerationMetadata(TurnModerationMetadataEvent),
+    /// Action-bound Guardian evidence for request-scoped consumers, not model history.
+    GuardianAssessment(crate::guardian_assessment::GuardianAssessment),
     /// Emitted when `X-Reasoning-Included: true` is present on the response,
     /// meaning the server already accounted for past reasoning tokens and the
     /// client should not re-estimate them.
@@ -275,6 +278,11 @@ impl Serialize for ResponsesApiTools {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PromptCacheOptions {
+    pub ttl: PromptCacheTtl,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
     // Keep routing fields first: serde serializes struct fields in declaration order, and
@@ -295,6 +303,8 @@ pub struct ResponsesApiRequest {
     pub include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +329,7 @@ impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
             include: &request.include,
             service_tier: request.service_tier.as_deref(),
             prompt_cache_key: request.prompt_cache_key.as_deref(),
+            prompt_cache_options: request.prompt_cache_options,
             text: request.text.as_ref(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
@@ -349,6 +360,8 @@ pub struct ResponseCreateWsRequest<'a> {
     pub include: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,12 +422,25 @@ pub fn create_text_param_for_request(
     })
 }
 
+/// Distinguishes draining a live response from abandoning obsolete work.
+#[derive(Clone, Copy)]
+pub enum ResponseInterrupt {
+    /// Drain normally, without validating or waiting for interruption acknowledgements.
+    Drain,
+    /// Skip undispatched work or retire its transport at the cleanup deadline.
+    /// Undispatched work ends without a completion event and leaves the socket reusable.
+    Cancel { deadline: tokio::time::Instant },
+}
+
 pub struct ResponseStream {
+    /// Routing pin from the connection that produced these responses. Never model metadata.
+    pub routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
     /// Requests a graceful interrupt. Keep consuming events through completion.
-    pub interrupt: Option<oneshot::Sender<()>>,
+    /// Only `Cancel` validates and waits for an interruption acknowledgement.
+    pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,
 }
 
 impl Stream for ResponseStream {

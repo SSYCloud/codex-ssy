@@ -102,6 +102,31 @@ requires_openai_auth = true
         .with_env_overrides(&[("OPENAI_API_KEY", None), ("CODEX_API_KEY", None)])
         .build_initialized()
         .await?;
+    // Exercise runtime toggles after login has replaced the startup catalog manager.
+    if let Some(enabled) = app_enablement {
+        let _: ExperimentalFeatureEnablementSetResponse = mcp
+            .request(
+                |request_id| ClientRequest::ExperimentalFeatureEnablementSet {
+                    request_id,
+                    params: ExperimentalFeatureEnablementSetParams {
+                        enablement: [("api_key_model_discovery".to_string(), !enabled)].into(),
+                    },
+                },
+            )
+            .await?;
+    }
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?
+        .replace("name = \"OpenAI\"", "name = \"After login\"");
+    std::fs::write(config_path, config)?;
+    let login = mcp.send_login_account_api_key_request("test-key").await?;
+    let _: codex_app_server_protocol::LoginAccountResponse = mcp.read_response(login).await?;
+    let _: ModelListResponse = mcp
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams::default(),
+        })
+        .await?;
     let mut bundled = codex_models_manager::bundled_models_response()?.models;
     bundled.sort_by_key(|model| model.priority);
     let mut bundled = ModelPreset::filter_by_auth(
@@ -131,6 +156,7 @@ requires_openai_auth = true
                 limit: Some(100),
                 include_hidden: Some(true),
                 cursor: None,
+                ..Default::default()
             },
         })
         .await?;
@@ -249,6 +275,7 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
                 limit: Some(100),
                 cursor: None,
                 include_hidden: None,
+                ..Default::default()
             },
         })
         .await?;
@@ -279,6 +306,7 @@ async fn list_models_includes_hidden_models() -> Result<()> {
                 limit: Some(100),
                 cursor: None,
                 include_hidden: Some(true),
+                ..Default::default()
             },
         })
         .await?;
@@ -401,6 +429,7 @@ model_catalog_url = "{server_uri}/v1/models"
             limit: Some(100),
             cursor: None,
             include_hidden: None,
+            ..Default::default()
         })
         .await?;
     let response = mcp
@@ -484,6 +513,7 @@ async fn list_models_pagination_works() -> Result<()> {
                     limit: Some(1),
                     cursor: cursor.clone(),
                     include_hidden: None,
+                    ..Default::default()
                 },
             })
             .await?;
@@ -520,6 +550,7 @@ async fn list_models_rejects_invalid_cursor() -> Result<()> {
             limit: None,
             cursor: Some("invalid".to_string()),
             include_hidden: None,
+            ..Default::default()
         })
         .await?;
 

@@ -49,8 +49,6 @@ use codex_sandboxing::record_filesystem_sandbox_violation;
 use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
 #[cfg(test)]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
-#[cfg(test)]
-use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
 #[cfg(any(test, target_os = "windows"))]
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -407,6 +405,7 @@ pub async fn build_exec_request(
         .transform(SandboxTransformRequest {
             command,
             permissions: permission_profile,
+            workspace_roots: None,
             sandbox: sandbox_type,
             enforce_managed_network,
             environment_id: network_environment_id.as_deref(),

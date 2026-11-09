@@ -58,6 +58,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
 
+use super::footer_content::FooterContent;
 use super::picker_rows;
 use super::picker_style;
 use super::selection_popup_common::ColumnWidthConfig;
@@ -75,7 +76,6 @@ use crate::key_hint::is_plain_text_key_event;
 use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
 use crate::keymap::RuntimeKeymap;
-use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::ColumnRenderable;
@@ -110,7 +110,7 @@ pub type CancelCallback = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 
 /// Callback to generate an optional preview line based on current item states.
 /// Returns `None` to hide the preview area.
-pub type PreviewCallback = Box<dyn Fn(&[MultiSelectItem]) -> Option<Line<'static>> + Send + Sync>;
+type PreviewCallback = Box<dyn Fn(&[MultiSelectItem]) -> Option<FooterContent> + Send + Sync>;
 
 /// A single selectable item in the multi-select picker.
 ///
@@ -201,7 +201,7 @@ pub(crate) struct MultiSelectPicker {
     preview_builder: Option<PreviewCallback>,
 
     /// Cached preview line (updated on item changes).
-    preview_line: Option<Line<'static>>,
+    preview_line: Option<FooterContent>,
 
     /// Callback invoked when items change (toggle or reorder).
     on_change: Option<ChangeCallBack>,
@@ -351,46 +351,6 @@ impl MultiSelectPicker {
                 scroll_top,
             },
         }
-    }
-
-    /// Moves the selection cursor up, wrapping to the bottom if at the top.
-    fn move_up(&mut self) {
-        let len = self.visible_len();
-        self.state.move_up_wrap(len);
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
-    }
-
-    /// Moves the selection cursor down, wrapping to the top if at the bottom.
-    fn move_down(&mut self) {
-        let len = self.visible_len();
-        self.state.move_down_wrap(len);
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
-    }
-
-    fn page_up(&mut self) {
-        let len = self.visible_len();
-        let visible = Self::max_visible_rows(len);
-        self.state.page_up_clamped(len, visible);
-    }
-
-    fn page_down(&mut self) {
-        let len = self.visible_len();
-        let visible = Self::max_visible_rows(len);
-        self.state.page_down_clamped(len, visible);
-    }
-
-    fn jump_top(&mut self) {
-        let len = self.visible_len();
-        let visible = Self::max_visible_rows(len);
-        self.state.jump_top(len, visible);
-    }
-
-    fn jump_bottom(&mut self) {
-        let len = self.visible_len();
-        let visible = Self::max_visible_rows(len);
-        self.state.jump_bottom(len, visible);
     }
 
     /// Toggles the enabled state of the currently selected item.
@@ -543,37 +503,30 @@ impl BottomPaneView for MultiSelectPicker {
         // plain j/k only apply through non-text events or modified bindings.
         let allow_plain_char_navigation = !is_plain_text_key_event(key_event);
 
+        if allow_plain_char_navigation
+            && self.ordering_enabled
+            && self.keymap.move_left.is_pressed(key_event)
+        {
+            self.move_selected_item(Direction::Up);
+            return;
+        }
+        if allow_plain_char_navigation
+            && self.ordering_enabled
+            && self.keymap.move_right.is_pressed(key_event)
+        {
+            self.move_selected_item(Direction::Down);
+            return;
+        }
+        if allow_plain_char_navigation
+            && let Some(action) = self.keymap.vertical_action_for(key_event)
+        {
+            let len = self.visible_len();
+            self.state
+                .apply_vertical_action(action, len, Self::max_visible_rows(len));
+            return;
+        }
+
         match key_event {
-            _ if allow_plain_char_navigation
-                && self.ordering_enabled
-                && self.keymap.move_left.is_pressed(key_event) =>
-            {
-                self.move_selected_item(Direction::Up);
-            }
-            _ if allow_plain_char_navigation
-                && self.ordering_enabled
-                && self.keymap.move_right.is_pressed(key_event) =>
-            {
-                self.move_selected_item(Direction::Down);
-            }
-            _ if allow_plain_char_navigation && self.keymap.move_up.is_pressed(key_event) => {
-                self.move_up()
-            }
-            _ if allow_plain_char_navigation && self.keymap.move_down.is_pressed(key_event) => {
-                self.move_down()
-            }
-            _ if allow_plain_char_navigation && self.keymap.page_up.is_pressed(key_event) => {
-                self.page_up()
-            }
-            _ if allow_plain_char_navigation && self.keymap.page_down.is_pressed(key_event) => {
-                self.page_down()
-            }
-            _ if allow_plain_char_navigation && self.keymap.jump_top.is_pressed(key_event) => {
-                self.jump_top()
-            }
-            _ if allow_plain_char_navigation && self.keymap.jump_bottom.is_pressed(key_event) => {
-                self.jump_bottom()
-            }
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -667,16 +620,8 @@ impl Renderable for MultiSelectPicker {
             let [preview_area, hint_area] =
                 Layout::vertical([Constraint::Length(1), Constraint::Length(hint_height)])
                     .areas(footer_area);
-            let preview_area = Rect {
-                x: preview_area.x + 2,
-                y: preview_area.y,
-                width: preview_area.width.saturating_sub(2),
-                height: preview_area.height,
-            };
-            let max_preview_width = preview_area.width.saturating_sub(2) as usize;
-            let preview_line =
-                truncate_line_with_ellipsis_if_overflow(preview_line.clone(), max_preview_width);
-            preview_line.render(preview_area, buf);
+            let preview_area = preview_area.inset(Insets::vh(/*v*/ 0, /*h*/ 2));
+            preview_line.clone().render(preview_area, buf);
             hint_area
         } else {
             footer_area
@@ -762,10 +707,19 @@ impl MultiSelectPickerBuilder {
     ///
     /// The callback receives all items and should return a [`Line`] to display,
     /// or `None` to hide the preview area.
-    pub fn on_preview<F>(mut self, callback: F) -> Self
+    pub fn on_preview<F>(self, callback: F) -> Self
     where
         F: Fn(&[MultiSelectItem]) -> Option<Line<'static>> + Send + Sync + 'static,
     {
+        self.on_preview_content(move |items| {
+            callback(items).map(|line| FooterContent::HyperlinkLine(line.into()))
+        })
+    }
+
+    pub(crate) fn on_preview_content(
+        mut self,
+        callback: impl Fn(&[MultiSelectItem]) -> Option<FooterContent> + Send + Sync + 'static,
+    ) -> Self {
         self.preview_builder = Some(Box::new(callback));
         self
     }
@@ -958,7 +912,7 @@ mod tests {
             vec!["theme-colors", "model", "branch"]
         );
 
-        picker.move_down();
+        picker.handle_key_event(KeyEvent::from(KeyCode::Down));
         picker.move_selected_item(Direction::Up);
         assert_eq!(
             picker
@@ -1050,6 +1004,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let mut keymap = RuntimeKeymap::defaults().list;
         keymap.page_down = vec![key_hint::ctrl(KeyCode::Char('d'))];
+        keymap.move_left = keymap.page_down.clone();
         keymap.page_up = vec![key_hint::ctrl(KeyCode::Char('u'))];
         keymap.jump_bottom = vec![key_hint::ctrl(KeyCode::Char('e'))];
         keymap.jump_top = vec![key_hint::ctrl(KeyCode::Char('a'))];
@@ -1063,7 +1018,7 @@ mod tests {
                 .map(|idx| {
                     item(
                         &format!("item-{idx}"),
-                        /*orderable*/ true,
+                        /*orderable*/ false,
                         /*section_break_after*/ false,
                     )
                 })
@@ -1102,7 +1057,7 @@ mod tests {
                 .collect(),
         );
         picker.header = Box::new(());
-        picker.jump_bottom();
+        picker.handle_key_event(KeyEvent::from(KeyCode::End));
         let mut snapshots = Vec::new();
         for height in 1..=7 {
             let area = Rect::new(/*x*/ 0, /*y*/ 0, /*width*/ 80, height);
@@ -1183,7 +1138,7 @@ mod tests {
             buf
         };
         let first = render(&picker);
-        picker.jump_bottom();
+        picker.handle_key_event(KeyEvent::from(KeyCode::End));
         picker.toggle_selected();
         picker.move_selected_item(Direction::Up);
         let last = render(&picker);

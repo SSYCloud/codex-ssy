@@ -7,6 +7,7 @@ use super::WorldStateSnapshot;
 use super::WorldStateUpdate;
 use super::WorldStateUpdateContent;
 use crate::context::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
 pub(super) fn render_section_cases<'a, S: WorldStateSection>(
@@ -21,11 +22,16 @@ pub(super) fn render_section_cases<'a, S: WorldStateSection>(
             } else {
                 updates
                     .into_iter()
-                    .map(|update| match update.content {
-                        WorldStateUpdateContent::Fragment(fragment) => {
-                            format!(" (role - {})\n{}", fragment.role(), fragment.render())
+                    .map(|update| match update.content.into_fragment() {
+                        Ok(fragment) => {
+                            let rendered = match fragment.render() {
+                                ContentItem::InputText { text }
+                                | ContentItem::OutputText { text, .. } => text,
+                                content => format!("{content:?}"),
+                            };
+                            format!(" (role - {})\n{rendered}", fragment.role())
                         }
-                        WorldStateUpdateContent::Item(item) => {
+                        Err(item) => {
                             let placement = match update.placement {
                                 Placement::Prefix => "prefix",
                                 Placement::Standalone => "standalone",
@@ -119,9 +125,9 @@ pub(crate) fn expect_fragments(
 }
 
 fn expect_fragment(content: WorldStateUpdateContent) -> Box<dyn ContextualUserFragment> {
-    match content {
-        WorldStateUpdateContent::Fragment(fragment) => fragment,
-        WorldStateUpdateContent::Item(item) => panic!("expected a context fragment, got {item:?}"),
+    match content.into_fragment() {
+        Ok(fragment) => fragment,
+        Err(item) => panic!("expected a context fragment, got {item:?}"),
     }
 }
 

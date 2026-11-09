@@ -68,19 +68,6 @@ pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
             .any(|component| component.as_os_str() == OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
 }
 
-/// Returns rollout files whose session metadata belongs to `thread_id`.
-pub(super) async fn owned_rollout_paths(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-) -> ThreadStoreResult<Vec<PathBuf>> {
-    RolloutReferenceIndex::scan(store.config.codex_home.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to scan thread rollout files: {err}"),
-        })
-        .map(|index| owned_rollout_paths_from_index(&index, thread_id))
-}
-
 pub(super) fn owned_rollout_paths_from_index(
     index: &RolloutReferenceIndex,
     thread_id: ThreadId,
@@ -153,6 +140,8 @@ pub(super) fn stored_thread_from_rollout_item(
     let rollout_path = codex_rollout::plain_rollout_path(item.path.as_path());
 
     Some(StoredThread {
+        creator_user_id: None,
+        creator_account_id: None,
         thread_id,
         extra_config: None,
         rollout_path: Some(rollout_path),

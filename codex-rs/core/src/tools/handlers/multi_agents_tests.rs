@@ -1,12 +1,14 @@
 use super::*;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
+use crate::ThreadStoreBuilder;
 use crate::agent::child_config::apply_spawn_agent_service_tier;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_config::build_agent_spawn_config;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::config::PermissionProfileSnapshot;
+use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
@@ -14,11 +16,11 @@ use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_auth_config_home_and_rx;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
-use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
@@ -35,6 +37,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
+use codex_models_manager::manager::ModelCatalogSettings;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_otel::MULTI_AGENT_SPAWN_FAILURE_METRIC;
 use codex_otel::MetricsClient;
@@ -116,6 +119,8 @@ fn invocation(
         tool_name: codex_tools::ToolName::plain(tool_name),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
+        native_call: None,
+        environments: Default::default(),
     }
 }
 
@@ -571,6 +576,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -624,6 +630,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -2332,9 +2339,13 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
     else {
         panic!("parent environment should be ready");
     };
-    environment.environment = environment_manager
-        .default_environment()
-        .expect("sandbox-capable test environment should exist");
+    let (attachment, _guard, _) = EnvironmentAttachment::new(
+        &environment.selection.environment_id,
+        environment_manager
+            .default_environment()
+            .expect("sandbox-capable test environment should exist"),
+    );
+    environment.attachment = attachment;
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(expected_permission_profile.clone());
     environment.config_origin = EnvironmentConfigOrigin::Owner;
@@ -2389,7 +2400,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .expect("spawned agent thread should exist");
     let child_turn = child_thread.session.new_default_turn().await;
     assert_eq!(
-        child_turn.file_system_sandbox_policy(),
+        child_turn.permission_profile().file_system_sandbox_policy(),
         expected_file_system_sandbox_policy
     );
     assert_eq!(
@@ -2804,6 +2815,8 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
             config.clone(),
             InitialHistory::Forked(vec![RolloutItem::ResponseItem(
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -3035,7 +3048,8 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
                 Vec::new(),
                 "hello from worker".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3535,7 +3549,8 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
                 Vec::new(),
                 "completed".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3611,7 +3626,8 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
                 Vec::new(),
                 "already queued".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3713,7 +3729,8 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
                 Vec::new(),
                 "from worker b".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3804,7 +3821,8 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
                 Vec::new(),
                 "sensitive child output".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3936,7 +3954,16 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
-    let (mut session, mut turn) = make_session_and_context().await;
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |_config| {},
+    )
+    .await;
+    let mut session = Arc::into_inner(session).expect("unshared test session");
+    let mut turn = Arc::into_inner(turn).expect("unshared test turn");
     let mut config = (*turn.config).clone();
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
     config
@@ -4271,7 +4298,14 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 
 #[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
-    let (_session, turn) = make_session_and_context().await;
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (_session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |_config| {},
+    )
+    .await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
     config
@@ -4286,8 +4320,12 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -4295,9 +4333,8 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         crate::thread_manager::passthrough_image_store(),
-        thread_store_from_config(&config, state_db.clone()),
+        ThreadStoreBuilder::from_config(&config, state_db.clone()).build(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        "11111111-1111-4111-8111-111111111111".to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -4650,6 +4687,41 @@ async fn build_agent_spawn_config_uses_captured_step_settings_and_turn_context_v
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+async fn child_agents_inherit_thread_routing_when_parent_overrides_it_for_one_turn() {
+    let home = tempfile::tempdir().expect("create test home");
+    let (session, _, _events) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("test"),
+        Vec::new(),
+        home.path(),
+        |config| config.code_mode.direct_only_tool_namespaces = vec!["thread_tools".into()],
+    )
+    .await;
+    let turn = session
+        .new_turn_with_default_settings(
+            "parent-turn".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                direct_only_tool_namespaces: Some(vec!["user_message".into()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        turn.config.code_mode.direct_only_tool_namespaces,
+        ["user_message"]
+    );
+    let resumed = build_agent_resume_config(&turn).expect("resume config");
+    let step = StepContext::for_test(turn);
+    let spawned =
+        build_agent_spawn_config(&BaseInstructions::default(), &step).expect("spawn config");
+    for config in [spawned, resumed] {
+        assert_eq!(
+            config.code_mode.direct_only_tool_namespaces,
+            ["thread_tools"]
+        );
+    }
 }
 
 #[tokio::test]

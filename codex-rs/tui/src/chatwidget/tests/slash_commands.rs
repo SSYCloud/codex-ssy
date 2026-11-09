@@ -418,6 +418,15 @@ async fn assert_cancelled_queued_menu_drains_next_input(
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
 
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+    if command.trim() == "/permissions" {
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, AppEvent::OpenPermissionsPopup)),
+            "permission menu must go through the app"
+        );
+        assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+        chat.open_permissions_popup();
+    }
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
         popup.contains(expected_popup_text),
@@ -456,7 +465,7 @@ async fn queued_slash_menu_cancel_drains_next_input() {
     )
     .await;
     assert_cancelled_queued_menu_drains_next_input(
-        "/permissions",
+        "/permissions   ",
         "Update Model Permissions",
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
     )
@@ -491,6 +500,10 @@ async fn queued_settings_selection_applies_before_next_input() {
             AppEvent::OpenReasoningPopup { model } => chat.open_reasoning_popup(model),
             AppEvent::UpdateModel(model) => chat.set_model(&model),
             AppEvent::UpdateReasoningEffort(effort) => chat.set_reasoning_effort(effort),
+            AppEvent::ApplyModelSelection { model, effort } => {
+                chat.set_model(&model);
+                chat.set_reasoning_effort(effort);
+            }
             AppEvent::SettingsSelectionClosed => {
                 chat.app_event_tx.send(AppEvent::SettingsSelectionSettled);
             }
@@ -680,7 +693,6 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
     );
     assert!(chat.input_queue.queued_user_messages.is_empty());
 
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
     chat.set_local_worktree_operations(/*enabled*/ false);
     let drain = chat.submit_queued_slash_prompt(UserMessage::from("/worktree extra").into());
     assert_matches!(drain, QueueDrain::Continue);
@@ -795,6 +807,7 @@ async fn goal_slash_command_uses_plain_text_for_mentions() {
             mention: "figma".to_string(),
             path: "app://figma".to_string(),
         }],
+        crate::bottom_pane::ShellPrefixHandling::Interpret,
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
@@ -1239,6 +1252,7 @@ async fn interrupted_merged_message_history_encodes_mentions_once() {
             mention: "figma".to_string(),
             path: "app://figma".to_string(),
         }],
+        crate::bottom_pane::ShellPrefixHandling::Interpret,
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1618,11 +1632,11 @@ async fn slash_copy_picker_uses_completed_commentary_during_active_turn() {
     let commentary = "Here is the command:\n\n```sh\necho current\n```";
     let current_thread_id = chat.thread_id.map(|id| id.to_string()).unwrap_or_default();
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: current_thread_id,
-            turn_id: "active".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::AgentMessage {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            current_thread_id,
+            "active".to_string(),
+            AppServerThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "active-commentary".to_string(),
                 text: commentary.to_string(),
                 phase: Some(MessagePhase::Commentary),
@@ -1630,7 +1644,9 @@ async fn slash_copy_picker_uses_completed_commentary_during_active_turn() {
                 delivery: None,
                 questions: None,
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     while rx.try_recv().is_ok() {}
@@ -1652,15 +1668,16 @@ async fn slash_copy_state_tracks_plan_item_completion() {
     let plan_text = "## Plan\n\n1. Build it\n2. Test it\n\n```sh\r\njust test  \r\n```".to_string();
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: String::new(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::Plan {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            String::new(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::Plan {
                 id: "plan-1".to_string(),
                 text: plan_text.clone(),
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
@@ -2217,10 +2234,46 @@ async fn slash_copy_picker_remains_available_from_parent_owned_threads() {
 
 #[tokio::test]
 async fn slash_daybreak_offers_an_application_when_unavailable() {
+    assert_daybreak_catalog_and_account_gates("openai").await;
+}
+
+#[tokio::test]
+async fn slash_daybreak_custom_provider_requires_capability() {
+    assert_daybreak_catalog_and_account_gates("proxy").await;
+}
+
+async fn assert_daybreak_catalog_and_account_gates(provider_id: &str) {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
     chat.has_chatgpt_account = true;
-    chat.config.model_provider_id = "openai".into();
+    chat.config.model_provider_id = provider_id.into();
+    if provider_id == "proxy" {
+        for capability in [None, Some(false)] {
+            chat.config.model_provider.capabilities =
+                Some(codex_model_provider_info::ModelProviderCapabilities {
+                    cyber_access_programs: capability,
+                    ..Default::default()
+                });
+            chat.config
+                .model_providers
+                .insert(provider_id.into(), chat.config.model_provider.clone());
+            assert!(!chat.daybreak_account_eligible());
+            assert!(chat.daybreak_command_description().is_none());
+        }
+        chat.config.model_provider.capabilities =
+            Some(codex_model_provider_info::ModelProviderCapabilities {
+                cyber_access_programs: Some(true),
+                ..Default::default()
+            });
+    }
+    chat.config
+        .model_providers
+        .insert(provider_id.into(), chat.config.model_provider.clone());
+    // Session updates change the provider ID; eligibility must not use the startup definition.
+    chat.config.model_provider.capabilities = None;
+    assert!(chat.daybreak_account_eligible());
+    chat.config.model_provider_id = "unknown-provider".into();
+    assert!(!chat.daybreak_account_eligible());
+    chat.config.model_provider_id = provider_id.into();
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
     model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::Standard],
@@ -2272,7 +2325,10 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
     chat.has_chatgpt_account = false;
     chat.status_account_display = Some(StatusAccountDisplay::ApiKey);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ true);
     chat.set_daybreak_enabled(/*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
     chat.bottom_pane
         .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
     assert_chatwidget_snapshot!(
@@ -2281,6 +2337,20 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
             .lines()
             .next()
             .unwrap()
+    );
+    chat.set_daybreak_enabled(/*enabled*/ true);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
+    chat.bottom_pane
+        .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
+    insta::assert_snapshot!(
+        render_bottom_popup(&chat, /*width*/ 80)
+            .lines()
+            .filter(|line| line.contains("broader access"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        @""
     );
     chat.has_chatgpt_account = true;
     chat.status_account_display = None;
@@ -2510,16 +2580,47 @@ async fn slash_keymap_invalid_args_show_usage() {
 #[tokio::test]
 async fn copy_shortcut_can_be_remapped() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
-        let paste = KeyEvent::new(KeyCode::Char('v'), modifiers);
+    for (code, modifiers) in [
+        (KeyCode::Char('v'), KeyModifiers::CONTROL),
+        (KeyCode::Char('V'), KeyModifiers::CONTROL),
+        (
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        (KeyCode::Char('v'), KeyModifiers::ALT),
+    ] {
+        let paste = KeyEvent::new(code, modifiers);
         assert_matches!(
             chat.handle_key_event(paste),
-            crate::chatwidget::KeyEventAction::PasteImage
+            crate::chatwidget::KeyEventAction::PasteImage { text_fallback, .. }
+                if text_fallback == (cfg!(windows) && modifiers == KeyModifiers::CONTROL)
+                    .then_some(code)
         );
         chat.handle_key_event(KeyEvent {
             kind: KeyEventKind::Release,
             ..paste
         });
+    }
+    // Crossterm maps VK_INSERT + SHIFT_PRESSED directly to Insert + Shift on Windows.
+    let shift_insert = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+    if cfg!(windows) {
+        chat.bottom_pane.set_disable_paste_burst(/*disabled*/ false);
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('q')));
+        assert_matches!(
+            chat.handle_key_event(shift_insert),
+            KeyEventAction::PasteImage {
+                text_fallback: Some(KeyCode::Insert),
+                ..
+            }
+        );
+        assert_eq!(chat.bottom_pane.composer_text(), "q");
+        assert_matches!(chat.handle_key_event(shift_insert), KeyEventAction::None);
+        chat.handle_key_event(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..shift_insert
+        });
+        chat.bottom_pane
+            .set_composer_text(String::new(), Vec::new(), Vec::new());
     }
     let mut keymap_config = chat.config_ref().tui_keymap.clone();
     keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
@@ -2553,22 +2654,34 @@ async fn legacy_image_paste_ignores_buffered_press_until_other_input() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
 
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
     assert_matches!(chat.handle_key_event(paste), KeyEventAction::None);
 
     chat.suppress_image_paste_until = Instant::now() - Duration::from_secs(/*secs*/ 1);
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 
     chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
     chat.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 
     chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
     chat.handle_key_event(KeyEvent {
         kind: KeyEventKind::Release,
         ..paste
     });
-    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(
+        chat.handle_key_event(paste),
+        KeyEventAction::PasteImage { .. }
+    );
 }
 
 #[tokio::test]
@@ -3006,32 +3119,15 @@ async fn slash_archive_confirmation_requests_current_thread_archive() {
 
 #[tokio::test]
 async fn slash_delete_confirmation_requests_current_thread_delete() {
-    let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500").unwrap();
-    for target in [
-        crate::AppServerTarget::Embedded,
-        crate::AppServerTarget::LocalDaemon {
-            allow_embedded_fallback: true,
-            endpoint: endpoint.clone(),
-        },
-        crate::AppServerTarget::Remote { endpoint },
-    ] {
-        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-        chat.remote_connection = crate::status::remote_connection::remote_connection_status_value(
-            &target, /*server_version*/ None,
-        );
-        chat.dispatch_command(SlashCommand::Delete);
-        assert!(chat.bottom_pane.has_active_view());
-        assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-        let popup = render_bottom_popup(&chat, /*width*/ 80);
-        if matches!(target, crate::AppServerTarget::Embedded) {
-            assert_chatwidget_snapshot!("slash_delete_confirmation_popup", popup);
-        } else {
-            assert_chatwidget_snapshot!("slash_delete_confirmation_command_center", popup);
-        }
-        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert_matches!(rx.try_recv(), Ok(AppEvent::DeleteCurrentThread));
-    }
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.dispatch_command(SlashCommand::Delete);
+    assert!(chat.bottom_pane.has_active_view());
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("slash_delete_confirmation_command_center", popup);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::DeleteCurrentThread));
 }
 
 #[tokio::test]
@@ -3125,7 +3221,7 @@ async fn slash_pets_in_tmux_shows_notice_and_preserves_draft() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Pets are disabled in tmux."));
+    assert!(rendered.contains("Pets are unavailable in this tmux pane."));
     assert!(rendered.contains("outside tmux"));
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
@@ -3144,14 +3240,17 @@ async fn slash_pets_with_arg_on_unsupported_terminal_shows_notice_without_select
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     assert!(chat.bottom_pane.has_active_view());
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Pets are disabled in tmux."));
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80)
+            .contains("Pets are unavailable in this tmux pane.")
+    );
     let cells = drain_insert_history_transcript(&mut rx);
     let rendered = cells
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Pets are disabled in tmux."));
+    assert!(rendered.contains("Pets are unavailable in this tmux pane."));
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 

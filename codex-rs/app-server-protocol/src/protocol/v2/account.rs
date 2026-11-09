@@ -33,6 +33,8 @@ pub enum Account {
         )]
         email: Option<String>,
         plan_type: PlanType,
+        /// Display name of the selected ChatGPT workspace, when available.
+        workspace_name: Option<String>,
     },
 
     #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
@@ -45,19 +47,28 @@ pub enum Account {
     #[serde(rename = "shengSuanYun", rename_all = "camelCase")]
     #[ts(rename = "shengSuanYun", rename_all = "camelCase")]
     ShengSuanYun {},
+    /// Google Cloud Vertex AI with externally managed credentials.
+    #[serde(rename = "gcp", rename_all = "camelCase")]
+    #[ts(rename = "gcp", rename_all = "camelCase")]
+    Gcp {},
 }
 
 impl From<ProviderAccount> for Account {
     fn from(account: ProviderAccount) -> Self {
         match account {
             ProviderAccount::ApiKey => Self::ApiKey {},
-            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt { email, plan_type },
+            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt {
+                email,
+                plan_type,
+                workspace_name: None,
+            },
             ProviderAccount::AmazonBedrock {
                 uses_codex_managed_credentials,
             } => Self::AmazonBedrock {
                 uses_codex_managed_credentials,
             },
             ProviderAccount::ShengSuanYun => Self::ShengSuanYun {},
+            ProviderAccount::Gcp => Self::Gcp {},
         }
     }
 }
@@ -236,8 +247,26 @@ pub struct AccountSessionsLogoutParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountSessionsSwitchParams {
+    /// Opaque active-login identifier returned by accountSession/list.
     pub session_id: String,
+    /// Workspace to select within that login; this is not a user identifier.
     pub account_id: String,
+    /// Allow Core to start browser sign-in if this session needs SSO for the workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<bool>")]
+    pub allow_browser_login: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(untagged, rename_all_fields = "camelCase")]
+#[ts(untagged, rename_all_fields = "camelCase", export_to = "v2/")]
+pub enum AccountSessionsSwitchResponse {
+    Switched {
+        #[serde(flatten)]
+        sessions: AccountSessionsResponse,
+    },
+    /// Open the URL and await account/login/completed for this login ID.
+    BrowserLogin { login_id: String, auth_url: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -577,6 +606,9 @@ pub struct GetAccountParams {
 #[ts(export_to = "v2/")]
 pub struct GetAccountResponse {
     pub account: Option<Account>,
+    /// ChatGPT user ID belonging to this account response, when available.
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub requires_openai_auth: bool,
     #[experimental("account/read.workspaceRouting")]
     pub workspace_routing: Option<WorkspaceRouting>,
@@ -642,6 +674,30 @@ impl std::fmt::Debug for GatewayOAuthChangedNotification {
             .finish()
     }
 }
+
+/// Read credential readiness for a configured provider without starting browser login.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthReadParams {
+    /// Defaults to the current provider when omitted.
+    #[ts(optional = nullable)]
+    pub model_provider: Option<String>,
+}
+
+pub type NullableGatewayOAuthReadParams = Option<GatewayOAuthReadParams>;
+
+/// Authorize a configured provider without changing the default or any thread's provider.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthLoginParams {
+    /// Defaults to the current provider when omitted.
+    #[ts(optional = nullable)]
+    pub model_provider: Option<String>,
+}
+
+pub type NullableGatewayOAuthLoginParams = Option<GatewayOAuthLoginParams>;
 
 /// Current effective gateway policy and credential readiness; never contains credentials.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -847,4 +903,32 @@ pub struct AccountLoginCompletedNotification {
 #[ts(export_to = "v2/")]
 pub enum DesktopOnboardingEntrypoint {
     LifeSciences,
+}
+
+/// Optional security reminder bound to the account that fetched it. Unavailable or
+/// ineligible accounts return no notice; this read never changes account security.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GetAccountSecuritySetupResponse {
+    pub notice: Option<AccountSecuritySetupNotice>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountSecuritySetupNotice {
+    pub account_id: String,
+    pub user_id: String,
+    pub title: String,
+    pub description: String,
+    pub action: AccountSecuritySetupAction,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountSecuritySetupAction {
+    pub label: String,
+    pub url: String,
 }

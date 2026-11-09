@@ -547,11 +547,17 @@ pub struct ThreadForkParams {
     /// Start from the loaded parent's effective config, tools, environments, and
     /// persisted history to maximize prompt-cache reuse. Requires a loaded,
     /// persisted parent and `ephemeral: true`. Enables `features.reasoning_effort_override`
-    /// on the fork. Cannot be combined with configuration overrides, `path`, `lastTurnId`,
-    /// or `beforeTurnId`.
+    /// on the fork. Only `config.thread_unload_delay_secs` may override the inherited
+    /// config. Cannot be combined with `path`, `lastTurnId`, or `beforeTurnId`.
     #[experimental("thread/fork.experimentalPredictionMode")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_prediction_mode: bool,
+
+    /// Disable MCP servers in prediction mode when the inherited window uses incremental tools on Responses Lite.
+    /// Requires `experimentalPredictionMode: true`.
+    #[experimental("thread/fork.experimentalDisablePredictionMcp")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_disable_prediction_mcp: bool,
 
     /// Optional last turn id to fork through, inclusive.
     ///
@@ -617,6 +623,12 @@ pub struct ThreadForkParams {
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// Persist the fork as an attached thread of its resolved source, hidden from ordinary
+    /// lists. The source cannot be deleted while attached threads exist. Requires a paginated source and local storage;
+    /// incompatible with ephemeral and deferGoalContinuation. Omitted or false creates an ordinary fork.
+    #[experimental("thread/fork.attachToSource")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attach_to_source: bool,
     /// Optional client-supplied analytics source classification for this forked thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -927,6 +939,8 @@ pub struct QueuedSubmission {
     pub id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// Metadata retained with this input, including across reconnect and restoration.
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -936,6 +950,9 @@ pub struct ThreadQueueAddParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     pub client_user_message_id: String,
+    /// ResponsesAPI metadata captured from the client submitting this input.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -974,6 +991,9 @@ pub struct ThreadQueueUpdateParams {
     pub thread_id: String,
     pub queued_submission_id: String,
     pub input: Vec<UserInput>,
+    /// Non-empty metadata replaces the input's metadata; omission or an empty map preserves it.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1117,6 +1137,20 @@ pub struct ThreadSectionMoveParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSectionMoveResponse {}
+
+/// Broadcast after a successful move into, within, or out of a section.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionChangedNotification {
+    pub thread_id: String,
+    /// Destination section, or `null` when the thread was removed from its section.
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    pub section_id: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
@@ -1401,6 +1435,9 @@ pub struct ThreadSectionDeleteResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadListParams {
+    /// Show local history visible to the current ChatGPT account. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_account_only: bool,
     /// Opaque pagination cursor returned by a previous call.
     #[ts(optional = nullable)]
     pub cursor: Option<String>,
@@ -1477,12 +1514,21 @@ pub struct ThreadListParams {
     #[experimental("thread/list.ancestorThreadId")]
     #[ts(optional = nullable)]
     pub ancestor_thread_id: Option<String>,
+    /// Return only persistent threads attached to this thread, including empty threads.
+    /// Mutually exclusive with parentThreadId and ancestorThreadId.
+    /// Omitting this filter keeps attached threads hidden from ordinary listings.
+    #[experimental("thread/list.attachedToThreadId")]
+    #[ts(optional = nullable)]
+    pub attached_to_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSearchParams {
+    /// Show local history visible to the current ChatGPT account. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_account_only: bool,
     /// Opaque pagination cursor returned by a previous call.
     #[ts(optional = nullable)]
     pub cursor: Option<String>,
@@ -1559,11 +1605,15 @@ pub enum SortDirection {
     Desc,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadListResponse {
     pub data: Vec<Thread>,
+    /// Local receipts for eligible threads on this page, keyed by thread ID.
+    /// Null means durable read state is unavailable; an absent key means that row is ineligible.
+    #[experimental("thread/list.readStates")]
+    pub read_states: Option<HashMap<String, ThreadReadState>>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.
     pub next_cursor: Option<String>,
@@ -1708,11 +1758,43 @@ pub struct ThreadReadParams {
     pub include_turns: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadReadResponse {
     pub thread: Thread,
+    /// Local receipt. Null means this thread's durable read state is unavailable.
+    #[experimental("thread/read.readState")]
+    pub read_state: Option<ThreadReadState>,
+}
+
+/// Calling `thread/guardianReview` subscribes the connection to the thread.
+/// The subscription remains after the review completes, keeping the thread loaded
+/// until the client calls `thread/unsubscribe` or disconnects.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianReviewParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianReviewResponse {
+    pub call_id: String,
+    /// Null when current policy or a remembered approval skips review.
+    pub assessment: Option<ThreadGuardianAssessment>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianAssessment {
+    pub outcome: codex_protocol::protocol::GuardianAssessmentOutcome,
+    pub risk_level: super::GuardianRiskLevel,
+    pub user_authorization: super::GuardianUserAuthorization,
+    pub rationale: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1763,7 +1845,7 @@ pub struct ThreadTurnsListResponse {
     pub backwards_cursor: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadItemsListParams {
@@ -1782,6 +1864,21 @@ pub struct ThreadItemsListParams {
     /// Optional item pagination direction; defaults to ascending.
     #[ts(optional = nullable)]
     pub sort_direction: Option<SortDirection>,
+    /// For a single turn, choose which saved outputs to fetch separately by item ID.
+    #[experimental(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub defer_output: Option<ThreadItemOutputDeferral>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadItemOutputDeferral {
+    /// Defer nonempty output from successful commands.
+    #[experimental("thread/items/list.deferOutput.commandExecution")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_execution: bool,
 }
 
 /// Starting position for an item-history page.
@@ -1805,19 +1902,50 @@ pub enum ThreadItemsListAnchor {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadItemEntry {
     /// Turn containing this item.
     pub turn_id: String,
     pub item: ThreadItem,
+    /// The saved command output was omitted. Fetch the complete item with `thread/items/read`.
+    #[experimental("thread/items/list.outputDeferred")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_deferred: bool,
     /// Unix timestamp (milliseconds) when the item started, if recorded by the producer.
     #[ts(type = "number | null")]
     pub started_at_ms: Option<i64>,
     /// Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
     #[ts(type = "number | null")]
     pub completed_at_ms: Option<i64>,
+}
+
+/// Identifies the item to fetch with `thread/items/read` to obtain its full output.
+#[derive(Debug, thiserror::Error)]
+#[error("output for item {item_id} in turn {turn_id} is deferred")]
+pub struct DeferredItemOutput {
+    pub turn_id: String,
+    pub item_id: String,
+}
+
+impl TryFrom<ThreadItemEntry> for ThreadItem {
+    type Error = DeferredItemOutput;
+
+    fn try_from(entry: ThreadItemEntry) -> Result<Self, Self::Error> {
+        if entry.output_deferred {
+            return Err(DeferredItemOutput {
+                item_id: entry.item.id().to_owned(),
+                turn_id: entry.turn_id,
+            });
+        }
+
+        Ok(Self {
+            started_at_ms: entry.item.started_at_ms.or(entry.started_at_ms),
+            completed_at_ms: entry.item.completed_at_ms.or(entry.completed_at_ms),
+            ..entry.item
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1831,6 +1959,25 @@ pub struct ThreadItemsListResponse {
     /// Opaque cursor to pass as `cursor` when reversing `sortDirection`.
     /// This is only populated when the page contains at least one item.
     pub backwards_cursor: Option<String>,
+}
+
+/// EXPERIMENTAL - retrieve a bounded set of persisted items from one turn.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadItemsReadParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    /// Item IDs to retrieve. Supply 1 to 100 IDs.
+    pub item_ids: Vec<String>,
+}
+
+/// EXPERIMENTAL - persisted items returned in canonical stored order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadItemsReadResponse {
+    pub data: Vec<ThreadItemEntry>,
 }
 
 /// EXPERIMENTAL - list ordinary and realtime thread history in rollout order.
@@ -2009,6 +2156,67 @@ pub struct ThreadStartedNotification {
 pub struct ThreadStatusChangedNotification {
     pub thread_id: String,
     pub status: ThreadStatus,
+}
+
+/// The first unread position in a durable local thread. A null position means read.
+/// The opaque revision guards edits against activity or marks the caller has not seen.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadReadState {
+    pub first_unread: Option<ThreadUnreadPosition>,
+    pub revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type", rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadUnreadPosition {
+    /// Explicitly marked unread, including when the thread has no turns.
+    ThreadStart,
+    /// The earliest completed result needing attention.
+    Turn {
+        #[serde(rename = "turnId")]
+        #[ts(rename = "turnId")]
+        turn_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(tag = "type", rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadReadStateOperation {
+    Read,
+    Unread,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadReadStateUpdateParams {
+    pub thread_id: String,
+    pub operation: ThreadReadStateOperation,
+    /// Revision of the row or transcript actually seen. Conflicts require a fresh user action.
+    pub expected_revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadReadStateUpdateResponse {
+    pub read_state: ThreadReadState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadReadStateChangedNotification {
+    pub thread_id: String,
+    pub read_state: ThreadReadState,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

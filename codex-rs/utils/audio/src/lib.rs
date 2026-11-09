@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::models::AudioReference;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::MAX_PROMPT_AUDIO_INPUT_BYTES;
@@ -30,7 +31,7 @@ const UNSUPPORTED_AUDIO_FORMAT_PLACEHOLDER: &str =
 
 const MAX_PROMPT_AUDIO_BASE64_BYTES: usize = MAX_PROMPT_AUDIO_INPUT_BYTES.div_ceil(3) * 4;
 const AUDIO_TOKEN_ESTIMATE_CACHE_SIZE: usize = 32;
-const AUDIO_TOKENS_PER_SECOND: f64 = 10.0;
+const AUDIO_TOKENS_PER_SECOND: u32 = 10;
 
 static AUDIO_TOKEN_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Arc<OnceLock<usize>>>> =
     LazyLock::new(|| {
@@ -91,7 +92,9 @@ pub fn prepare_response_items(items: &mut [ResponseItem]) {
 
 fn prepare_message_content(items: &mut [ContentItem]) {
     for item in items {
-        if let ContentItem::InputAudio { audio_url } = item
+        if let ContentItem::InputAudio {
+            audio: AudioReference::Inline { audio_url },
+        } = item
             && let Err(error) = prepare_audio(audio_url)
         {
             warn!(%error, "failed to prepare message audio");
@@ -144,20 +147,38 @@ fn canonical_audio_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// Budget one file reference at the inline audio rate. Missing or unusable metadata
+/// reserves the full 20 minutes accepted by Responses. Admission belongs to Responses.
+pub fn estimate_file_audio_tokens(duration: Option<std::time::Duration>) -> usize {
+    const MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+    let duration = duration
+        .filter(|value| !value.is_zero())
+        .unwrap_or(MAX_DURATION)
+        .min(MAX_DURATION);
+    let tokens =
+        (duration.as_nanos() * u128::from(AUDIO_TOKENS_PER_SECOND)).div_ceil(1_000_000_000);
+    usize::try_from(tokens).unwrap_or(usize::MAX)
+}
+
 /// Estimates audio tokens from decoded duration, falling back to the data URL size.
 pub fn estimate_audio_token_count(audio_url: &str) -> usize {
     let key = sha1_digest(audio_url.as_bytes());
-    AUDIO_TOKEN_ESTIMATE_CACHE.get_or_init(key, || {
-        let Some(duration_seconds) = audio_duration_seconds(audio_url) else {
-            return approx_token_count(audio_url);
-        };
-        let token_count = (duration_seconds * AUDIO_TOKENS_PER_SECOND).ceil();
-        if token_count >= usize::MAX as f64 {
-            usize::MAX
-        } else {
-            token_count as usize
-        }
-    })
+    AUDIO_TOKEN_ESTIMATE_CACHE
+        .get_or_init(key, || estimate_audio_token_count_without_cache(audio_url))
+}
+
+/// The same duration-based estimate without accessing the Tokio-dependent cache.
+/// Suitable for bounded output rendered on a current-thread runtime.
+pub fn estimate_audio_token_count_without_cache(audio_url: &str) -> usize {
+    let Some(duration_seconds) = audio_duration_seconds(audio_url) else {
+        return approx_token_count(audio_url);
+    };
+    let token_count = (duration_seconds * f64::from(AUDIO_TOKENS_PER_SECOND)).ceil();
+    if token_count >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        token_count as usize
+    }
 }
 
 fn audio_duration_seconds(audio_url: &str) -> Option<f64> {

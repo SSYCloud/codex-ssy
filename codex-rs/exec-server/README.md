@@ -1,18 +1,44 @@
 # codex-exec-server
 
-`codex-exec-server` is the library backing `codex exec-server`, a small
+`codex-exec-server` is the library backing `codex exec-server` and the standalone
+`codex-exec-server` executable, a small
 JSON-RPC server for spawning and controlling subprocesses through
 `codex-utils-pty`.
 
 It provides:
 
-- a CLI entrypoint: `codex exec-server`
+- CLI entrypoints: `codex exec-server` and `codex-exec-server`
 - a Rust client: `ExecServerClient`
 - a small protocol module with shared request/response types
 
 This crate owns the transport, protocol, and filesystem/process handlers. The
-top-level `codex` binary owns hidden helper dispatch for sandboxed
-filesystem operations and `codex-linux-sandbox`.
+`codex-exec-server-cli` crate shares startup between the two executables. Both
+use `codex-arg0` for hidden filesystem, process, and platform sandbox dispatch.
+The standalone executable accepts the same executor arguments and `-c` config
+overrides, including `--listen stdio`. Build it with
+`cargo build -p codex-exec-server-cli --bin codex-exec-server`.
+Canonical packages place it in `bin/` beside the entrypoint, with platform
+sandbox resources in `codex-resources/`.
+
+## Command metadata
+
+Launches expose `metadata.threadId` as `CODEX_THREAD_ID` and `metadata.toolCallId`
+as `CODEX_TOOL_CALL_ID` in the initial child environment. `exec_command` supplies
+the originating execution call ID, unchanged by later input. Code-mode uses the
+nested execution call ID, not the outer cell ID.
+
+These reserved labels override inherited values, policy settings, overlays, and
+cached snapshots. Present metadata clears omitted fields; absent metadata preserves
+thread-only context and unsets the call ID. Snapshot capture and validation helpers
+keep available thread context but omit the call ID; newly captured snapshots exclude
+both ID exports.
+Call IDs are copied unchanged, including empty values; NUL-containing IDs are
+omitted. Platform process-environment size limits apply.
+
+Labels support correlation, not authorization. Shell startup, commands, and
+descendants can change or remove them; consumers must handle missing or unusable
+labels. These guarantees require an updated executor: older executors may ignore
+metadata or restore stale snapshot values.
 
 ## Transport
 
@@ -37,6 +63,12 @@ Tokens require `wss://` or a loopback destination, are redacted in diagnostics, 
 
 Remote mode registers the local exec-server with the environment registry,
 then reconnects to the service-provided rendezvous websocket as the environment.
+To supply registration credentials independently of Codex login, pass
+`--registration-bearer-stdin` and write one newline-terminated bearer to the
+executor's stdin. Exec-server reads it once and requires an HTTPS registry URL
+or an HTTP loopback address. For rotating credentials, use
+`--executor-credential-stdin`. Local configuration
+and plugins still come from the usual Codex home.
 Remote communication uses the Noise relay contract; the registry and harness
 must support it.
 Forward mode uses the same registration and Noise relay, but opens an independent

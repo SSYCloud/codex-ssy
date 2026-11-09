@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_core::RecoverTurnRequest;
 use codex_core::StartIfIdleSubmission;
+use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
 use codex_core::TurnInputSubmission;
 use codex_core::TurnStartOptions;
@@ -12,6 +13,10 @@ use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutRecorder;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
+use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::responses;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
@@ -27,35 +32,64 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[test_case(false; "user_input")]
+#[test_case(true; "standalone_tool_output")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -> Result<()> {
+async fn recover_turn_restores_start_options_without_making_them_sticky(
+    standalone_tool_output: bool,
+) -> Result<()> {
     // Keep sampling pending until interruption so restart must reload the unfinished turn.
     let (release_response, response_gate) = oneshot::channel();
-    let (initial_server, _completions) =
-        start_streaming_sse_server(vec![vec![StreamingSseChunk {
+    let (initial_server, _completions) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse_completed("seed"),
+        }],
+        vec![StreamingSseChunk {
             gate: Some(response_gate),
             body: responses::sse(vec![responses::ev_completed("resp-initial")]),
-        }]])
-        .await;
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let initial = builder.build_with_streaming_server(&initial_server).await?;
+        }],
+    ])
+    .await;
+    let server = responses::start_mock_server().await;
+    let apps = AppsTestServer::mount_searchable(&server).await?;
+    let builder = || {
+        search_capable_apps_builder(apps.chatgpt_base_url.clone()).with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeModeOnly)
+                .expect("enable code mode only");
+            config.code_mode.direct_only_tool_namespaces =
+                vec![SEARCH_CALENDAR_NAMESPACE.to_owned()];
+        })
+    };
+    let initial = builder()
+        .build_with_streaming_server(&initial_server)
+        .await?;
+    initial.submit_text_turn("seed user turn").await?;
+    let request = if standalone_tool_output {
+        TurnInputRequest::new(TurnInput::ResponseItem(serde_json::from_value(json!({
+            "type": "function_call_output", "name": "result", "namespace": "example",
+            "output": "recover this tool output",
+        }))?))
+    } else {
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "recover this turn".to_owned(),
+            text_elements: Vec::new(),
+        }])
+    };
     let TurnInputSubmission::Started { turn_id, .. } = initial
         .codex
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "recover this turn".to_owned(),
-                text_elements: Vec::new(),
-            }])
-            .on_start(TurnStartOptions {
-                cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
-                ..Default::default()
-            }),
-        )
+        .start_or_steer_turn(request.on_start(TurnStartOptions {
+            direct_only_tool_namespaces: Some(Vec::new()),
+            cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
+            ..Default::default()
+        }))
         .await?
     else {
         panic!("expected a new turn");
     };
-    initial_server.wait_for_request_count(/*count*/ 1).await;
+    initial_server.wait_for_request_count(/*count*/ 2).await;
     initial.codex.submit(Op::Interrupt).await?;
     wait_for_event(&initial.codex, |event| {
         matches!(event, EventMsg::TurnAborted(_))
@@ -65,8 +99,7 @@ async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -
     initial_server.shutdown().await;
     initial.codex.flush_rollout().await?;
 
-    let server = responses::start_mock_server().await;
-    let test = builder.restart(&server, &initial).await?;
+    let test = builder().restart(&server, &initial).await?;
     let (rollout, _, _) = RolloutRecorder::load_rollout_items(
         &test
             .codex
@@ -91,6 +124,11 @@ async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -
         Some(CyberAccessProgram::DaybreakBlue)
     );
 
+    assert_eq!(
+        persisted_context.direct_only_tool_namespaces,
+        Some(Vec::new())
+    );
+
     let response_mock =
         responses::mount_sse_once(&server, responses::sse_completed("resp-1")).await;
     let submission = test
@@ -99,6 +137,7 @@ async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -
             turn_id: turn_id.clone(),
             thread_settings: Default::default(),
             trace: None,
+            prompt_cache_ttl: None,
             cyber_access_program: persisted_context.cyber_access_program,
         })
         .await?;
@@ -117,15 +156,33 @@ async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -
         response_mock.single_request().body_json()["access_programs"],
         json!({"cyber": "daybreak_blue"})
     );
-    assert_eq!(
-        response_mock
-            .single_request()
+    let recovered_request = response_mock.single_request();
+    let recovered_input_count = if standalone_tool_output {
+        recovered_request
+            .inputs_of_type("function_call_output")
+            .iter()
+            .filter(|item| item["name"] == "result")
+            .count()
+    } else {
+        recovered_request
             .message_input_texts("user")
-            .into_iter()
-            .filter(|text| text == "recover this turn")
-            .count(),
-        1
-    );
+            .iter()
+            .filter(|text| text.as_str() == "recover this turn")
+            .count()
+    };
+    assert_eq!(recovered_input_count, 1);
+
+    let declares_calendar = |body: &serde_json::Value| {
+        responses::namespace_child_tool(
+            body,
+            SEARCH_CALENDAR_NAMESPACE,
+            SEARCH_CALENDAR_CREATE_TOOL,
+        )
+        .is_some()
+    };
+    assert!(!declares_calendar(
+        &response_mock.single_request().body_json()
+    ));
 
     let next_response = responses::mount_sse_once(
         &server,
@@ -157,17 +214,30 @@ async fn recover_turn_restores_cyber_access_program_without_making_it_sticky() -
             .get("access_programs"),
         None
     );
+    assert!(declares_calendar(
+        &next_response.single_request().body_json()
+    ));
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 
+#[test_case(None; "omitted")]
+#[test_case(Some(false); "disabled")]
+#[test_case(Some(true); "enabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cyber_access_program_omits_spoofed_custom_providers() -> Result<()> {
+async fn cyber_access_program_custom_provider_requires_capability(
+    capability: Option<bool>,
+) -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     for auth in [
         CodexAuth::from_api_key("test-key"),
         CodexAuth::create_dummy_chatgpt_auth_for_testing(),
     ] {
+        let expected_authorization = if auth.is_api_key_auth() {
+            "Bearer test-key"
+        } else {
+            "Bearer Access Token"
+        };
         let server = responses::start_mock_server().await;
         let request = responses::mount_sse_once(
             &server,
@@ -176,26 +246,85 @@ async fn cyber_access_program_omits_spoofed_custom_providers() -> Result<()> {
         .await;
         let test = test_codex()
             .with_auth(auth)
-            .with_config(|config| {
+            .with_config(move |config| {
                 // Keep the display name "OpenAI": provider identity must not use it.
                 config.model_provider_id = "custom".to_owned();
+                config.model_provider.capabilities =
+                    Some(codex_model_provider_info::ModelProviderCapabilities {
+                        cyber_access_programs: capability,
+                        ..Default::default()
+                    });
+                config
+                    .features
+                    .enable(Feature::ApiKeyCyberAccessPrograms)
+                    .expect("enable API-key Cyber access programs");
             })
             .build_with_auto_env(&server)
             .await?;
         submit(&test, Some(CyberAccessProgram::DaybreakRed)).await?;
         assert_eq!(
-            request.single_request().body_json().get("access_programs"),
-            None
+            request.single_request().header("authorization").as_deref(),
+            Some(expected_authorization)
+        );
+        assert_eq!(
+            request
+                .single_request()
+                .body_json()
+                .get("access_programs")
+                .cloned(),
+            (capability == Some(true)).then(|| json!({"cyber": "daybreak_red"}))
         );
     }
     Ok(())
 }
 
-#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(); "chatgpt")]
-#[test_case(CodexAuth::from_api_key("test-api-key"); "api_key")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cyber_access_program_custom_provider_preserves_api_key_feature_gate() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_auth(CodexAuth::from_api_key("test-api-key"))
+        .with_config(|config| {
+            config.model_provider_id = "proxy".to_owned();
+            config.model_provider.capabilities =
+                Some(codex_model_provider_info::ModelProviderCapabilities {
+                    cyber_access_programs: Some(true),
+                    ..Default::default()
+                });
+            config
+                .features
+                .disable(Feature::ApiKeyCyberAccessPrograms)
+                .unwrap();
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let error = submit(&test, Some(CyberAccessProgram::DaybreakBlue))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cyber access programs are disabled for this API-key session.")
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().ends_with("/responses"))
+    );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "openai"; "chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), "openai"; "api_key")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "proxy"; "custom_chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), "proxy"; "custom_api_key")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cyber_access_program_survives_mid_turn_remote_compaction_v2(
     auth: CodexAuth,
+    provider_id: &'static str,
 ) -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
@@ -224,7 +353,15 @@ async fn cyber_access_program_survives_mid_turn_remote_compaction_v2(
     .await;
     let test = test_codex()
         .with_auth(auth)
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.model_provider_id = provider_id.to_owned();
+            if provider_id == "proxy" {
+                config.model_provider.capabilities =
+                    Some(codex_model_provider_info::ModelProviderCapabilities {
+                        cyber_access_programs: Some(true),
+                        ..Default::default()
+                    });
+            }
             config.model_auto_compact_token_limit = Some(200);
             config
                 .features
@@ -408,11 +545,14 @@ async fn cyber_access_program_is_inherited_by_child_turns() -> Result<()> {
     Ok(())
 }
 
-#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(); "chatgpt")]
-#[test_case(CodexAuth::from_api_key("test-api-key"); "api_key")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "openai"; "chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), "openai"; "api_key")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "proxy"; "custom_chatgpt")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), "proxy"; "custom_api_key")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cyber_access_program_changes_on_one_websocket_with_response_reuse(
     auth: CodexAuth,
+    provider_id: &'static str,
 ) -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let response_ids = [
@@ -427,7 +567,15 @@ async fn cyber_access_program_changes_on_one_websocket_with_response_reuse(
     .await;
     let test = test_codex()
         .with_auth(auth)
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.model_provider_id = provider_id.to_owned();
+            if provider_id == "proxy" {
+                config.model_provider.capabilities =
+                    Some(codex_model_provider_info::ModelProviderCapabilities {
+                        cyber_access_programs: Some(true),
+                        ..Default::default()
+                    });
+            }
             config
                 .features
                 .enable(Feature::ApiKeyModelDiscovery)

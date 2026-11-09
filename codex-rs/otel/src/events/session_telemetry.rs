@@ -27,6 +27,8 @@ use crate::metrics::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::TOOL_CALL_DURATION_METRIC;
 use crate::metrics::TURN_COST_MICROUSD_METRIC;
 use crate::metrics::TURN_TTFT_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_CONNECT_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_CONNECT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_REQUEST_COUNT_METRIC;
@@ -38,7 +40,6 @@ use crate::sanitize_metric_tag_value;
 use crate::tool_result::ToolResultEvent;
 use crate::tool_result::emit_tool_result;
 use codex_api::AgentIdentityTelemetry;
-use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -120,6 +121,7 @@ pub struct SessionTelemetryMetadata {
 #[derive(Debug, Clone)]
 pub struct SessionTelemetry {
     tool_result_log_config: ToolResultLogConfig,
+    log_sse_deltas: bool,
     pub(crate) metadata: SessionTelemetryMetadata,
     pub(crate) metrics: Option<MetricsClient>,
     pub(crate) metrics_use_metadata_tags: bool,
@@ -142,6 +144,12 @@ pub fn bounded_product_sku(product_sku: Option<&str>) -> Option<&'static str> {
 }
 
 impl SessionTelemetry {
+    /// Suppress successful SSE delta logs while retaining errors and all metrics.
+    pub fn without_sse_delta_logs(mut self) -> Self {
+        self.log_sse_deltas = false;
+        self
+    }
+
     pub fn with_tool_result_log_config(mut self, config: ToolResultLogConfig) -> Self {
         self.tool_result_log_config = config;
         self
@@ -609,6 +617,7 @@ impl SessionTelemetry {
             });
         Self {
             tool_result_log_config: ToolResultLogConfig::default(),
+            log_sse_deltas: true,
             metadata: SessionTelemetryMetadata {
                 conversation_id,
                 agent_name,
@@ -686,11 +695,17 @@ impl SessionTelemetry {
         approval_policy: AskForApproval,
         sandbox_policy: SandboxPolicy,
         mcp_servers: Vec<&str>,
+        legacy_multi_agent_disabled_sources: &[&str],
     ) {
         log_and_trace_event!(
             self,
             common: {
                 event.name = "codex.conversation_starts",
+                config.legacy_multi_agent_disabled_sources = if legacy_multi_agent_disabled_sources.is_empty() {
+                    "none".to_string()
+                } else {
+                    legacy_multi_agent_disabled_sources.join(",")
+                },
                 provider_name = %provider_name,
                 auth.env_openai_api_key_present = self.metadata.auth_env.openai_api_key_env_present,
                 auth.env_codex_api_key_present = self.metadata.auth_env.codex_api_key_env_present,
@@ -826,7 +841,7 @@ impl SessionTelemetry {
         recovery_mode: Option<&str>,
         recovery_phase: Option<&str>,
         endpoint: &str,
-        connection_reused: bool,
+        reauth: bool,
         request_id: Option<&str>,
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
@@ -838,6 +853,15 @@ impl SessionTelemetry {
                 .map(|code| (200..=299).contains(&code))
                 .unwrap_or(true);
         let success_str = if success { "true" } else { "false" };
+        let mut tags = vec![
+            ("success", success_str),
+            ("reauth", if reauth { "true" } else { "false" }),
+        ];
+        if let Some(product_sku) = self.metadata.product_sku {
+            tags.push(("product_sku", product_sku));
+        }
+        self.counter(WEBSOCKET_CONNECT_COUNT_METRIC, /*inc*/ 1, &tags);
+        self.record_duration(WEBSOCKET_CONNECT_DURATION_METRIC, duration, &tags);
         log_and_trace_event!(
             self,
             common: {
@@ -858,7 +882,8 @@ impl SessionTelemetry {
                 auth.env_provider_key_name = self.metadata.auth_env.provider_env_key_name.as_deref(),
                 auth.env_provider_key_present = self.metadata.auth_env.provider_env_key_present,
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
-                auth.connection_reused = connection_reused,
+                auth.connection_reused = false,
+                auth.reauth = reauth,
                 auth.request_id = request_id,
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
@@ -943,62 +968,52 @@ impl SessionTelemetry {
         );
     }
 
-    pub fn record_websocket_event(
+    pub fn record_websocket_receive_failure(&self, duration: Duration) {
+        self.record_websocket_event_metrics(
+            WEBSOCKET_UNKNOWN_KIND,
+            /*success*/ false,
+            duration,
+        );
+    }
+
+    /// Records the transport's decoded event kind. Timing events also carry metric values.
+    pub fn record_websocket_text_event(
         &self,
-        result: &Result<
-            Option<
-                Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
-                >,
-            >,
-            ApiError,
-        >,
+        text: &str,
+        parsed_kind: Option<&str>,
         duration: Duration,
     ) {
-        let mut kind = None;
-        let mut success = true;
-
-        match result {
-            Ok(Some(Ok(message))) => match message {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    match serde_json::from_str::<serde_json::Value>(text) {
-                        Ok(value) => {
-                            kind = value
-                                .get("type")
-                                .and_then(|value| value.as_str())
-                                .map(std::string::ToString::to_string);
-                            if kind.as_deref() == Some(RESPONSES_WEBSOCKET_TIMING_KIND) {
-                                self.record_responses_websocket_timing_metrics(&value);
-                            }
-                            if kind.as_deref() == Some("response.failed") {
-                                success = false;
-                            }
-                        }
-                        Err(_) => {
-                            kind = Some("parse_error".to_string());
-                            success = false;
-                        }
+        let value;
+        let kind = match parsed_kind {
+            Some(kind) if kind != RESPONSES_WEBSOCKET_TIMING_KIND => kind,
+            _ => {
+                // Valid JSON with an unknown or malformed stream shape still contributes its kind.
+                value = match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return self.record_websocket_event_metrics(
+                            "parse_error",
+                            /*success*/ false,
+                            duration,
+                        );
                     }
+                };
+                let kind = value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(WEBSOCKET_UNKNOWN_KIND);
+                if kind == RESPONSES_WEBSOCKET_TIMING_KIND {
+                    self.record_responses_websocket_timing_metrics(&value);
                 }
-                tokio_tungstenite::tungstenite::Message::Ping(_)
-                | tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                    return;
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(_)
-                | tokio_tungstenite::tungstenite::Message::Close(_)
-                | tokio_tungstenite::tungstenite::Message::Frame(_) => {
-                    success = false;
-                }
-            },
-            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
-                success = false;
+                kind
             }
-        }
+        };
+        self.record_websocket_event_metrics(kind, kind != "response.failed", duration);
+    }
 
-        let kind_str = kind.as_deref().unwrap_or(WEBSOCKET_UNKNOWN_KIND);
+    fn record_websocket_event_metrics(&self, kind: &str, success: bool, duration: Duration) {
         let success_str = if success { "true" } else { "false" };
-        let tags = [("kind", kind_str), ("success", success_str)];
+        let tags = [("kind", kind), ("success", success_str)];
         self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
         self.record_duration(WEBSOCKET_EVENT_DURATION_METRIC, duration, &tags);
     }
@@ -1065,6 +1080,9 @@ impl SessionTelemetry {
             duration,
             &[("kind", kind), ("success", "true")],
         );
+        if !self.log_sse_deltas && kind.ends_with(".delta") {
+            return;
+        }
         log_event!(
             self,
             event.name = "codex.sse_event",
@@ -1409,6 +1427,7 @@ impl SessionTelemetry {
             ResponseEvent::ServerModel(_) => "server_model".into(),
             ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
             ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
+            ResponseEvent::GuardianAssessment(_) => "guardian_assessment".into(),
             ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),

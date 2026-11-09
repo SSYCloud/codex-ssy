@@ -11,6 +11,45 @@ fn map_api_error_maps_server_overloaded() {
     assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
 }
 
+#[tokio::test(start_paused = true)]
+async fn http_policy_capacity_preserves_retry_advice_and_terminal_behavior() {
+    use std::time::Duration;
+    for (code, expected) in [
+        (
+            "policy_capacity_unavailable",
+            CodexErrorInfo::PolicyCapacityUnavailable,
+        ),
+        ("server_is_overloaded", CodexErrorInfo::ServerOverloaded),
+    ] {
+        for advice in [RetryAfter::from_delay(Duration::from_secs(3)), None] {
+            let error = map_api_error(ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::SERVICE_UNAVAILABLE,
+                url: None,
+                headers: None,
+                body: Some(
+                    serde_json::json!({"error": {
+                        "code": code, "type": "service_unavailable_error",
+                    }})
+                    .to_string(),
+                ),
+                retry_after: advice,
+            }));
+            assert_eq!(
+                (
+                    error.to_codex_protocol_error(),
+                    error.retry_after(),
+                    error.retry_delay(/*retry_count*/ 1)
+                ),
+                (
+                    expected.clone(),
+                    advice,
+                    advice.map(|_| Duration::from_secs(3))
+                )
+            );
+        }
+    }
+}
+
 #[test]
 fn map_api_error_preserves_content_filter_retry_and_public_error() {
     let err = map_api_error(ApiError::ContentFilter);
@@ -125,31 +164,55 @@ async fn http_retry_deadline_survives_mapping_and_respects_terminal_errors() {
 }
 
 #[test]
-fn map_api_error_distinguishes_capacity_from_slow_down() {
-    for (code, expected, retryable) in [
+fn map_http_error_classifies_provider_codes() {
+    use CodexErrorInfo::ModelNotFound;
+
+    for (status, code, expected, retryable) in [
         (
+            503,
             "server_is_overloaded",
             CodexErrorInfo::ServerOverloaded,
             false,
         ),
-        ("slow_down", CodexErrorInfo::RateLimitExceeded, true),
+        (503, "slow_down", CodexErrorInfo::RateLimitExceeded, true),
         (
+            503,
             "unknown_error",
             CodexErrorInfo::HttpConnectionFailed {
                 http_status_code: Some(503),
             },
             true,
         ),
+        (400, "model_not_found", ModelNotFound, false),
+        (
+            400,
+            "budget_reached",
+            CodexErrorInfo::SessionBudgetExceeded,
+            false,
+        ),
+        (403, "model_not_found", ModelNotFound, false),
+        (404, "model_not_found", ModelNotFound, false),
+        (
+            404,
+            "resource_not_found",
+            CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: Some(404),
+            },
+            true,
+        ),
     ] {
         let err = map_api_error(ApiError::Transport(TransportError::Http {
             retry_after: None,
-            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            status: http::StatusCode::from_u16(status).unwrap(),
             url: None,
             headers: None,
             body: Some(
                 serde_json::json!({"error": {"code": code, "message": "retry later"}}).to_string(),
             ),
         }));
+        if expected == ModelNotFound {
+            assert_eq!(err.http_status_code_value(), Some(status));
+        }
         assert_eq!(
             (
                 err.to_codex_protocol_error(),
@@ -775,4 +838,58 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
         Some("missing_authorization_header")
     );
     assert_eq!(err.identity_error_code.as_deref(), Some("token_expired"));
+}
+
+#[test]
+fn runtime_auth_denials_stop_retries_without_losing_http_diagnostics() {
+    for (status, code, retryable) in [
+        (403, "runtime_assertion_invalid", false),
+        (403, "runtime_instance_paused", false),
+        (403, "runtime_instance_revoked", false),
+        (401, "invalid_agent_instance_assertion", false),
+        (503, "runtime_verification_unavailable", true),
+        (503, "agent_instance_authentication_unavailable", true),
+        (401, "token_expired", true),
+        (403, "ordinary_policy_denial", true),
+    ] {
+        for in_header in [false, true] {
+            let status = http::StatusCode::from_u16(status).unwrap();
+            let details = serde_json::json!({"error": {"code": code}}).to_string();
+            let mut headers = http::HeaderMap::from_iter([(
+                "x-request-id".parse().unwrap(),
+                "request-runtime".parse().unwrap(),
+            )]);
+            let body = if in_header {
+                headers.insert(
+                    X_ERROR_JSON_HEADER,
+                    base64::engine::general_purpose::STANDARD
+                        .encode(details)
+                        .parse()
+                        .unwrap(),
+                );
+                r#"{"detail":"Unauthorized"}"#.to_owned()
+            } else {
+                details
+            };
+            let error = map_api_error(ApiError::Transport(TransportError::Http {
+                status,
+                retry_after: None,
+                url: Some("https://api.openai.com/v1/responses".into()),
+                headers: Some(headers),
+                body: Some(body.clone()),
+            }));
+            assert_eq!(
+                error.retry_delay(/*retry_count*/ 1).is_some(),
+                retryable,
+                "{code}, in_header={in_header}"
+            );
+            let CodexErrorDetails::UnexpectedStatus(details) = error.details() else {
+                panic!("missing HTTP diagnostics: {error:?}");
+            };
+            assert_eq!(
+                (&details.body, details.status, details.request_id.as_deref()),
+                (&body, status, Some("request-runtime"))
+            );
+        }
+    }
 }

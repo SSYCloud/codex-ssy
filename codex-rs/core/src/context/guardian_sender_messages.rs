@@ -3,8 +3,11 @@
 
 use super::ContextualUserFragment;
 use codex_guardian_context::GuardianRootMessage;
+pub(crate) use codex_guardian_reviewer::GuardianSenderExchange;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// A bounded fragment rendered once at admission and never added to the worker prompt.
 pub(crate) struct GuardianSenderMessages {
@@ -12,12 +15,6 @@ pub(crate) struct GuardianSenderMessages {
     pub delivery: String,
     pub from_storage: bool,
     pub messages: Vec<GuardianSenderExchange>,
-}
-
-/// Recorded adjacency provides context, not a verified question/answer association.
-pub(crate) struct GuardianSenderExchange {
-    pub user: Option<String>,
-    pub assistant: Option<GuardianRootMessage>,
 }
 
 impl ContextualUserFragment for GuardianSenderMessages {
@@ -40,7 +37,7 @@ impl ContextualUserFragment for GuardianSenderMessages {
         )
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let source = self
             .source
             .map(|id| id.to_string())
@@ -76,6 +73,6 @@ impl ContextualUserFragment for GuardianSenderMessages {
         if assistant_omitted {
             text.push_str(&GuardianRootMessage::IncompleteAssistantContext.render());
         }
-        text
+        input_text(text)
     }
 }

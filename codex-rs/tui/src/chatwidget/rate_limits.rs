@@ -164,7 +164,10 @@ pub(super) fn app_server_rate_limit_error_kind(
     info: &AppServerCodexErrorInfo,
 ) -> Option<RateLimitErrorKind> {
     match info {
-        AppServerCodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
+        AppServerCodexErrorInfo::ServerOverloaded
+        | AppServerCodexErrorInfo::PolicyCapacityUnavailable => {
+            Some(RateLimitErrorKind::ServerOverloaded)
+        }
         AppServerCodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
         AppServerCodexErrorInfo::ResponseTooManyFailedAttempts {
             http_status_code: Some(429),
@@ -390,7 +393,7 @@ impl ChatWidget {
 
             if !warnings.is_empty() {
                 for warning in warnings {
-                    self.add_to_history(history_cell::new_usage_warning_event(warning));
+                    self.add_to_history(history_cell::new_visible_warning_event(warning));
                 }
                 self.request_redraw();
             }

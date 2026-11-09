@@ -556,6 +556,22 @@ fn windows_sandbox_backend_honors_unelevated_configuration() {
     ));
 }
 
+fn unsupported_windows_restricted_token_sandbox_reason(
+    sandbox: SandboxType,
+    permission_profile: &PermissionProfile,
+    sandbox_policy_cwd: &AbsolutePathBuf,
+    windows_sandbox_level: WindowsSandboxLevel,
+) -> Option<String> {
+    WindowsSandboxFilesystemOverrides::resolve(
+        sandbox,
+        permission_profile,
+        sandbox_policy_cwd,
+        windows_sandbox_level,
+        &HashMap::new(),
+    )
+    .err()
+}
+
 #[test]
 fn windows_restricted_token_rejects_network_only_restrictions() {
     let permission_profile = PermissionProfile::from_runtime_permissions(
@@ -1526,16 +1542,26 @@ while :; do sleep 1; done"#
     );
     let cancel_token = CancellationToken::new();
     let cancel_tx = cancel_token.clone();
-    tokio::spawn(async move {
-        for _ in 0..50 {
-            if ready_marker.exists() {
-                cancel_tx.cancel();
-                return;
-            }
+    let clock_paused = std::cell::Cell::new(false);
+    let cancel_when_ready = async {
+        while !ready_marker.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Exercise the TERM trap without requiring the OS to schedule the shell
+        // within the production grace period. Keep this future runnable so the
+        // paused clock cannot auto-advance while the real process handles TERM.
+        tokio::time::pause();
+        clock_paused.set(true);
         cancel_tx.cancel();
-    });
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            std::fs::read_to_string(&cleanup_marker).as_deref(),
+            Ok("cleaned")
+        ) && std::time::Instant::now() < cleanup_deadline
+        {
+            tokio::task::yield_now().await;
+        }
+    };
     let params = ExecParams {
         command,
         cwd: cwd.clone(),
@@ -1550,8 +1576,7 @@ while :; do sleep 1; done"#
         arg0: None,
     };
 
-    let result = timeout(
-        Duration::from_secs(5),
+    let execution = async {
         process_exec_tool_call(
             params,
             &PermissionProfile::Disabled,
@@ -1561,10 +1586,25 @@ while :; do sleep 1; done"#
             /*codex_self_exe*/ &None,
             /*use_legacy_landlock*/ false,
             /*stdout_stream*/ None,
-        ),
-    )
-    .await
-    .expect("cancellation should stop the process promptly");
+        )
+        .await
+    };
+    tokio::pin!(execution);
+    let result = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut execution => result,
+            () = cancel_when_ready => (&mut execution).await,
+        }
+    })
+    .await;
+    if clock_paused.get() {
+        tokio::time::resume();
+    }
+    if result.is_err() {
+        cancel_tx.cancel();
+        let _ = execution.await;
+    }
+    let result = result.expect("cancellation should stop the process promptly");
     let output = result.expect("cancellation should return a non-timeout exec result");
     assert!(!output.timed_out);
     assert_eq!(

@@ -1,6 +1,9 @@
 //! Persistent status survives transient footer modes and suggestion overlays.
 
 use super::*;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::osc8_hyperlink;
+use crate::terminal_hyperlinks::strip_osc8;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -14,8 +17,300 @@ fn composer() -> ChatComposer {
         /*disable_paste_burst*/ true,
     );
     composer.set_status_line_enabled(/*enabled*/ true);
-    composer.set_status_line(Some(Line::from("MODEL · ~/project · Context 20% used")));
+    composer.set_status_line(Some(
+        Line::from("MODEL · ~/project · Context 20% used").into(),
+    ));
     composer
+}
+
+#[test]
+fn extension_status_line_clips_links_to_footer_layout() {
+    let mut composer = composer();
+    let tree: crate::ui_tree::UiTree = r#"{
+        "type": "row", "props": {"gap": 1}, "children": [
+            "plain",
+            { "type": "row", "props": {"gap": 1}, "children": [
+                "·",
+                { "type": "link", "props": { "href": "https://example.com/pr/42" }, "children": [
+                    "PR #42"
+                ] }
+            ] }
+        ]
+    }"#
+    .parse()
+    .unwrap();
+    composer.set_status_line(Some(FooterContent::from(tree)));
+
+    for separate_status_line in [false, true] {
+        for width in [12, 40] {
+            let options = composer.resolve_render_options(ComposerRenderOptions {
+                separate_status_line,
+                ..ComposerRenderOptions::default()
+            });
+            let area = Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                width,
+                composer.desired_height_with_options(width, options),
+            );
+            let mut buffer = Buffer::empty(area);
+            composer.render_with_options(area, &mut buffer, /*mask_char*/ None, options);
+            let linked = buffer
+                .content
+                .iter()
+                .filter(|cell| cell.symbol().contains("https://example.com/pr/42"))
+                .collect::<Vec<_>>();
+            let linked_text: String = linked
+                .iter()
+                .map(|cell| strip_osc8(cell.symbol()))
+                .collect();
+            assert_eq!(
+                linked_text,
+                if width == 12 { "PR#" } else { "PR #42" },
+                "{buffer:?}"
+            );
+            assert!(linked.iter().all(|cell| !cell.symbol().contains('…')));
+            assert!(buffer.content.iter().any(|cell| cell.symbol() == "p"));
+        }
+    }
+
+    composer.set_active_agent_label(Some("bot".to_string()));
+    let (output, _) = render(&composer, /*width*/ 40, /*footer*/ None);
+    assert!(output.contains("plain"), "{output}");
+    assert!(!output.contains("bot"), "{output}");
+}
+
+fn status_rows(
+    composer: &ChatComposer,
+    area: Rect,
+    options: ComposerRenderOptions<'_>,
+) -> Vec<String> {
+    let layout = composer.layout_with_options(area, options);
+    let status = if options.separate_status_line {
+        layout.status
+    } else {
+        layout.footer
+    };
+    let mut buf = Buffer::empty(area);
+    composer.render_with_options(area, &mut buf, /*mask_char*/ None, options);
+    (status.y..status.bottom())
+        .map(|y| {
+            (status.x..status.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn extension_layout_uses_the_width_left_by_the_mode_indicator_after_resize() {
+    let mut composer = composer();
+    composer.footer.show_warnings_key = None;
+    let tree: crate::ui_tree::UiTree =
+        r#"{"type":"row","props":{"wrap":"wrap","gap":1},"children":[
+        "Ready", {"type":"row","props":{"gap":1},"children":["PR",
+        {"type":"link","props":{"href":"https://example.com/pr/12345"},"children":["12345"]}]}]}"#
+            .parse()
+            .unwrap();
+    composer.set_status_line(Some(FooterContent::from(tree)));
+    composer.set_collaboration_modes_enabled(/*enabled*/ true);
+    let linked_number: String = "12345"
+        .chars()
+        .map(|digit| osc8_hyperlink("https://example.com/pr/12345", &digit.to_string()))
+        .collect();
+    let [shared, separate] = [false, true].map(|separate_status_line| {
+        let mut frames = Vec::new();
+        for (width, mode, warning_count) in [
+            (16, None, 0),
+            (15, None, 0),
+            (16, None, 0),
+            (25, Some(CollaborationModeIndicator::Plan), 0),
+            (19, None, 1),
+        ] {
+            composer.set_collaboration_mode_indicator(mode);
+            let options = ComposerRenderOptions {
+                separate_status_line,
+                warning_count,
+                ..Default::default()
+            };
+            let height = composer.desired_height_with_options(width, options);
+            let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
+            let rows = status_rows(&composer, area, options);
+            for row in &rows {
+                let text = strip_osc8(row);
+                assert_eq!(*row, text.replace("12345", &linked_number));
+                if warning_count == 0 {
+                    frames.push(format!("{width} | {text}"));
+                }
+            }
+            if warning_count > 0 {
+                assert_eq!(
+                    composer.footer.warning_notice_area.get().unwrap().bottom(),
+                    height
+                );
+                assert_eq!(rows.len(), if separate_status_line { 1 } else { 2 });
+                let last = strip_osc8(rows.last().unwrap());
+                assert!(last.contains("PR 12345"));
+                assert_eq!(last.contains("⚠ 1"), !separate_status_line);
+            }
+        }
+        frames.join("\n")
+    });
+    assert_eq!(shared, separate);
+    insta::assert_snapshot!(shared);
+}
+
+#[test]
+fn status_rows_yield_to_the_composer_and_shared_footer_overrides() {
+    let mut composer = composer();
+    let tree: crate::ui_tree::UiTree = r#""one\ntwo\nthree\nfour\nfive""#.parse().unwrap();
+    composer.set_status_line(Some(FooterContent::from(tree)));
+    composer.set_text_content("a\nb\nc".into(), Vec::new(), Vec::new());
+    for separate_status_line in [false, true] {
+        let options = ComposerRenderOptions {
+            separate_status_line,
+            ..Default::default()
+        };
+        let short = if separate_status_line {
+            "one…"
+        } else {
+            "one\ntwo…"
+        };
+        for (height, expected) in [(12, "one\ntwo\nthree\nfour…"), (7, short)] {
+            let area = Rect::new(/*x*/ 0, /*y*/ 0, /*width*/ 7, height);
+            assert_eq!(status_rows(&composer, area, options).join("\n"), expected);
+            let input = composer.layout_with_options(area, options).textarea;
+            let mut buffer = Buffer::empty(area);
+            composer.render_with_options(area, &mut buffer, /*mask_char*/ None, options);
+            assert!(input.height >= 3);
+            let draft = [0, 1, 2].map(|dy| buffer[(input.x, input.y + dy)].symbol());
+            assert_eq!(draft, ["a", "b", "c"]);
+            let (x, y) = composer
+                .cursor_pos_with_options(area, options)
+                .expect("visible draft cursor");
+            assert!(input.contains((x, y).into()));
+            if separate_status_line && height == 7 {
+                let rows: Vec<String> = buffer
+                    .content
+                    .chunks(usize::from(area.width))
+                    .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+                    .collect();
+                insta::assert_debug_snapshot!(rows);
+            }
+        }
+    }
+    let tree: crate::ui_tree::UiTree = r#""x\ny""#.parse().unwrap();
+    composer.set_status_line(Some(FooterContent::from(tree)));
+    assert_eq!(
+        composer.footer_hint_height(/*width*/ 7, ComposerRenderOptions::default()),
+        2
+    );
+    composer.show_footer_flash("Copied".into(), Duration::from_secs(/*secs*/ 3));
+    assert_eq!(
+        composer.footer_hint_height(/*width*/ 7, ComposerRenderOptions::default()),
+        1
+    );
+}
+
+#[test]
+fn sidebar_focus_collapses_extension_status_to_its_dim_line() {
+    let mut composer = composer();
+    composer.insert_str("draft");
+    let tree: crate::ui_tree::UiTree = r#""one\ntwo\nthree\nfour""#.parse().unwrap();
+    composer.set_status_line(Some(tree.into()));
+    let frames = [false, true, false].map(|unfocused| {
+        let options = ComposerRenderOptions {
+            separate_status_line: true,
+            unfocused,
+            ..Default::default()
+        };
+        let height = composer.desired_height_with_options(/*width*/ 40, options);
+        status_rows(&composer, Rect::new(0, 0, 40, height), options).join("\n")
+    });
+    insta::assert_snapshot!(frames.join("\n---\n"), @"
+    one
+    two
+    three
+    four
+    ---
+    one…
+    ---
+    one
+    two
+    three
+    four
+    ");
+}
+
+#[test]
+fn extension_status_paints_with_the_current_theme_at_the_same_width() {
+    use crate::render::highlight::current_syntax_theme;
+    use crate::render::highlight::set_syntax_theme;
+    use ratatui::style::Color;
+    use syntect::highlighting::Color as ThemeColor;
+
+    let mut composer = composer();
+    let content: crate::ui_tree::UiTree =
+        r#"{"type":"text","props":{"color":"primary"},"children":["λ"]}"#
+            .parse()
+            .unwrap();
+    composer.set_status_line(Some(FooterContent::from(content)));
+    let previous = current_syntax_theme();
+    let colors = [1, 2].map(|index| {
+        let mut theme = previous.clone();
+        theme.settings.foreground = Some(ThemeColor {
+            r: index,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+        set_syntax_theme(theme);
+        let options = ComposerRenderOptions::default();
+        let width = 24;
+        let area = Rect::new(
+            0,
+            0,
+            width,
+            composer.desired_height_with_options(width, options),
+        );
+        let mut buffer = Buffer::empty(area);
+        composer.render_with_options(area, &mut buffer, /*mask_char*/ None, options);
+        buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "λ")
+            .unwrap()
+            .fg
+    });
+    set_syntax_theme(previous);
+    assert_eq!(colors, [Color::Red, Color::Green]);
+}
+
+#[test]
+fn extension_status_keeps_its_rows_when_effort_changes() {
+    let mut composer = composer();
+    let tree: crate::ui_tree::UiTree = r#""one\ntwo\nthree""#.parse().unwrap();
+    composer.set_status_line(Some(FooterContent::from(tree)));
+    composer.set_active_reasoning_effort_baseline(/*effort*/ None);
+    composer.set_active_reasoning_effort(
+        Some(&ReasoningEffort::Max),
+        /*animations_enabled*/ true,
+    );
+    for separate_status_line in [false, true] {
+        let options = ComposerRenderOptions {
+            separate_status_line,
+            ..Default::default()
+        };
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 7, /*height*/ 12,
+        );
+        assert_eq!(
+            status_rows(&composer, area, options),
+            ["one", "two", "three"]
+        );
+    }
 }
 
 fn render(
@@ -101,9 +396,14 @@ fn fullscreen_plan_indicator_keeps_the_cycle_hint_when_it_fits() {
     );
     insta::assert_snapshot!("fullscreen_plan_cycle_hint", wide);
 
-    let (narrow, _) = render(&composer, /*width*/ 44, /*footer*/ None);
-    assert!(narrow.contains("Plan mode"), "{narrow}");
-    assert!(!narrow.contains("⇧tab"), "{narrow}");
+    let mut status = HyperlinkLine::from("project · ");
+    status.push_span("PR #42".underlined(), Some("https://example.com/pull/42"));
+    composer.set_status_line(Some(status.into()));
+    composer.set_active_agent_label(Some("reviewer".to_string()));
+    let (narrow, _) = render(&composer, /*width*/ 37, /*footer*/ None);
+    let row = narrow.lines().rev().nth(1).expect("persistent status row");
+    insta::assert_snapshot!(strip_osc8(row).trim(), @"project · PR #42 · rev… Plan mode");
+    composer.set_active_agent_label(/*active_agent_label*/ None);
 
     composer.set_task_running(/*running*/ true);
     let (running, _) = render(&composer, /*width*/ 100, /*footer*/ None);

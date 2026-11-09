@@ -1,7 +1,6 @@
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use crate::session_runtime::OutputItem;
 use std::sync::Arc;
 
-use super::EXIT_SENTINEL;
 use super::RuntimeEvent;
 use super::RuntimeState;
 use super::timers;
@@ -37,24 +36,28 @@ pub(super) fn tool_callback(
         }
     };
 
-    let Some(resolver) = v8::PromiseResolver::new(scope) else {
-        throw_type_error(scope, "failed to create tool promise");
-        return;
-    };
-    let promise = resolver.get_promise(scope);
-
-    let resolver = v8::Global::new(scope, resolver);
     let (tool_name, tool_kind) = {
         let Some(state) = scope.get_slot::<RuntimeState>() else {
             throw_type_error(scope, "runtime state unavailable");
             return;
         };
+        // Input serialization can call exit() from a getter or toJSON.
+        if state.exit_requested {
+            return;
+        }
         let Some(tool) = state.enabled_tools.get(tool_index) else {
             throw_type_error(scope, "tool callback data is out of range");
             return;
         };
         (tool.tool_name.clone(), tool.kind)
     };
+
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_type_error(scope, "failed to create tool promise");
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver = v8::Global::new(scope, resolver);
 
     let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
         throw_type_error(scope, "runtime state unavailable");
@@ -64,7 +67,7 @@ pub(super) fn tool_callback(
     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
     state.pending_tool_calls.insert(id.clone(), resolver);
-    let _ = event_tx.send(RuntimeEvent::ToolCall {
+    let _ = event_tx.blocking_send(RuntimeEvent::ToolCall {
         id,
         name: tool_name,
         kind: tool_kind,
@@ -90,10 +93,12 @@ pub(super) fn text_callback(
             return;
         }
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText { text },
-        ));
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state
+            .event_tx
+            .blocking_send(RuntimeEvent::ContentItem(OutputItem::InputText { text }));
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -112,8 +117,12 @@ pub(super) fn audio_callback(
         Ok(audio_item) => audio_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(audio_item));
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state
+            .event_tx
+            .blocking_send(RuntimeEvent::ContentItem(audio_item));
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -145,8 +154,12 @@ pub(super) fn image_callback(
         Ok(image_item) => image_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state
+            .event_tx
+            .blocking_send(RuntimeEvent::ContentItem(image_item));
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -172,12 +185,16 @@ pub(super) fn generated_image_callback(
         Ok(image_item) => image_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state
+            .event_tx
+            .blocking_send(RuntimeEvent::ContentItem(image_item));
         if let Some(text) = output_hint {
-            let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-                FunctionCallOutputContentItem::InputText { text },
-            ));
+            let _ = state
+                .event_tx
+                .blocking_send(RuntimeEvent::ContentItem(OutputItem::InputText { text }));
         }
     }
     retval.set(v8::undefined(scope).into());
@@ -230,7 +247,9 @@ pub(super) fn store_callback(
             return;
         }
     };
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>()
+        && !state.exit_requested
+    {
         let serialized = Arc::new(serialized);
         state
             .stored_values
@@ -287,8 +306,10 @@ pub(super) fn notify_callback(
         throw_type_error(scope, "notify expects non-empty text");
         return;
     }
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::Notify {
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state.event_tx.blocking_send(RuntimeEvent::Notify {
             call_id: state.tool_call_id.clone(),
             text,
         });
@@ -302,7 +323,8 @@ pub(super) fn set_timeout_callback(
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
     let timeout_id = match timers::schedule_timeout(scope, args) {
-        Ok(timeout_id) => timeout_id,
+        Ok(Some(timeout_id)) => timeout_id,
+        Ok(None) => return,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
             return;
@@ -330,8 +352,10 @@ pub(super) fn yield_control_callback(
     _args: v8::FunctionCallbackArguments,
     _retval: v8::ReturnValue<v8::Value>,
 ) {
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::YieldRequested);
+    if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
+    {
+        let _ = state.event_tx.blocking_send(RuntimeEvent::YieldRequested);
     }
 }
 
@@ -343,7 +367,9 @@ pub(super) fn exit_callback(
     if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
         state.exit_requested = true;
     }
-    if let Some(error) = v8::String::new(scope, EXIT_SENTINEL) {
-        scope.throw_exception(error.into());
-    }
+    scope.terminate_execution();
 }
+
+#[cfg(test)]
+#[path = "callbacks_tests.rs"]
+mod tests;

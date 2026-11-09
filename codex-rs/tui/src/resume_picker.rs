@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::unread_revision;
+use crate::backend_id::BackendId;
 use crate::clipboard_paste::normalize_pasted_search_query;
 use crate::clock_format::ClockFormat;
 use crate::color::blend;
@@ -73,8 +75,10 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 mod archive;
+mod catalog;
 mod layout;
 mod page_loading;
+mod sources;
 
 #[cfg(test)]
 #[path = "resume_picker_color_tests.rs"]
@@ -109,6 +113,8 @@ const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
 
 #[derive(Debug, Clone)]
 pub struct SessionTarget {
+    /// Logical owner of the native thread ID, retained across connection replacement.
+    pub(crate) backend_id: crate::backend_id::BackendId,
     pub path: Option<PathBuf>,
     pub thread_id: ThreadId,
     /// Working directory reported by `thread/list` or `thread/read` at selection time.
@@ -118,6 +124,14 @@ pub struct SessionTarget {
 }
 
 impl SessionTarget {
+    pub(crate) fn ensure_backend(&self, backend_id: crate::backend_id::BackendId) -> Result<()> {
+        color_eyre::eyre::ensure!(
+            self.backend_id == backend_id,
+            "This session belongs to a different backend. Open the session picker again."
+        );
+        Ok(())
+    }
+
     pub fn display_label(&self) -> String {
         self.path
             .as_ref()
@@ -174,8 +188,10 @@ impl SessionPickerAction {
 struct PageLoadRequest {
     cursor: Option<PageCursor>,
     request_token: usize,
+    listing_token: usize,
     search_token: Option<usize>,
     mode: PageLoadMode,
+    filter_mode: SessionFilterMode,
     cwd_filter: Option<PathBuf>,
     status: SessionStatus,
     provider_filter: ProviderFilter,
@@ -183,31 +199,44 @@ struct PageLoadRequest {
 }
 
 enum PickerLoadRequest {
+    Acknowledge {
+        backend_id: crate::backend_id::BackendId,
+        thread_id: ThreadId,
+        revision: String,
+    },
     Page(PageLoadRequest),
     Preview {
+        backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
     },
     Transcript {
+        backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
         cancellation: oneshot::Receiver<()>,
     },
     Archive {
+        backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
     },
     Unarchive {
+        backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
     },
 }
 
 #[derive(Clone)]
 enum ProviderFilter {
+    // Omit the filter and let the server use its default provider.
     Any,
+    // Explicitly include threads from every provider.
+    All,
     MatchDefault(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionFilterMode {
     Cwd,
+    Repo,
     All,
 }
 
@@ -220,11 +249,20 @@ impl SessionFilterMode {
         }
     }
 
-    fn toggle(self, filter_cwd: Option<&Path>) -> Self {
-        match self {
-            Self::Cwd => Self::All,
-            Self::All if filter_cwd.is_some() => Self::Cwd,
-            Self::All => Self::All,
+    fn change(
+        self,
+        direction: ToolbarValueDirection,
+        filter_cwd: Option<&Path>,
+        repo_filter_available: bool,
+    ) -> Self {
+        match (self, direction) {
+            (Self::Cwd, ToolbarValueDirection::Next) if repo_filter_available => Self::Repo,
+            (Self::Cwd, ToolbarValueDirection::Next | ToolbarValueDirection::Previous)
+            | (Self::Repo, ToolbarValueDirection::Next) => Self::All,
+            (Self::Repo, ToolbarValueDirection::Previous) => Self::Cwd,
+            (Self::All, ToolbarValueDirection::Previous) if repo_filter_available => Self::Repo,
+            (Self::All, _) if filter_cwd.is_some() => Self::Cwd,
+            (Self::All, _) => Self::All,
         }
     }
 }
@@ -240,6 +278,11 @@ enum ToolbarControl {
     Filter,
     Status,
     Sort,
+}
+
+enum ToolbarValueDirection {
+    Previous,
+    Next,
 }
 
 impl ToolbarControl {
@@ -295,10 +338,30 @@ impl From<SessionListDensity> for SessionPickerViewMode {
 }
 
 type PickerLoader = Arc<dyn Fn(PickerLoadRequest) + Send + Sync>;
+
+struct PickerBackground {
+    loader: PickerLoader,
+    task: tokio::task::JoinHandle<()>,
+}
+
 enum BackgroundEvent {
+    Acknowledged {
+        backend_id: crate::backend_id::BackendId,
+        thread_id: ThreadId,
+        revision: Option<String>,
+    },
+    PartialPage {
+        listing_token: usize,
+        page: PickerPage,
+    },
+    SourceError {
+        listing_token: usize,
+        next_cursor: Option<PageCursor>,
+    },
     Page {
         request_token: usize,
         search_token: Option<usize>,
+        mode: PageLoadMode,
         page: std::io::Result<PickerPage>,
     },
     Preview {
@@ -306,8 +369,9 @@ enum BackgroundEvent {
         preview: std::io::Result<Vec<TranscriptPreviewLine>>,
     },
     Transcript {
+        backend_id: crate::backend_id::BackendId,
         thread_id: ThreadId,
-        transcript: std::io::Result<TranscriptCells>,
+        transcript: std::io::Result<LoadedTranscript>,
     },
     Archive {
         thread_id: ThreadId,
@@ -322,10 +386,78 @@ enum BackgroundEvent {
 #[derive(Clone)]
 enum PageCursor {
     AppServer(String),
+    Catalog,
+    SourcesPending,
+}
+
+pub(crate) struct ResumePickerAppServers {
+    ordered: Vec<AppServerSession>,
+    displayed_owner: crate::backend_id::BackendId,
+}
+
+impl ResumePickerAppServers {
+    pub(crate) fn new(
+        ordered: Vec<AppServerSession>,
+        displayed_owner: crate::backend_id::BackendId,
+    ) -> Self {
+        assert!(
+            ordered
+                .iter()
+                .any(|session| session.backend_id() == displayed_owner)
+        );
+        Self {
+            ordered,
+            displayed_owner,
+        }
+    }
+
+    fn singleton(session: AppServerSession) -> Self {
+        let displayed_owner = session.backend_id();
+        Self::new(vec![session], displayed_owner)
+    }
+}
+
+struct AppServerPickerBackend {
+    uses_remote_filesystem: bool,
+    session: AppServerSession,
+    archive_request_handle: AppServerRequestHandle,
+    include_non_interactive: bool,
+    raw_reasoning_visibility: RawReasoningVisibility,
+    config: Option<Config>,
+}
+
+fn resume_picker_backends(
+    uses_remote_filesystem: bool,
+    config: &Config,
+    include_non_interactive: bool,
+    app_servers: ResumePickerAppServers,
+) -> (Vec<AppServerPickerBackend>, crate::backend_id::BackendId) {
+    let displayed_owner = app_servers.displayed_owner;
+    let backends = app_servers
+        .ordered
+        .into_iter()
+        .map(|session| {
+            let is_displayed_owner = session.backend_id() == displayed_owner;
+            AppServerPickerBackend {
+                uses_remote_filesystem: if is_displayed_owner {
+                    uses_remote_filesystem
+                } else {
+                    session.uses_remote_workspace()
+                },
+                archive_request_handle: session.request_handle(),
+                config: (!session.uses_remote_workspace()).then(|| config.clone()),
+                session,
+                include_non_interactive,
+                raw_reasoning_visibility: raw_reasoning_visibility(config),
+            }
+        })
+        .collect();
+    (backends, displayed_owner)
 }
 
 struct PickerPage {
     rows: Vec<Row>,
+    read_states: HashMap<String, codex_app_server_protocol::ThreadReadState>,
     history_modes: HashMap<ThreadId, ThreadHistoryMode>,
     next_cursor: Option<PageCursor>,
     num_scanned_files: usize,
@@ -338,13 +470,14 @@ struct SessionPickerViewPersistence {
 }
 
 struct SessionPickerRunOptions {
+    backend_id: crate::backend_id::BackendId,
     use_theme_colors: bool,
     copy_on_select: bool,
+    copy_on_select_clear_selection: bool,
     mouse_scroll_speed: f64,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
-    worktrees_enabled: bool,
     action: SessionPickerAction,
     launch_context: SessionPickerLaunchContext,
     provider_filter: ProviderFilter,
@@ -379,16 +512,41 @@ pub async fn run_resume_picker_with_app_server(
     include_non_interactive: bool,
     app_server: AppServerSession,
 ) -> Result<SessionSelection> {
-    let archive_request_handle = app_server.request_handle();
-    run_resume_picker_with_launch_context(
+    run_resume_picker_with_app_servers(
         uses_remote_filesystem,
         tui,
         config,
         local_settings,
         show_all,
         include_non_interactive,
-        app_server,
-        archive_request_handle,
+        ResumePickerAppServers::singleton(app_server),
+    )
+    .await
+}
+
+pub(crate) async fn run_resume_picker_with_app_servers(
+    uses_remote_filesystem: bool,
+    tui: &mut Tui,
+    config: &Config,
+    local_settings: &crate::local_settings::LocalSettings,
+    show_all: bool,
+    include_non_interactive: bool,
+    app_servers: ResumePickerAppServers,
+) -> Result<SessionSelection> {
+    let (backends, displayed_owner) = resume_picker_backends(
+        uses_remote_filesystem,
+        config,
+        include_non_interactive,
+        app_servers,
+    );
+    run_resume_picker_with_launch_context(
+        uses_remote_filesystem,
+        tui,
+        config,
+        local_settings,
+        show_all,
+        backends,
+        displayed_owner,
         SessionPickerLaunchContext::Startup,
     )
     .await
@@ -396,28 +554,32 @@ pub async fn run_resume_picker_with_app_server(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "keep local preferences separate while the legacy Config parameter is still required"
+    reason = "picker configuration follows the existing session entry point"
 )]
-pub async fn run_resume_picker_from_existing_session_with_app_server(
+pub(crate) async fn run_resume_picker_from_existing_session_with_app_servers(
     uses_remote_filesystem: bool,
     tui: &mut Tui,
     config: &Config,
     local_settings: &crate::local_settings::LocalSettings,
     show_all: bool,
     include_non_interactive: bool,
-    app_server: AppServerSession,
-    archive_request_handle: AppServerRequestHandle,
+    app_servers: ResumePickerAppServers,
     current_thread_id: Option<ThreadId>,
 ) -> Result<SessionSelection> {
+    let (backends, displayed_owner) = resume_picker_backends(
+        uses_remote_filesystem,
+        config,
+        include_non_interactive,
+        app_servers,
+    );
     run_resume_picker_with_launch_context(
         uses_remote_filesystem,
         tui,
         config,
         local_settings,
         show_all,
-        include_non_interactive,
-        app_server,
-        archive_request_handle,
+        backends,
+        displayed_owner,
         SessionPickerLaunchContext::ExistingSession { current_thread_id },
     )
     .await
@@ -433,30 +595,43 @@ async fn run_resume_picker_with_launch_context(
     config: &Config,
     local_settings: &crate::local_settings::LocalSettings,
     show_all: bool,
-    include_non_interactive: bool,
-    app_server: AppServerSession,
-    archive_request_handle: AppServerRequestHandle,
+    app_servers: Vec<AppServerPickerBackend>,
+    displayed_owner: crate::backend_id::BackendId,
     launch_context: SessionPickerLaunchContext,
 ) -> Result<SessionSelection> {
+    let has_multiple_backends = app_servers.len() > 1;
+    let Some(app_server) = app_servers
+        .iter()
+        .find(|backend| backend.session.backend_id() == displayed_owner)
+    else {
+        unreachable!("displayed owner must belong to the resume picker's nonempty backend set");
+    };
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
-    let uses_remote_workspace = app_server.uses_remote_workspace();
-    let cwd_filter = picker_cwd_filter(
-        config.cwd.as_path(),
-        /*show_all*/ false,
-        uses_remote_workspace,
-        app_server.remote_cwd_override(),
-    );
+    let uses_remote_workspace = app_server.session.uses_remote_workspace();
+    // A single path cannot describe both local and remote workspaces. Until the
+    // picker owns per-backend filters, a mixed listing starts unfiltered.
+    let cwd_filter = (!has_multiple_backends)
+        .then(|| {
+            picker_cwd_filter(
+                config.cwd.as_path(),
+                /*show_all*/ false,
+                uses_remote_workspace,
+                app_server.session.remote_cwd_override(),
+            )
+        })
+        .flatten();
     let local_filter_cwd = local_picker_cwd_filter(&cwd_filter, uses_remote_filesystem);
-    let provider_filter = picker_provider_filter(config, &app_server).await?;
+    let provider_filter = ProviderFilter::All;
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
+        backend_id: app_server.session.backend_id(),
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        copy_on_select_clear_selection: local_settings.tui.copy_on_select_clear_selection,
         mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
-        worktrees_enabled: config.features.enabled(codex_features::Feature::Worktrees),
         action: SessionPickerAction::Resume,
         launch_context,
         provider_filter,
@@ -467,7 +642,7 @@ async fn run_resume_picker_with_launch_context(
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
         keymap: runtime_keymap,
-        initial_page_mode: if uses_remote_workspace {
+        initial_page_mode: if uses_remote_workspace || has_multiple_backends {
             PageLoadMode::StoreDefault
         } else {
             PageLoadMode::StateDbOnly
@@ -476,15 +651,7 @@ async fn run_resume_picker_with_launch_context(
     run_session_picker_with_loader(
         tui,
         options,
-        spawn_app_server_page_loader(
-            uses_remote_filesystem,
-            app_server,
-            archive_request_handle,
-            include_non_interactive,
-            raw_reasoning_visibility(config),
-            (!uses_remote_workspace).then(|| config.clone()),
-            bg_tx,
-        ),
+        spawn_app_server_page_loaders(app_servers, bg_tx),
         bg_rx,
     )
     .await
@@ -511,13 +678,14 @@ pub async fn run_fork_picker_with_app_server(
     let provider_filter = picker_provider_filter(config, &app_server).await?;
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
+        backend_id: app_server.backend_id(),
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        copy_on_select_clear_selection: local_settings.tui.copy_on_select_clear_selection,
         mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
-        worktrees_enabled: config.features.enabled(codex_features::Feature::Worktrees),
         action: SessionPickerAction::Fork,
         launch_context: SessionPickerLaunchContext::Startup,
         provider_filter,
@@ -554,23 +722,46 @@ pub async fn run_fork_picker_with_app_server(
 async fn run_session_picker_with_loader(
     tui: &mut Tui,
     options: SessionPickerRunOptions,
+    background: PickerBackground,
+    bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
+) -> Result<SessionSelection> {
+    let PickerBackground { loader, task } = background;
+    let result = run_session_picker_event_loop(tui, options, loader, bg_rx).await;
+
+    drop(task);
+    result
+}
+
+async fn run_session_picker_event_loop(
+    tui: &mut Tui,
+    options: SessionPickerRunOptions,
     picker_loader: PickerLoader,
     bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
 ) -> Result<SessionSelection> {
+    let (repo_filter_tx, repo_filter_rx) = mpsc::unbounded_channel();
+    if let Some(cwd) = options.local_filter_cwd.clone() {
+        tokio::task::spawn_blocking(move || {
+            let _ = repo_filter_tx.send(local_repo_filter_available(&cwd));
+        });
+    }
     let alt = AltScreenGuard::enter(tui);
     let mut state = PickerState::new(
+        options.backend_id,
         alt.tui.frame_requester(),
         picker_loader,
         options.provider_filter,
         options.show_all,
-        options.filter_cwd,
+        options.local_filter_cwd.clone(),
         options.action,
     );
+    state.filter_mode =
+        SessionFilterMode::from_show_all(options.show_all, options.filter_cwd.as_deref());
+    state.filter_cwd = options.filter_cwd;
     state.local_filter_cwd = options.local_filter_cwd;
     state.use_theme_colors = options.use_theme_colors;
     state.copy_on_select = options.copy_on_select;
+    state.copy_on_select_clear_selection = options.copy_on_select_clear_selection;
     state.mouse_scroll_speed = options.mouse_scroll_speed;
-    state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
     state.view_persistence = options.view_persistence;
     state.keymap = options.keymap;
@@ -590,12 +781,18 @@ async fn run_session_picker_with_loader(
     }
     let mut tui_events = alt.tui.event_stream().fuse();
     let mut background_events = UnboundedReceiverStream::new(bg_rx).fuse();
+    let mut repo_filter_events = UnboundedReceiverStream::new(repo_filter_rx).fuse();
 
     loop {
         tokio::select! {
             Some(ev) = tui_events.next() => {
                 alt.tui.clipboard.poll();
                 let screen_size = alt.tui.screen_size_for_event(&ev)?;
+                if matches!(&ev, TuiEvent::Paste(_) | TuiEvent::FocusLost)
+                    || matches!(&ev, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+                {
+                    state.chord_matcher.cancel();
+                }
                 let ev = if let TuiEvent::Key(key) = ev {
                     let Some(key) = state.route_key_chord(key) else {
                         continue;
@@ -638,6 +835,9 @@ async fn run_session_picker_with_loader(
                 if let Some(selection) = state.handle_background_event(event).await? {
                     return Ok(selection);
                 }
+            }
+            Some(available) = repo_filter_events.next() => {
+                state.set_repo_filter_available(available);
             }
             else => break,
         }
@@ -703,49 +903,112 @@ fn spawn_app_server_page_loader(
     include_non_interactive: bool,
     raw_reasoning_visibility: RawReasoningVisibility,
     config: Option<Config>,
-    bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
-) -> PickerLoader {
+    output: mpsc::UnboundedSender<BackgroundEvent>,
+) -> PickerBackground {
+    spawn_app_server_page_loaders(
+        vec![AppServerPickerBackend {
+            uses_remote_filesystem,
+            session: app_server,
+            archive_request_handle,
+            include_non_interactive,
+            raw_reasoning_visibility,
+            config,
+        }],
+        output,
+    )
+}
+
+fn spawn_app_server_page_loaders(
+    backends: Vec<AppServerPickerBackend>,
+    output: mpsc::UnboundedSender<BackgroundEvent>,
+) -> PickerBackground {
+    let mut sources = Vec::with_capacity(backends.len());
+    for backend in backends {
+        sources.push(spawn_app_server_source(backend));
+    }
+    sources::spawn(sources, output)
+}
+
+fn spawn_app_server_source(backend: AppServerPickerBackend) -> sources::Source {
+    let AppServerPickerBackend {
+        uses_remote_filesystem,
+        session: app_server,
+        archive_request_handle,
+        include_non_interactive,
+        raw_reasoning_visibility,
+        config,
+    } = backend;
+    let backend_id = app_server.backend_id();
+    let (bg_tx, events) = mpsc::unbounded_channel();
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PickerLoadRequest>();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut app_server = app_server;
         let mut page_cwd_filter = PageCwdFilter::default();
         while let Some(request) = request_rx.recv().await {
             match request {
                 PickerLoadRequest::Page(request) => {
+                    let mode = request.mode;
+                    let provider_filter = request.provider_filter;
                     let cwd_filter = page_cwd_filter.for_request(
                         request.cursor.as_ref(),
                         request.cwd_filter.as_deref(),
+                        request.filter_mode,
                         uses_remote_filesystem,
-                        config.as_ref().is_some_and(|config| {
-                            config.features.enabled(codex_features::Feature::Worktrees)
-                        }),
                     );
-                    let cursor = request.cursor.map(|PageCursor::AppServer(cursor)| cursor);
+                    let cursor = request.cursor.map(|cursor| match cursor {
+                        PageCursor::AppServer(cursor) => cursor,
+                        PageCursor::Catalog | PageCursor::SourcesPending => {
+                            unreachable!("catalog cursors never reach a source")
+                        }
+                    });
                     let params = thread_list_params(
                         cursor,
                         cwd_filter,
                         request.status,
-                        request.provider_filter,
+                        provider_filter,
                         request.sort_key,
                         include_non_interactive,
                         matches!(request.mode, PageLoadMode::StateDbOnly),
                     );
-                    let page = load_app_server_page(&mut app_server, params).await;
+                    let page = tokio::select! {
+                        page = load_app_server_page(&mut app_server, params) => page,
+                        _ = bg_tx.closed() => continue,
+                    };
                     let _ = bg_tx.send(BackgroundEvent::Page {
                         request_token: request.request_token,
                         search_token: request.search_token,
+                        mode,
                         page,
                     });
                 }
-                PickerLoadRequest::Preview { thread_id } => {
-                    let preview =
-                        load_transcript_preview(&mut app_server, thread_id, config.as_ref()).await;
+                PickerLoadRequest::Acknowledge {
+                    thread_id,
+                    revision,
+                    ..
+                } => match app_server.acknowledge_read(thread_id, revision).await {
+                    Ok(state) => {
+                        let _ = bg_tx.send(BackgroundEvent::Acknowledged {
+                            backend_id,
+                            thread_id,
+                            revision: unread_revision(Some(state)),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(%thread_id, %error, "Could not acknowledge viewed transcript")
+                    }
+                },
+                PickerLoadRequest::Preview { thread_id, .. } => {
+                    let preview = tokio::select! {
+                        preview = load_transcript_preview(&mut app_server, thread_id, config.as_ref()) => preview,
+                        _ = bg_tx.closed() => continue,
+                    };
                     let _ = bg_tx.send(BackgroundEvent::Preview { thread_id, preview });
                 }
                 PickerLoadRequest::Transcript {
                     thread_id,
                     cancellation,
+                    ..
                 } => {
                     tokio::select! {
                         transcript = load_session_transcript(
@@ -755,14 +1018,17 @@ fn spawn_app_server_page_loader(
                             config.as_ref(),
                         ) => {
                             let _ = bg_tx.send(BackgroundEvent::Transcript {
-                                thread_id,
-                                transcript,
+                                backend_id, thread_id,
+                                transcript: transcript.map(|cells| LoadedTranscript {
+                                    cells, unread_revision: app_server.unread_revisions.remove(&thread_id),
+                                }),
                             });
                         }
                         _ = cancellation => {}
+                        _ = bg_tx.closed() => {}
                     }
                 }
-                PickerLoadRequest::Archive { thread_id } => {
+                PickerLoadRequest::Archive { thread_id, .. } => {
                     let result = archive_request_handle
                         .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
                             request_id: RequestId::String(format!(
@@ -778,7 +1044,7 @@ fn spawn_app_server_page_loader(
                         .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Archive { thread_id, result });
                 }
-                PickerLoadRequest::Unarchive { thread_id } => {
+                PickerLoadRequest::Unarchive { thread_id, .. } => {
                     let result = archive_request_handle
                         .request_typed::<ThreadUnarchiveResponse>(ClientRequest::ThreadUnarchive {
                             request_id: RequestId::String(format!(
@@ -791,6 +1057,7 @@ fn spawn_app_server_page_loader(
                         })
                         .await
                         .map(|response| SessionTarget {
+                            backend_id: app_server.backend_id(),
                             path: response.thread.path,
                             thread_id,
                             cwd: Some(response.thread.cwd.to_path_buf()),
@@ -806,9 +1073,14 @@ fn spawn_app_server_page_loader(
         }
     });
 
-    Arc::new(move |request: PickerLoadRequest| {
-        let _ = request_tx.send(request);
-    })
+    sources::Source {
+        backend_id,
+        loader: Arc::new(move |request: PickerLoadRequest| {
+            let _ = request_tx.send(request);
+        }),
+        events,
+        task,
+    }
 }
 
 /// Returns the human-readable column header for the given sort key.
@@ -840,9 +1112,11 @@ impl Drop for AltScreenGuard<'_> {
 }
 
 struct PickerState {
+    backend_id: crate::backend_id::BackendId,
     clock_format: ClockFormat,
     use_theme_colors: bool,
     copy_on_select: bool,
+    copy_on_select_clear_selection: bool,
     mouse_scroll_speed: f64,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
@@ -851,7 +1125,6 @@ struct PickerState {
     pagination: PaginationState,
     all_rows: Vec<Row>,
     filtered_rows: Vec<Row>,
-    thread_history_modes: HashMap<ThreadId, ThreadHistoryMode>,
     seen_rows: HashSet<SeenRowKey>,
     selected: usize,
     scroll_top: usize,
@@ -859,6 +1132,7 @@ struct PickerState {
     frozen_footer_percent: Option<u8>,
     query: String,
     search_state: SearchState,
+    listing_token: usize,
     next_request_token: usize,
     next_search_token: usize,
     picker_loader: PickerLoader,
@@ -869,7 +1143,7 @@ struct PickerState {
     status: SessionStatus,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
-    worktrees_enabled: bool,
+    repo_filter_available: bool,
     toolbar_focus: ToolbarControl,
     density: SessionListDensity,
     launch_context: SessionPickerLaunchContext,
@@ -880,8 +1154,10 @@ struct PickerState {
     archive_state: archive::ArchiveState,
     expanded_thread_id: Option<ThreadId>,
     transcript_previews: HashMap<ThreadId, TranscriptPreviewState>,
-    transcript_cells: HashMap<ThreadId, SessionTranscriptState>,
-    pending_transcript_open: Option<ThreadId>,
+    transcript_cells: HashMap<(BackendId, ThreadId), SessionTranscriptState>,
+    pending_transcript_open: Option<(BackendId, ThreadId)>,
+    unread: HashMap<(BackendId, ThreadId), String>,
+    overlay_receipt: Option<PickerLoadRequest>,
     pending_transcript_cancellation: Option<oneshot::Sender<()>>,
     transcript_loading_frame_shown: bool,
     overlay: Option<Overlay>,
@@ -903,9 +1179,14 @@ enum TranscriptPreviewState {
     Failed,
 }
 
+struct LoadedTranscript {
+    cells: TranscriptCells,
+    unread_revision: Option<String>,
+}
+
 enum SessionTranscriptState {
     Loading,
-    Loaded(TranscriptCells),
+    Loaded(LoadedTranscript),
     Failed,
 }
 
@@ -948,6 +1229,7 @@ async fn load_app_server_page(
 
     Ok(PickerPage {
         rows,
+        read_states: response.read_states.unwrap_or_default(),
         history_modes,
         next_cursor: response.next_cursor.map(PageCursor::AppServer),
         num_scanned_files,
@@ -971,6 +1253,8 @@ impl SearchState {
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Row {
+    backend_id: Option<crate::backend_id::BackendId>,
+    history_mode: Option<ThreadHistoryMode>,
     path: Option<PathBuf>,
     preview: String,
     thread_id: Option<ThreadId>,
@@ -1034,6 +1318,7 @@ impl Row {
 
 impl PickerState {
     fn new(
+        backend_id: crate::backend_id::BackendId,
         requester: FrameRequester,
         picker_loader: PickerLoader,
         provider_filter: ProviderFilter,
@@ -1042,16 +1327,17 @@ impl PickerState {
         action: SessionPickerAction,
     ) -> Self {
         Self {
+            backend_id,
             clock_format: ClockFormat::system(),
             use_theme_colors: true,
             copy_on_select: false,
+            copy_on_select_clear_selection: false,
             mouse_scroll_speed: 1.0,
             requester,
             relative_time_reference: None,
             pagination: PaginationState::new(),
             all_rows: Vec::new(),
             filtered_rows: Vec::new(),
-            thread_history_modes: HashMap::new(),
             seen_rows: HashSet::new(),
             selected: 0,
             scroll_top: 0,
@@ -1059,6 +1345,7 @@ impl PickerState {
             frozen_footer_percent: None,
             query: String::new(),
             search_state: SearchState::Idle,
+            listing_token: 0,
             next_request_token: 0,
             next_search_token: 0,
             picker_loader,
@@ -1069,8 +1356,8 @@ impl PickerState {
             status: SessionStatus::Active,
             local_filter_cwd: filter_cwd.clone(),
             local_cwd_matches: HashMap::new(),
-            worktrees_enabled: false,
             filter_cwd,
+            repo_filter_available: false,
             toolbar_focus: ToolbarControl::Filter,
             density: SessionListDensity::Comfortable,
             launch_context: SessionPickerLaunchContext::Startup,
@@ -1083,6 +1370,8 @@ impl PickerState {
             transcript_previews: HashMap::new(),
             transcript_cells: HashMap::new(),
             pending_transcript_open: None,
+            unread: HashMap::new(),
+            overlay_receipt: None,
             pending_transcript_cancellation: None,
             transcript_loading_frame_shown: false,
             overlay: None,
@@ -1123,6 +1412,11 @@ impl PickerState {
         self.requester.schedule_frame();
     }
 
+    fn set_repo_filter_available(&mut self, available: bool) {
+        self.repo_filter_available = available;
+        self.request_frame();
+    }
+
     fn is_transcript_loading(&self) -> bool {
         self.pending_transcript_open.is_some()
     }
@@ -1140,30 +1434,36 @@ impl PickerState {
         if !self.transcript_loading_frame_shown {
             return;
         }
-        let Some(thread_id) = self.pending_transcript_open else {
+        let Some((backend_id, thread_id)) = self.pending_transcript_open else {
             return;
         };
-        let Some(SessionTranscriptState::Loaded(cells)) = self.transcript_cells.get(&thread_id)
+        let Some(SessionTranscriptState::Loaded(cells)) =
+            self.transcript_cells.get(&(backend_id, thread_id))
         else {
             return;
         };
         let mut overlay = Overlay::new_transcript(
-            cells.clone(),
+            cells.cells.clone(),
             self.keymap.pager.clone(),
             self.copy_on_select,
             self.mouse_scroll_speed,
-        );
+        )
+        .with_copy_on_select_clear_selection(self.copy_on_select_clear_selection);
         if let Overlay::Transcript(view) = &mut overlay {
             view.set_keymap_bindings(&self.keymap);
         }
+        self.chord_matcher.cancel();
+        self.overlay_receipt =
+            cells
+                .unread_revision
+                .clone()
+                .map(|revision| PickerLoadRequest::Acknowledge {
+                    backend_id,
+                    thread_id,
+                    revision,
+                });
         self.overlay = Some(overlay);
         self.pending_transcript_open = None;
-        self.transcript_loading_frame_shown = false;
-        self.request_frame();
-    }
-
-    fn begin_transcript_loading(&mut self, thread_id: ThreadId) {
-        self.pending_transcript_open = Some(thread_id);
         self.transcript_loading_frame_shown = false;
         self.request_frame();
     }
@@ -1172,12 +1472,35 @@ impl PickerState {
         let Some(overlay) = &mut self.overlay else {
             return Ok(());
         };
+        let draw = matches!(
+            event,
+            TuiEvent::Draw | TuiEvent::FocusGained | TuiEvent::Resume | TuiEvent::Resize(_)
+        );
         overlay.handle_event(tui, event)?;
+        if draw
+            && tui.is_terminal_focused()
+            && let Some(receipt) = self.overlay_receipt.take()
+        {
+            (self.picker_loader)(receipt);
+        }
         if overlay.is_done() {
             self.overlay = None;
             self.request_frame();
         }
         Ok(())
+    }
+
+    fn update_unread(&mut self, key: (BackendId, ThreadId), revision: Option<String>) {
+        if let Some(revision) = revision {
+            self.unread.insert(key, revision);
+        } else {
+            self.unread.remove(&key);
+        }
+    }
+
+    fn unread_revision(&self, row: &Row) -> Option<&String> {
+        self.unread
+            .get(&(row.backend_id.unwrap_or(self.backend_id), row.thread_id?))
     }
 
     fn open_selected_transcript(&mut self) {
@@ -1189,21 +1512,22 @@ impl PickerState {
             self.request_frame();
             return;
         };
-
-        match self.transcript_cells.get(&thread_id) {
-            Some(SessionTranscriptState::Loaded(_)) => {
-                self.begin_transcript_loading(thread_id);
-            }
-            Some(SessionTranscriptState::Loading) => {
-                self.begin_transcript_loading(thread_id);
-            }
-            Some(SessionTranscriptState::Failed) | None => {
+        let backend_id = row.backend_id.unwrap_or(self.backend_id);
+        let key = (backend_id, thread_id);
+        self.pending_transcript_open = Some(key);
+        self.transcript_loading_frame_shown = false;
+        self.request_frame();
+        match self.transcript_cells.get(&key) {
+            Some(SessionTranscriptState::Loaded(transcript))
+                if self.unread.get(&key) == transcript.unread_revision.as_ref() => {}
+            Some(SessionTranscriptState::Loading) => {}
+            _ => {
                 self.transcript_cells
-                    .insert(thread_id, SessionTranscriptState::Loading);
-                self.begin_transcript_loading(thread_id);
+                    .insert(key, SessionTranscriptState::Loading);
                 let (cancellation_tx, cancellation) = oneshot::channel();
                 self.pending_transcript_cancellation = Some(cancellation_tx);
                 (self.picker_loader)(PickerLoadRequest::Transcript {
+                    backend_id,
                     thread_id,
                     cancellation,
                 });
@@ -1219,13 +1543,13 @@ impl PickerState {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => Some(SessionSelection::Exit),
             key if self.keymap.list.cancel.is_pressed(key) => {
-                if let Some(thread_id) = self.pending_transcript_open.take()
+                if let Some(key) = self.pending_transcript_open.take()
                     && matches!(
-                        self.transcript_cells.get(&thread_id),
+                        self.transcript_cells.get(&key),
                         Some(SessionTranscriptState::Loading)
                     )
                 {
-                    self.transcript_cells.remove(&thread_id);
+                    self.transcript_cells.remove(&key);
                 }
                 if let Some(cancellation) = self.pending_transcript_cancellation.take() {
                     let _ = cancellation.send(());
@@ -1313,14 +1637,15 @@ impl PickerState {
                     let path = row.path.clone();
                     if let Some(thread_id) = row.thread_id {
                         if self.status == SessionStatus::Archived {
-                            self.request_unarchive(thread_id);
+                            self.request_unarchive(thread_id, row.backend_id.unwrap_or(self.backend_id));
                             return Ok(None);
                         }
                         return Ok(Some(self.action.selection(SessionTarget {
+                            backend_id: row.backend_id.unwrap_or(self.backend_id),
                             path,
                             thread_id,
                             cwd: row.cwd.clone(),
-                            history_mode: self.thread_history_modes.get(&thread_id).copied(),
+                            history_mode: row.history_mode,
                         })));
                     }
                     self.inline_error = Some(match path {
@@ -1398,11 +1723,12 @@ impl PickerState {
                 self.focus_previous_toolbar_control();
                 self.request_frame();
             }
-            _ if allow_plain_char_navigation
-                && (self.keymap.list.move_left.is_pressed(key)
-                    || self.keymap.list.move_right.is_pressed(key)) =>
-            {
-                self.change_focused_toolbar_value();
+            _ if allow_plain_char_navigation && self.keymap.list.move_left.is_pressed(key) => {
+                self.change_focused_toolbar_value(ToolbarValueDirection::Previous);
+                self.request_frame();
+            }
+            _ if allow_plain_char_navigation && self.keymap.list.move_right.is_pressed(key) => {
+                self.change_focused_toolbar_value(ToolbarValueDirection::Next);
                 self.request_frame();
             }
             KeyEvent {
@@ -1454,9 +1780,9 @@ impl PickerState {
     fn start_initial_load(&mut self) {
         self.relative_time_reference = Some(Utc::now());
         self.reset_pagination();
+        self.unread.clear();
         self.all_rows.clear();
         self.filtered_rows.clear();
-        self.thread_history_modes.clear();
         self.seen_rows.clear();
         self.local_cwd_matches.clear();
         self.selected = 0;
@@ -1473,6 +1799,7 @@ impl PickerState {
         };
 
         let request_token = self.allocate_request_token();
+        self.listing_token = request_token;
         let mode = self.initial_page_mode;
         self.pagination
             .start_load(request_token, search_token, mode);
@@ -1481,8 +1808,10 @@ impl PickerState {
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
             cursor: None,
             request_token,
+            listing_token: self.listing_token,
             search_token,
             mode,
+            filter_mode: self.filter_mode,
             cwd_filter: self.active_cwd_filter(),
             status: self.status,
             provider_filter: self.provider_filter.clone(),
@@ -1495,20 +1824,44 @@ impl PickerState {
         event: BackgroundEvent,
     ) -> Result<Option<SessionSelection>> {
         match event {
+            BackgroundEvent::PartialPage {
+                listing_token,
+                page,
+            } => {
+                if listing_token != self.listing_token {
+                    return Ok(None);
+                }
+                self.ingest_page(page);
+                self.continue_search_if_needed();
+            }
+            BackgroundEvent::SourceError {
+                listing_token,
+                next_cursor,
+            } => {
+                if listing_token != self.listing_token {
+                    return Ok(None);
+                }
+                self.pagination.next_cursor = next_cursor;
+                self.continue_search_if_needed();
+                self.inline_error =
+                    Some("Could not load one backend. Reopen the picker to retry.".into());
+                self.request_frame();
+            }
             BackgroundEvent::Page {
                 request_token,
                 search_token,
+                mode,
                 page,
             } => {
                 let Some(pending) = self.pagination.finish_load(request_token) else {
                     return Ok(None);
                 };
+                self.pagination.next_page_mode = mode;
                 let page_has_rows = matches!(&page, Ok(page) if !page.rows.is_empty());
                 // Fall back only when the initial DB listing is unusable. Once SQLite returns
                 // rows, its pagination is authoritative and an empty later page ends the list.
-                let should_restart_from_store = pending.mode == PageLoadMode::StateDbOnly
-                    && self.all_rows.is_empty()
-                    && !page_has_rows;
+                let should_restart_from_store =
+                    mode == PageLoadMode::StateDbOnly && self.all_rows.is_empty() && !page_has_rows;
                 if should_restart_from_store {
                     let request_token = self.allocate_request_token();
                     let search_token = pending.search_token.or(search_token);
@@ -1521,8 +1874,10 @@ impl PickerState {
                     (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
                         cursor: None,
                         request_token,
+                        listing_token: self.listing_token,
                         search_token,
                         mode: PageLoadMode::StoreDefault,
+                        filter_mode: self.filter_mode,
                         cwd_filter: self.active_cwd_filter(),
                         status: self.status,
                         provider_filter: self.provider_filter.clone(),
@@ -1545,7 +1900,7 @@ impl PickerState {
                 };
                 self.ingest_page(page);
                 self.complete_pending_page_down();
-                let completed_token = pending.search_token.or(search_token);
+                let completed_token = self.search_state.active_token();
                 self.continue_search_if_token_matches(completed_token);
             }
             BackgroundEvent::Preview { thread_id, preview } => {
@@ -1558,32 +1913,47 @@ impl PickerState {
                 );
                 self.request_frame();
             }
+            BackgroundEvent::Acknowledged {
+                backend_id,
+                thread_id,
+                revision,
+            } => {
+                self.update_unread((backend_id, thread_id), revision);
+                self.request_frame();
+            }
             BackgroundEvent::Transcript {
+                backend_id,
                 thread_id,
                 transcript,
-            } => match transcript {
-                Ok(cells) => {
-                    let should_open = self.pending_transcript_open == Some(thread_id);
-                    self.transcript_cells
-                        .insert(thread_id, SessionTranscriptState::Loaded(cells.clone()));
-                    if should_open {
-                        self.pending_transcript_cancellation = None;
+            } => {
+                let key = (backend_id, thread_id);
+                if self.pending_transcript_open != Some(key)
+                    || !matches!(
+                        self.transcript_cells.get(&key),
+                        Some(SessionTranscriptState::Loading)
+                    )
+                {
+                    return Ok(None);
+                }
+                self.pending_transcript_cancellation = None;
+                match transcript {
+                    Ok(cells) => {
+                        self.update_unread(key, cells.unread_revision.clone());
+                        self.transcript_cells
+                            .insert(key, SessionTranscriptState::Loaded(cells));
                         self.open_pending_transcript_if_ready();
                     }
-                    self.request_frame();
-                }
-                Err(_) => {
-                    self.transcript_cells
-                        .insert(thread_id, SessionTranscriptState::Failed);
-                    if self.pending_transcript_open == Some(thread_id) {
-                        self.pending_transcript_cancellation = None;
+                    Err(_) => {
+                        self.transcript_cells
+                            .insert(key, SessionTranscriptState::Failed);
+                        self.chord_matcher.cancel();
                         self.pending_transcript_open = None;
                         self.transcript_loading_frame_shown = false;
                         self.inline_error = Some("Could not load transcript preview".to_string());
                     }
-                    self.request_frame();
                 }
-            },
+                self.request_frame();
+            }
             BackgroundEvent::Archive { thread_id, result } => {
                 self.handle_archive_result(thread_id, result);
             }
@@ -1600,8 +1970,16 @@ impl PickerState {
     }
 
     fn ingest_page(&mut self, page: PickerPage) {
+        let selected_key = self
+            .filtered_rows
+            .get(self.selected)
+            .and_then(Row::seen_key);
+        let pending_page_down_distance = self
+            .pending_page_down_target
+            .map(|target| target.saturating_sub(self.selected));
         let PickerPage {
             rows,
+            mut read_states,
             history_modes,
             next_cursor,
             num_scanned_files,
@@ -1609,9 +1987,14 @@ impl PickerState {
         } = page;
         self.pagination
             .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
-        self.thread_history_modes.extend(history_modes);
-
-        for row in rows {
+        for mut row in rows {
+            if let Some(thread_id) = row.thread_id {
+                row.history_mode = history_modes.get(&thread_id).copied();
+                self.update_unread(
+                    (row.backend_id.unwrap_or(self.backend_id), thread_id),
+                    unread_revision(read_states.remove(&thread_id.to_string())),
+                );
+            }
             if let Some(cwd) = row.cwd.as_ref()
                 && !self.local_cwd_matches.contains_key(cwd)
             {
@@ -1619,15 +2002,44 @@ impl PickerState {
                 self.local_cwd_matches.insert(cwd.clone(), matches);
             }
             if let Some(seen_key) = row.seen_key() {
-                if self.seen_rows.insert(seen_key) {
+                if self.seen_rows.insert(seen_key.clone()) {
                     self.all_rows.push(row);
+                } else if let Some(existing) = self.all_rows.iter_mut().find(|existing| {
+                    existing.seen_key().as_ref() == Some(&seen_key)
+                        && existing.backend_id == row.backend_id
+                        && existing.thread_id == row.thread_id
+                }) {
+                    // Preserve the pre-catalog behavior where metadata from a later page wins.
+                    existing.history_mode = row.history_mode;
                 }
             } else {
                 self.all_rows.push(row);
             }
         }
 
+        let sort_key = self.sort_key;
+        self.all_rows.sort_by_key(|row| {
+            std::cmp::Reverse(match sort_key {
+                ThreadSortKey::CreatedAt => row.created_at,
+                ThreadSortKey::UpdatedAt
+                | ThreadSortKey::RecencyAt
+                | ThreadSortKey::SectionPosition => row.updated_at.or(row.created_at),
+            })
+        });
         self.apply_filter();
+        if let Some(selected_key) = selected_key
+            && let Some(index) = self
+                .filtered_rows
+                .iter()
+                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
+        {
+            self.selected = index;
+            if let Some(distance) = pending_page_down_distance {
+                self.pending_page_down_target = Some(index.saturating_add(distance));
+            }
+            self.ensure_selected_visible();
+            self.request_frame();
+        }
     }
 
     fn complete_pending_page_down(&mut self) {
@@ -1652,6 +2064,7 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        self.chord_matcher.cancel();
         let base_iter = self
             .all_rows
             .iter()
@@ -1691,7 +2104,7 @@ impl PickerState {
             return false;
         };
         paths_match(row_cwd, filter_cwd)
-            || (self.worktrees_enabled
+            || (self.filter_mode == SessionFilterMode::Repo
                 && codex_git_utils::repository_identity(row_cwd)
                     .zip(codex_git_utils::repository_identity(filter_cwd))
                     .is_some_and(|(row, filter)| {
@@ -1846,8 +2259,10 @@ impl PickerState {
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
             cursor: Some(cursor),
             request_token,
+            listing_token: self.listing_token,
             search_token,
             mode,
+            filter_mode: self.filter_mode,
             cwd_filter: self.active_cwd_filter(),
             status: self.status,
             provider_filter: self.provider_filter.clone(),
@@ -1887,8 +2302,12 @@ impl PickerState {
         self.start_initial_load();
     }
 
-    fn toggle_filter_mode(&mut self) {
-        let next_filter_mode = self.filter_mode.toggle(self.filter_cwd.as_deref());
+    fn change_filter_mode(&mut self, direction: ToolbarValueDirection) {
+        let next_filter_mode = self.filter_mode.change(
+            direction,
+            self.filter_cwd.as_deref(),
+            self.repo_filter_available,
+        );
         if self.filter_mode == next_filter_mode {
             return;
         }
@@ -1906,7 +2325,7 @@ impl PickerState {
 
     fn active_cwd_filter(&self) -> Option<PathBuf> {
         match self.filter_mode {
-            SessionFilterMode::Cwd => self.filter_cwd.clone(),
+            SessionFilterMode::Cwd | SessionFilterMode::Repo => self.filter_cwd.clone(),
             SessionFilterMode::All => None,
         }
     }
@@ -1919,10 +2338,10 @@ impl PickerState {
         self.toolbar_focus = self.toolbar_focus.next(self.action);
     }
 
-    fn change_focused_toolbar_value(&mut self) {
+    fn change_focused_toolbar_value(&mut self, direction: ToolbarValueDirection) {
         match self.toolbar_focus {
             ToolbarControl::Sort => self.toggle_sort_key(),
-            ToolbarControl::Filter => self.toggle_filter_mode(),
+            ToolbarControl::Filter => self.change_filter_mode(direction),
             ToolbarControl::Status => self.toggle_status(),
         }
     }
@@ -1958,6 +2377,7 @@ impl PickerState {
         let Some(thread_id) = row.thread_id else {
             return;
         };
+        let backend_id = row.backend_id.unwrap_or(self.backend_id);
         if self.expanded_thread_id == Some(thread_id) {
             self.expanded_thread_id = None;
             self.request_frame();
@@ -1968,7 +2388,10 @@ impl PickerState {
             self.transcript_previews.entry(thread_id)
         {
             e.insert(TranscriptPreviewState::Loading);
-            (self.picker_loader)(PickerLoadRequest::Preview { thread_id });
+            (self.picker_loader)(PickerLoadRequest::Preview {
+                backend_id,
+                thread_id,
+            });
         }
         self.request_frame();
     }
@@ -2063,6 +2486,8 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
     };
     let preview = thread.preview.trim();
     Some(Row {
+        backend_id: None,
+        history_mode: None,
         path: thread.path,
         preview: if preview.is_empty() {
             String::from("(no message yet)")
@@ -2090,7 +2515,9 @@ fn thread_list_params(
     use_state_db_only: bool,
 ) -> ThreadListParams {
     ThreadListParams {
+        current_account_only: true,
         excluded_thread_ids: None,
+        attached_to_thread_id: None,
         originators: None,
         cursor,
         limit: Some(PAGE_SIZE as u32),
@@ -2098,6 +2525,7 @@ fn thread_list_params(
         sort_direction: None,
         model_providers: match provider_filter {
             ProviderFilter::Any => None,
+            ProviderFilter::All => Some(Vec::new()),
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
         source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
@@ -2115,10 +2543,8 @@ fn thread_list_params(
 pub(crate) fn repository_cwd_filter(
     cwd: &Path,
     uses_remote_filesystem: bool,
-    worktrees_enabled: bool,
 ) -> ThreadListCwdFilter {
-    if worktrees_enabled
-        && !uses_remote_filesystem
+    if !uses_remote_filesystem
         && let Some(cwds) = codex_git_utils::linked_worktree_cwds(cwd)
         && cwds.len() > 1
     {
@@ -2129,6 +2555,16 @@ pub(crate) fn repository_cwd_filter(
         );
     }
     ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())
+}
+
+fn local_repo_filter_available(cwd: &Path) -> bool {
+    codex_git_utils::linked_worktree_cwds(cwd).is_some_and(|cwds| {
+        cwds.into_iter()
+            .filter_map(|cwd| dunce::canonicalize(cwd).ok())
+            .collect::<HashSet<_>>()
+            .len()
+            > 1
+    })
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
@@ -2268,19 +2704,27 @@ fn filter_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>
             ),
         ];
     }
-    vec![
+    let mut values = vec![
         "Filter: ".set_style(secondary_text_style()),
         toolbar_value(
             filter_mode_label(SessionFilterMode::Cwd),
             state.filter_mode == SessionFilterMode::Cwd,
             filter_focused,
         ),
-        toolbar_value(
-            filter_mode_label(SessionFilterMode::All),
-            state.filter_mode == SessionFilterMode::All,
+    ];
+    if state.repo_filter_available {
+        values.push(toolbar_value(
+            filter_mode_label(SessionFilterMode::Repo),
+            state.filter_mode == SessionFilterMode::Repo,
             filter_focused,
-        ),
-    ]
+        ));
+    }
+    values.push(toolbar_value(
+        filter_mode_label(SessionFilterMode::All),
+        state.filter_mode == SessionFilterMode::All,
+        filter_focused,
+    ));
+    values
 }
 
 fn toolbar_value(label: &'static str, active: bool, focused: bool) -> Span<'static> {
@@ -2300,6 +2744,7 @@ fn toolbar_value(label: &'static str, active: bool, focused: bool) -> Span<'stat
 fn filter_mode_label(filter_mode: SessionFilterMode) -> &'static str {
     match filter_mode {
         SessionFilterMode::Cwd => "Cwd",
+        SessionFilterMode::Repo => "Repo",
         SessionFilterMode::All => "All",
     }
 }
@@ -2853,11 +3298,6 @@ fn render_comfortable_session_lines(
     is_zebra: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let marker = selection_marker(is_selected, is_expanded);
-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
-    let title = session_title_span(title, row.thread_id, state.use_theme_colors, is_selected);
-    let title_line = Line::from(vec![marker, title]);
-    let mut lines = vec![title_line];
     let row_style = if is_selected {
         dense_selected_style()
     } else if is_zebra {
@@ -2865,7 +3305,20 @@ fn render_comfortable_session_lines(
     } else {
         Style::default()
     };
-    lines = apply_session_row_background(lines, row_style, width);
+    let marker = selection_marker(is_selected, is_expanded);
+    let unread = state.unread_revision(row).is_some();
+    let title = truncate_text(
+        row.display_preview(),
+        (width as usize).saturating_sub(marker.width() + 2 * usize::from(unread)),
+    );
+    let title = session_title_span(title, row.thread_id, state.use_theme_colors, is_selected);
+    let mut lines = vec![session_summary_line(
+        vec![marker],
+        title,
+        unread,
+        row_style,
+        width,
+    )];
     if is_expanded {
         lines.extend(render_transcript_preview_lines(row, state, width));
         return lines;
@@ -2880,12 +3333,11 @@ fn render_comfortable_session_lines(
         .as_ref()
         .map(|path| format_directory_display(path, /*max_width*/ None));
     let show_cwd = state.filter_mode == SessionFilterMode::All
-        || (state.worktrees_enabled
-            && row
-                .cwd
-                .as_deref()
-                .zip(state.local_filter_cwd.as_deref())
-                .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd)));
+        || row
+            .cwd
+            .as_deref()
+            .zip(state.local_filter_cwd.as_deref())
+            .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd));
     let footer_lines = render_footer_lines(
         state.sort_key,
         &created,
@@ -2958,6 +3410,7 @@ fn render_dense_session_lines(
         marker,
         date: &date,
         title: row.display_preview(),
+        unread: state.unread_revision(row).is_some(),
         thread_id: row.thread_id,
         use_theme_colors: state.use_theme_colors,
         is_selected,
@@ -2971,6 +3424,7 @@ fn render_dense_session_lines(
 }
 
 struct DenseSummaryInput<'a> {
+    unread: bool,
     thread_id: Option<ThreadId>,
     use_theme_colors: bool,
     marker: Span<'static>,
@@ -2982,11 +3436,23 @@ struct DenseSummaryInput<'a> {
 }
 
 fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+    let row_style = if input.is_selected {
+        dense_selected_style()
+    } else if input.is_zebra {
+        dense_zebra_style()
+    } else {
+        Style::default()
+    };
     let marker_width = input.marker.width();
     let available = (input.width as usize).saturating_sub(marker_width);
     let columns = dense_columns(available);
     let title = session_title_span(
-        dense_column_text(input.title, columns.title_width),
+        dense_column_text(
+            input.title,
+            columns
+                .title_width
+                .saturating_sub(2 * usize::from(input.unread)),
+        ),
         input.thread_id,
         input.use_theme_colors,
         input.is_selected,
@@ -2995,17 +3461,32 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
     let spans = vec![
         input.marker,
         dense_column_text(input.date, columns.date_width).set_style(secondary_text_style()),
-        title,
     ];
-    let line = Line::from(spans);
-    let row_style = if input.is_selected {
-        dense_selected_style()
-    } else if input.is_zebra {
-        dense_zebra_style()
-    } else {
-        Style::default()
-    };
-    apply_line_background(line, row_style, input.width)
+    session_summary_line(spans, title, input.unread, row_style, input.width)
+}
+
+/// Paint the title and metadata first so contrast adjustment preserves the fixed blue dot.
+fn session_summary_line(
+    mut prefix: Vec<Span<'static>>,
+    title: Span<'static>,
+    unread: bool,
+    row_style: Style,
+    width: u16,
+) -> Line<'static> {
+    let title_index = prefix.len();
+    prefix.push(title);
+    let mut line = apply_line_background(
+        prefix.into(),
+        row_style,
+        width.saturating_sub(2 * u16::from(unread)),
+    );
+    if unread {
+        line.spans.splice(
+            title_index..title_index,
+            [crate::style::task_marker(unread, row_style), " ".into()],
+        );
+    }
+    line
 }
 
 struct DenseColumns {
@@ -3595,6 +4076,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemPayload;
     use codex_app_server_protocol::ThreadSourceKind;
     use codex_config::CONFIG_TOML_FILE;
     use codex_protocol::ThreadId;
@@ -3612,7 +4094,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    fn page(
+    pub(super) fn page(
         rows: Vec<Row>,
         next_cursor: Option<&str>,
         num_scanned_files: usize,
@@ -3620,6 +4102,7 @@ mod tests {
     ) -> PickerPage {
         PickerPage {
             rows,
+            read_states: HashMap::new(),
             history_modes: HashMap::new(),
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
@@ -3644,6 +4127,7 @@ mod tests {
             .handle_background_event(BackgroundEvent::Page {
                 request_token: request.request_token,
                 search_token: request.search_token,
+                mode: request.mode,
                 page,
             })
             .await
@@ -3655,9 +4139,11 @@ mod tests {
         Ok(page(rows, next_cursor, n, /*reached_scan_cap*/ false))
     }
 
-    fn make_row(path: &str, ts: &str, preview: &str) -> Row {
+    pub(super) fn make_row(path: &str, ts: &str, preview: &str) -> Row {
         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
         Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from(path)),
             preview: preview.to_string(),
             thread_id: None,
@@ -3669,13 +4155,14 @@ mod tests {
         }
     }
 
-    fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
+    pub(super) fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_sink = Arc::clone(&requests);
         let loader = page_only_loader(move |request| {
             request_sink.lock().unwrap().push(request);
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -3719,7 +4206,7 @@ mod tests {
             .join("\n")
     }
 
-    fn render_picker_list(state: &PickerState, width: u16, height: u16) -> String {
+    pub(super) fn render_picker_list(state: &PickerState, width: u16, height: u16) -> String {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;
 
@@ -3738,6 +4225,8 @@ mod tests {
     #[test]
     fn row_display_preview_prefers_thread_name() {
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("first message"),
             thread_id: None,
@@ -3752,7 +4241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktrees_filtering_requires_feature() {
+    async fn linked_worktree_sessions_follow_directory_scope() {
         let root = tempfile::tempdir().expect("temporary repository");
         let primary = root.path().join("primary");
         let linked = root.path().join("linked");
@@ -3770,6 +4259,7 @@ mod tests {
         let primary = dunce::canonicalize(primary).unwrap();
         let linked = dunce::canonicalize(linked).unwrap();
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             page_only_loader(|_| {}),
             ProviderFilter::MatchDefault("openai".to_string()),
@@ -3780,59 +4270,52 @@ mod tests {
         let mut row = make_row("session.jsonl", "2025-01-01T00:00:00Z", "Linked session");
         row.cwd = Some(linked.clone());
         let single = ThreadListCwdFilter::One(primary.display().to_string());
-        for enabled in [false, true] {
-            state.worktrees_enabled = enabled;
-            state.start_initial_load();
-            state.ingest_page(page(
-                vec![row.clone()],
-                /*next_cursor*/ None,
-                /*num_scanned_files*/ 1,
-                /*reached_scan_cap*/ false,
-            ));
-            assert_eq!(
-                state.filtered_rows,
-                if enabled { vec![row.clone()] } else { vec![] }
-            );
-            if enabled {
-                state
-                    .pagination
-                    .finish_load(state.next_request_token - 1)
-                    .expect("initial page completed");
-                state.relative_time_reference =
-                    Some(parse_timestamp_str("2025-01-02T00:00:00Z").expect("fixed time"));
-                // The retained row was filtered using its real checkout path; use a stable
-                // display path so the snapshot is independent of the temporary directory.
-                state.filtered_rows[0].cwd = Some(PathBuf::from("/repo/linked"));
-                state.update_viewport(/*rows*/ 12, /*width*/ 100);
-                assert_snapshot!(
-                    "resume_picker_linked_worktree",
-                    render_picker_list(&state, /*width*/ 100, /*height*/ 12)
-                );
-            }
-            assert_eq!(
-                repository_cwd_filter(&primary, /*uses_remote_filesystem*/ false, enabled),
-                if enabled {
-                    ThreadListCwdFilter::Many(vec![
-                        primary.display().to_string(),
-                        linked.display().to_string(),
-                    ])
-                } else {
-                    single.clone()
-                }
-            );
-            assert_eq!(
-                repository_cwd_filter(&primary, /*uses_remote_filesystem*/ true, enabled),
-                single
-            );
-        }
-        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+        state.repo_filter_available = local_repo_filter_available(&primary);
+        state.start_initial_load();
+        state.ingest_page(page(
+            vec![row.clone()],
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 1,
+            /*reached_scan_cap*/ false,
+        ));
+        assert!(state.filtered_rows.is_empty());
+        state.change_filter_mode(ToolbarValueDirection::Next);
+        state.ingest_page(page(
+            vec![row.clone()],
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 1,
+            /*reached_scan_cap*/ false,
+        ));
+        assert_eq!(state.filtered_rows, vec![row.clone()]);
+        state
+            .pagination
+            .finish_load(state.next_request_token - 1)
+            .expect("initial page completed");
+        state.relative_time_reference =
+            Some(parse_timestamp_str("2025-01-02T00:00:00Z").expect("fixed time"));
+        // The retained row was filtered using its real checkout path; use a stable
+        // display path so the snapshot is independent of the temporary directory.
+        state.filtered_rows[0].cwd = Some(PathBuf::from("/repo/linked"));
+        state.update_viewport(/*rows*/ 12, /*width*/ 100);
+        assert_snapshot!(
+            "resume_picker_linked_worktree",
+            render_picker_list(&state, /*width*/ 100, /*height*/ 12)
+        );
+        assert_eq!(
+            repository_cwd_filter(&primary, /*uses_remote_filesystem*/ false),
+            ThreadListCwdFilter::Many(vec![
+                primary.display().to_string(),
+                linked.display().to_string(),
+            ])
+        );
+        assert_eq!(
+            repository_cwd_filter(&primary, /*uses_remote_filesystem*/ true),
+            single
+        );
+        let config = crate::legacy_core::config::ConfigBuilder::default()
             .codex_home(root.path().to_path_buf())
             .build()
             .await
-            .unwrap();
-        config
-            .features
-            .set_enabled(codex_features::Feature::Worktrees, /*enabled*/ true)
             .unwrap();
         for (filename_ts, timestamp, cwd) in [
             ("2025-01-02T10-00-00", "2025-01-02T10:00:00Z", &primary),
@@ -3863,24 +4346,44 @@ mod tests {
             bg_tx,
         );
         let mut live_picker = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
-            loader,
+            loader.loader.clone(),
             ProviderFilter::MatchDefault(config.model_provider_id.clone()),
             /*show_all*/ false,
             Some(primary.clone()),
             SessionPickerAction::Resume,
         );
         live_picker.local_filter_cwd = Some(primary.clone());
-        live_picker.worktrees_enabled = true;
         live_picker.start_initial_load();
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), bg_rx.recv())
-            .await
-            .expect("app-server page response")
-            .expect("page event");
-        live_picker
-            .handle_background_event(event)
-            .await
-            .expect("ingest app-server page");
+        while live_picker.pagination.is_loading() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), bg_rx.recv())
+                .await
+                .expect("app-server page response")
+                .expect("page event");
+            live_picker
+                .handle_background_event(event)
+                .await
+                .expect("ingest app-server page");
+        }
+        assert!(
+            live_picker
+                .filtered_rows
+                .iter()
+                .all(|row| row.cwd.as_deref() == Some(primary.as_path()))
+        );
+        live_picker.filter_mode = SessionFilterMode::Repo;
+        live_picker.start_initial_load();
+        while live_picker.pagination.is_loading() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), bg_rx.recv())
+                .await
+                .expect("app-server repo page response")
+                .expect("repo page event");
+            live_picker
+                .handle_background_event(event)
+                .await
+                .expect("ingest app-server repo page");
+        }
         let linked_index = live_picker
             .filtered_rows
             .iter()
@@ -3900,21 +4403,19 @@ mod tests {
             live_picker.handle_key(accept).await.expect("fork selection"),
             Some(SessionSelection::Fork(SessionTarget { thread_id, .. })) if thread_id == linked_id
         ));
-        let mut local = crate::latest_session_lookup_params(
-            /*uses_remote_filesystem*/ false,
-            /*model_provider*/ None,
-            &config,
+        drop(live_picker);
+        drop(bg_rx);
+        loader.task.await.unwrap();
+        let local = crate::latest_session_lookup_params(
+            /*model_providers*/ None,
             Some(&primary),
             /*include_non_interactive*/ false,
             crate::LatestSessionLookupMode::StateDbOnly,
         );
-        assert!(matches!(local.cwd, Some(ThreadListCwdFilter::Many(_))));
-        local.cwd = Some(single.clone());
+        assert_eq!(local.cwd, Some(single.clone()));
         assert_eq!(
             crate::latest_session_lookup_params(
-                /*uses_remote_filesystem*/ true,
-                /*model_provider*/ None,
-                &config,
+                /*model_providers*/ None,
                 Some(&primary),
                 /*include_non_interactive*/ false,
                 crate::LatestSessionLookupMode::StateDbOnly,
@@ -4085,10 +4586,19 @@ mod tests {
                 "---- loading fallback ----\n{loading_snapshot}\n---- repaired results ----\n{repaired_snapshot}"
             )
         );
+        state.pagination.complete_page(
+            Some(PageCursor::AppServer("fallback-next".to_string())),
+            /*num_scanned_files*/ 0,
+            /*reached_scan_cap*/ false,
+        );
+        assert!(matches!(
+            state.pagination.next_page(),
+            Some((_, PageLoadMode::StoreDefault))
+        ));
     }
 
     #[tokio::test]
-    async fn local_db_first_accepts_db_thread_id_without_rollout_validation() {
+    async fn local_db_first_accepts_db_thread_id_and_latest_history_mode() {
         let (mut state, requests) = local_db_first_state();
         state.start_initial_load();
         let db_request = requests.lock().unwrap()[0].clone();
@@ -4107,6 +4617,20 @@ mod tests {
             .insert(thread_id, ThreadHistoryMode::Legacy);
         deliver_page(&mut state, &db_request, Ok(listed_page)).await;
 
+        let mut updated_row = make_row(
+            "/tmp/missing-rollout.jsonl",
+            "2025-01-02T00:00:00Z",
+            "updated indexed metadata",
+        );
+        updated_row.thread_id = Some(thread_id);
+        updated_row.cwd = Some(PathBuf::from("/tmp/saved-cwd"));
+        let mut updated_page = ok_page(vec![updated_row], /*next_cursor*/ None)
+            .expect("updated indexed thread page should be available");
+        updated_page
+            .history_modes
+            .insert(thread_id, ThreadHistoryMode::Paginated);
+        state.ingest_page(updated_page);
+
         let selection = state
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -4116,7 +4640,7 @@ mod tests {
             Some(SessionSelection::Resume(SessionTarget {
                 thread_id: selected_thread_id,
                 cwd: Some(cwd),
-                history_mode: Some(ThreadHistoryMode::Legacy),
+                history_mode: Some(ThreadHistoryMode::Paginated),
                 ..
             })) if selected_thread_id == thread_id && cwd == Path::new("/tmp/saved-cwd")
         ));
@@ -4127,6 +4651,8 @@ mod tests {
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("first message"),
             thread_id: Some(thread_id),
@@ -4178,6 +4704,7 @@ mod tests {
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4188,6 +4715,8 @@ mod tests {
         state.clock_format = ClockFormat::TwentyFourHour;
         state.relative_time_reference = parse_timestamp_str("2026-05-02T14:48:19Z");
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("first message"),
             thread_id: Some(thread_id),
@@ -4333,37 +4862,6 @@ mod tests {
     }
 
     #[test]
-    fn picker_renders_server_provider_history() {
-        let cwd = PathBuf::from("/project");
-        let mut row = make_row(
-            "/session.jsonl",
-            "2025-01-02T11:00:00Z",
-            "Other provider session",
-        );
-        row.cwd = Some(cwd.clone());
-        let mut state = PickerState::new(
-            FrameRequester::test_dummy(),
-            page_only_loader(|_| {}),
-            ProviderFilter::MatchDefault("server-provider".to_string()),
-            /*show_all*/ false,
-            Some(cwd),
-            SessionPickerAction::Resume,
-        );
-        state.ingest_page(page(
-            vec![row],
-            /*next_cursor*/ None,
-            /*num_scanned_files*/ 1,
-            /*reached_scan_cap*/ false,
-        ));
-        state.relative_time_reference = Some(parse_timestamp_str("2025-01-02T12:00:00Z").unwrap());
-        state.update_viewport(/*rows*/ 12, /*width*/ 80);
-        assert_snapshot!(
-            "resume_picker_shared_provider_history",
-            render_picker_list(&state, /*width*/ 80, /*height*/ 12)
-        );
-    }
-
-    #[test]
     fn remote_thread_list_params_omit_provider_filter() {
         let params = thread_list_params(
             Some(String::from("cursor-1")),
@@ -4414,6 +4912,7 @@ mod tests {
         });
         let remote_cwd = Some(PathBuf::from("/srv/link-project"));
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::Any,
@@ -4434,6 +4933,8 @@ mod tests {
         }
 
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
@@ -4451,6 +4952,7 @@ mod tests {
     fn remote_picker_does_not_filter_rows_by_local_cwd() {
         let loader = page_only_loader(|_| {});
         let state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::Any,
@@ -4459,6 +4961,8 @@ mod tests {
             SessionPickerAction::Resume,
         );
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
@@ -4473,9 +4977,10 @@ mod tests {
     }
 
     #[test]
-    fn resume_table_snapshot() {
+    fn mixed_backend_resume_table_snapshot() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4485,8 +4990,11 @@ mod tests {
         );
 
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
-        let rows = vec![
+        let unread_id = ThreadId::from_u128(/*value*/ 2);
+        let mut rows = [
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: Some(PathBuf::from("/tmp/a.jsonl")),
                 preview: String::from("Fix resume picker timestamps"),
                 thread_id: None,
@@ -4497,9 +5005,11 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: Some(PathBuf::from("/tmp/b.jsonl")),
                 preview: String::from("Investigate lazy pagination cap"),
-                thread_id: None,
+                thread_id: Some(unread_id),
                 thread_name: None,
                 created_at: Some(now - Duration::hours(1)),
                 updated_at: Some(now - Duration::minutes(35)),
@@ -4507,6 +5017,8 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: Some(PathBuf::from("/tmp/c.jsonl")),
                 preview: String::from("Explain the codebase"),
                 thread_id: None,
@@ -4517,12 +5029,50 @@ mod tests {
                 git_branch: None,
             },
         ];
-        state.all_rows = rows.clone();
-        state.filtered_rows = rows;
+        let local_backend = state.backend_id;
+        let cloud_backend = crate::backend_id::BackendId::new();
+        rows[0].backend_id = Some(cloud_backend);
+        for row in &mut rows[1..] {
+            row.backend_id = Some(local_backend);
+        }
+        let mut local_page = page(
+            rows[1..].to_vec(),
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 2,
+            /*reached_scan_cap*/ false,
+        );
+        local_page.read_states.insert(
+            unread_id.to_string(),
+            codex_app_server_protocol::ThreadReadState {
+                first_unread: Some(codex_app_server_protocol::ThreadUnreadPosition::ThreadStart),
+                revision: "revision".into(),
+            },
+        );
+        state.ingest_page(local_page);
+        state.selected = 0;
+        state.ingest_page(page(
+            vec![rows[0].clone()],
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 1,
+            /*reached_scan_cap*/ false,
+        ));
         state.relative_time_reference = Some(now);
-        state.selected = 1;
         state.scroll_top = 0;
         state.update_viewport(/*rows*/ 12, /*width*/ 80);
+
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(|row| row.backend_id)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(cloud_backend),
+                Some(local_backend),
+                Some(local_backend)
+            ]
+        );
+        assert_eq!(state.selected, 1);
 
         let snapshot = render_picker_list(&state, /*width*/ 80, /*height*/ 12);
         assert_snapshot!("resume_picker_table", snapshot);
@@ -4535,6 +5085,7 @@ mod tests {
 
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4567,6 +5118,7 @@ mod tests {
     fn hint_line_switches_esc_label_for_search_mode() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4586,6 +5138,7 @@ mod tests {
     fn hint_line_labels_cancel_keys_as_exit_for_existing_session_resume_picker() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4614,6 +5167,7 @@ mod tests {
     fn hint_line_switches_density_label() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4645,6 +5199,7 @@ mod tests {
     fn hint_line_compacts_on_narrow_width() {
         let loader = page_only_loader(|_| {});
         let state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4668,6 +5223,7 @@ mod tests {
     fn hint_line_snapshot_uses_distributed_wide_footer() {
         let loader = page_only_loader(|_| {});
         let state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4686,6 +5242,7 @@ mod tests {
     fn hint_line_snapshot_uses_compact_footer() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4706,6 +5263,7 @@ mod tests {
     fn hint_line_preserves_primary_action_labels_when_very_narrow() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4734,6 +5292,7 @@ mod tests {
     fn hint_line_shows_loading_transcript_mode() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4741,7 +5300,7 @@ mod tests {
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
-        state.pending_transcript_open = Some(ThreadId::new());
+        state.pending_transcript_open = Some((state.backend_id, ThreadId::new()));
 
         let rendered = footer_lines_text(&state, /*width*/ 80);
 
@@ -4754,6 +5313,7 @@ mod tests {
     fn picker_footer_percent_reports_scroll_progress() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4782,6 +5342,7 @@ mod tests {
     fn picker_footer_progress_label_shows_position_total_and_percent() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4810,6 +5371,7 @@ mod tests {
     fn picker_footer_progress_label_uses_known_count_when_more_pages_exist() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4838,6 +5400,7 @@ mod tests {
     fn picker_footer_progress_label_freezes_percent_while_loading() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4873,6 +5436,7 @@ mod tests {
     fn picker_footer_percent_is_complete_when_not_scrollable() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4895,6 +5459,7 @@ mod tests {
     async fn ctrl_o_toggles_density_without_typing_into_search() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4924,6 +5489,7 @@ mod tests {
             }
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4932,6 +5498,8 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -4949,9 +5517,10 @@ mod tests {
 
         assert_eq!(state.density, SessionListDensity::Comfortable);
         assert_eq!(*recorded_requests.lock().unwrap(), vec![thread_id]);
-        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        let key = (state.backend_id, thread_id);
+        assert_eq!(state.pending_transcript_open, Some(key));
         assert!(matches!(
-            state.transcript_cells.get(&thread_id),
+            state.transcript_cells.get(&key),
             Some(SessionTranscriptState::Loading)
         ));
     }
@@ -4961,6 +5530,7 @@ mod tests {
         let loader = page_only_loader(|_| {});
         let thread_id = ThreadId::new();
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -4970,6 +5540,8 @@ mod tests {
         );
         state.filtered_rows = vec![
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: None,
                 preview: String::from("one"),
                 thread_id: Some(ThreadId::new()),
@@ -4980,6 +5552,8 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: None,
                 preview: String::from("two"),
                 thread_id: Some(ThreadId::new()),
@@ -4990,7 +5564,7 @@ mod tests {
                 git_branch: None,
             },
         ];
-        state.pending_transcript_open = Some(thread_id);
+        state.pending_transcript_open = Some((state.backend_id, thread_id));
 
         let selection = state
             .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
@@ -5021,6 +5595,7 @@ mod tests {
             }
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5039,7 +5614,8 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
             .await
             .unwrap();
-        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        let key = (state.backend_id, thread_id);
+        assert_eq!(state.pending_transcript_open, Some(key));
 
         state
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -5047,7 +5623,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.pending_transcript_open, None);
-        assert!(!state.transcript_cells.contains_key(&thread_id));
+        assert!(!state.transcript_cells.contains_key(&key));
         assert!(
             cancellation
                 .lock()
@@ -5069,6 +5645,7 @@ mod tests {
     async fn transcript_loading_still_allows_ctrl_c_exit() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5076,7 +5653,7 @@ mod tests {
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
-        state.pending_transcript_open = Some(ThreadId::new());
+        state.pending_transcript_open = Some((state.backend_id, ThreadId::new()));
 
         let selection = state
             .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -5093,6 +5670,7 @@ mod tests {
 
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5101,9 +5679,11 @@ mod tests {
             SessionPickerAction::Resume,
         );
         let thread_id = ThreadId::new();
-        state.pending_transcript_open = Some(thread_id);
+        state.pending_transcript_open = Some((state.backend_id, thread_id));
         state.filtered_rows = vec![
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: None,
                 preview: String::from("Find pending threads and emails"),
                 thread_id: Some(thread_id),
@@ -5114,6 +5694,8 @@ mod tests {
                 git_branch: None,
             },
             Row {
+                backend_id: None,
+                history_mode: None,
                 path: None,
                 preview: String::from("Plan raw scrollback mode"),
                 thread_id: Some(ThreadId::new()),
@@ -5161,6 +5743,7 @@ mod tests {
             }
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5169,6 +5752,8 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -5191,6 +5776,7 @@ mod tests {
     async fn ctrl_t_on_row_without_thread_id_shows_inline_error() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5199,6 +5785,8 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("preview"),
             thread_id: None,
@@ -5225,10 +5813,11 @@ mod tests {
         use crate::history_cell::PlainHistoryCell;
 
         let thread_id = ThreadId::new();
-        let loader = page_only_loader(|_| {});
+        let (tx, mut receipts) = tokio::sync::mpsc::unbounded_channel();
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
-            loader,
+            Arc::new(move |request| tx.send(request).unwrap()),
             ProviderFilter::MatchDefault(String::from("openai")),
             /*show_all*/ true,
             /*filter_cwd*/ None,
@@ -5242,23 +5831,32 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        state.pending_transcript_open = Some(thread_id);
+        let owner = BackendId::new();
+        let key = (owner, thread_id);
+        state.pending_transcript_open = Some(key);
         let cells: TranscriptCells =
             vec![Arc::new(PlainHistoryCell::new(vec!["transcript".into()]))];
 
         state
+            .transcript_cells
+            .insert(key, SessionTranscriptState::Loading);
+        state
             .handle_background_event(BackgroundEvent::Transcript {
+                backend_id: owner,
                 thread_id,
-                transcript: Ok(cells),
+                transcript: Ok(LoadedTranscript {
+                    cells,
+                    unread_revision: Some("observed".into()),
+                }),
             })
             .await
             .unwrap();
 
         assert!(state.overlay.is_none());
-        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        assert_eq!(state.pending_transcript_open, Some(key));
         assert!(matches!(
-            state.transcript_cells.get(&thread_id),
-            Some(SessionTranscriptState::Loaded(_))
+            state.transcript_cells.get(&key),
+            Some(SessionTranscriptState::Loaded(..))
         ));
 
         assert!(state.note_transcript_loading_frame_drawn());
@@ -5276,6 +5874,16 @@ mod tests {
         assert_eq!(state.route_key_chord(select), Some(select));
         assert!(!state.chord_matcher.is_pending());
         let mut tui = crate::tui::test_support::make_test_tui().expect("tui");
+        assert!(receipts.try_recv().is_err());
+        tui.defer_screen_size(Size::new(80, 24));
+        tui.screen_size_for_event(&TuiEvent::Draw).unwrap();
+        state
+            .handle_overlay_event(&mut tui, TuiEvent::Draw)
+            .unwrap();
+        assert!(
+            matches!(receipts.try_recv(), Ok(PickerLoadRequest::Acknowledge { backend_id, thread_id: id, revision })
+            if backend_id == owner && id == thread_id && revision == "observed")
+        );
         state
             .handle_overlay_event(
                 &mut tui,
@@ -5332,6 +5940,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5340,6 +5949,8 @@ mod tests {
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -5349,11 +5960,13 @@ mod tests {
             cwd: None,
             git_branch: None,
         }];
+        let key = (state.backend_id, thread_id);
         state.transcript_cells.insert(
-            thread_id,
-            SessionTranscriptState::Loaded(vec![Arc::new(PlainHistoryCell::new(vec![
-                "transcript".into(),
-            ]))]),
+            key,
+            SessionTranscriptState::Loaded(LoadedTranscript {
+                cells: vec![Arc::new(PlainHistoryCell::new(vec!["transcript".into()]))],
+                unread_revision: None,
+            }),
         );
 
         state
@@ -5362,7 +5975,7 @@ mod tests {
             .unwrap();
 
         assert!(state.overlay.is_none());
-        assert_eq!(state.pending_transcript_open, Some(thread_id));
+        assert_eq!(state.pending_transcript_open, Some(key));
 
         assert!(state.note_transcript_loading_frame_drawn());
         state.open_pending_transcript_if_ready();
@@ -5376,6 +5989,7 @@ mod tests {
         let tmp = tempdir().expect("tmpdir");
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5410,6 +6024,7 @@ session_picker_view = "dense"
         std::fs::write(&codex_home_file, "not a directory").expect("write codex home file");
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5441,6 +6056,7 @@ session_picker_view = "dense"
     async fn raw_ctrl_o_toggles_density_without_typing_into_search() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5463,6 +6079,7 @@ session_picker_view = "dense"
     async fn space_appends_to_search_query() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5491,11 +6108,12 @@ session_picker_view = "dense"
         let recorded_requests: Arc<Mutex<Vec<ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
         let request_sink = recorded_requests.clone();
         let loader: PickerLoader = Arc::new(move |request| {
-            if let PickerLoadRequest::Preview { thread_id } = request {
+            if let PickerLoadRequest::Preview { thread_id, .. } = request {
                 request_sink.lock().unwrap().push(thread_id);
             }
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5504,6 +6122,8 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -5535,6 +6155,7 @@ session_picker_view = "dense"
         let thread_id = ThreadId::new();
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5543,6 +6164,8 @@ session_picker_view = "dense"
             SessionPickerAction::Resume,
         );
         state.filtered_rows = vec![Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("preview"),
             thread_id: Some(thread_id),
@@ -5567,7 +6190,8 @@ session_picker_view = "dense"
         use crate::test_backend::VT100Backend;
 
         let loader = page_only_loader(|_| {});
-        let state = PickerState::new(
+        let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5575,6 +6199,7 @@ session_picker_view = "dense"
             Some(PathBuf::from("/tmp/project")),
             SessionPickerAction::Resume,
         );
+        state.set_repo_filter_available(/*available*/ true);
 
         let width: u16 = 100;
         let backend = VT100Backend::new(width, /*height*/ 1);
@@ -5598,6 +6223,7 @@ session_picker_view = "dense"
     fn toolbar_compacts_on_narrow_width() {
         let loader = page_only_loader(|_| {});
         let state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5616,6 +6242,8 @@ session_picker_view = "dense"
 
     fn dense_snapshot_row() -> Row {
         Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from(
                 "Propose session picker redesign with enough title text to exercise truncation",
@@ -5644,6 +6272,7 @@ session_picker_view = "dense"
         let loader = page_only_loader(|_| {});
         let row = dense_snapshot_row();
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5703,6 +6332,7 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5729,6 +6359,7 @@ session_picker_view = "dense"
     #[test]
     fn dense_selected_summary_line_uses_full_width_selection_style() {
         let line = dense_summary_line(DenseSummaryInput {
+            unread: false,
             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
             date: "15m ago",
             title: "Selected dense row",
@@ -5747,6 +6378,7 @@ session_picker_view = "dense"
     #[test]
     fn dense_zebra_summary_line_uses_full_width_background() {
         let line = dense_summary_line(DenseSummaryInput {
+            unread: false,
             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
             date: "15m ago",
             title: "Zebra dense row",
@@ -5765,6 +6397,7 @@ session_picker_view = "dense"
     fn comfortable_zebra_lines_use_full_width_background() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5806,6 +6439,7 @@ session_picker_view = "dense"
         second.preview = String::from("Second dense row");
         second.git_branch = Some(String::from("fcoury/other-branch"));
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5848,6 +6482,8 @@ session_picker_view = "dense"
         let thread_id =
             ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id");
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("Investigate picker expansion"),
             thread_id: Some(thread_id),
@@ -5858,6 +6494,7 @@ session_picker_view = "dense"
             git_branch: Some(String::from("fcoury/session-picker")),
         };
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5918,6 +6555,8 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/a.jsonl")),
             preview: String::from("Investigate picker expansion"),
             thread_id: Some(
@@ -5930,6 +6569,7 @@ session_picker_view = "dense"
             git_branch: Some(String::from("fcoury/session-picker")),
         };
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5968,6 +6608,7 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -5978,6 +6619,8 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..5)
             .map(|idx| Row {
+                backend_id: None,
+                history_mode: None,
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
                 preview: format!("item-{idx}"),
                 thread_id: None,
@@ -6020,6 +6663,7 @@ session_picker_view = "dense"
 
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6030,6 +6674,8 @@ session_picker_view = "dense"
         let now = parse_timestamp_str("2026-04-28T16:30:00Z").expect("timestamp");
         state.all_rows = (0..4)
             .map(|idx| Row {
+                backend_id: None,
+                history_mode: None,
                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
                 preview: format!("item-{idx}"),
                 thread_id: None,
@@ -6075,6 +6721,7 @@ session_picker_view = "dense"
     fn pageless_scrolling_deduplicates_and_keeps_order() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6127,6 +6774,79 @@ session_picker_view = "dense"
     }
 
     #[test]
+    fn page_ingestion_globally_sorts_rows_and_preserves_selection() {
+        let loader = page_only_loader(|_| {});
+        let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.sort_key = ThreadSortKey::CreatedAt;
+        state.reset_pagination();
+        state.ingest_page(page(
+            vec![make_row(
+                "/tmp/selected.jsonl",
+                "2025-01-02T00:00:00Z",
+                "selected",
+            )],
+            Some("2025-01-02T00:00:00Z"),
+            /*num_scanned_files*/ 1,
+            /*reached_scan_cap*/ false,
+        ));
+
+        let mut newest_update = make_row(
+            "/tmp/newest-update.jsonl",
+            "2025-01-01T00:00:00Z",
+            "newest update",
+        );
+        newest_update.updated_at = parse_timestamp_str("2025-01-04T00:00:00Z");
+        state.ingest_page(page(
+            vec![
+                make_row(
+                    "/tmp/newest-created.jsonl",
+                    "2025-01-03T00:00:00Z",
+                    "newest created",
+                ),
+                newest_update,
+            ],
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 2,
+            /*reached_scan_cap*/ false,
+        ));
+
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(|row| row.preview.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest created", "selected", "newest update"]
+        );
+        assert_eq!(state.filtered_rows[state.selected].preview, "selected");
+
+        state.sort_key = ThreadSortKey::UpdatedAt;
+        state.ingest_page(page(
+            Vec::new(),
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 0,
+            /*reached_scan_cap*/ false,
+        ));
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(|row| row.preview.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest update", "newest created", "selected"]
+        );
+        assert_eq!(state.filtered_rows[state.selected].preview, "selected");
+    }
+
+    #[test]
     fn ensure_minimum_rows_prefetches_when_underfilled() {
         let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let request_sink = recorded_requests.clone();
@@ -6135,6 +6855,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6169,6 +6890,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6204,6 +6926,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6246,6 +6969,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6288,6 +7012,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6307,10 +7032,28 @@ session_picker_view = "dense"
             .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
             .await
             .unwrap();
+        assert_eq!(state.filter_mode, SessionFilterMode::All);
+        state.set_repo_filter_available(/*available*/ true);
+        assert_eq!(state.filter_mode, SessionFilterMode::All);
 
-        let guard = recorded_requests.lock().unwrap();
-        assert_eq!(guard.len(), 2);
-        assert_eq!(guard[1].cwd_filter, None);
+        let cwd_filter = Some(Path::new("/tmp/project"));
+        for (key, filter_mode, expected_cwd) in [
+            (KeyCode::Left, SessionFilterMode::Repo, cwd_filter),
+            (KeyCode::Left, SessionFilterMode::Cwd, cwd_filter),
+            (KeyCode::Right, SessionFilterMode::Repo, cwd_filter),
+            (KeyCode::Right, SessionFilterMode::All, None),
+        ] {
+            state
+                .handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .await
+                .unwrap();
+            let guard = recorded_requests.lock().unwrap();
+            let request = guard.last().expect("filter reload request");
+            assert_eq!(
+                (request.filter_mode, request.cwd_filter.as_deref()),
+                (filter_mode, expected_cwd)
+            );
+        }
     }
 
     #[tokio::test]
@@ -6322,6 +7065,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6356,6 +7100,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::Any,
@@ -6398,6 +7143,7 @@ session_picker_view = "dense"
     async fn page_navigation_uses_view_rows() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6451,12 +7197,34 @@ session_picker_view = "dense"
             .await
             .unwrap();
         assert_eq!(state.selected, 0);
+
+        state.selected = 9;
+        state.pending_page_down_target = Some(19);
+        let newer_items = (20..50)
+            .map(|idx| {
+                let timestamp = format!("2026-01-{:02}T00:00:00Z", idx - 19);
+                make_row(
+                    &format!("/tmp/item-{idx}.jsonl"),
+                    &timestamp,
+                    &format!("item-{idx}"),
+                )
+            })
+            .collect();
+        state.ingest_page(page(
+            newer_items,
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 30,
+            /*reached_scan_cap*/ false,
+        ));
+        assert_eq!(state.selected, 39);
+        assert_eq!(state.pending_page_down_target, Some(49));
     }
 
     #[tokio::test]
     async fn page_and_jump_navigation_use_list_keymap() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6519,6 +7287,7 @@ session_picker_view = "dense"
     async fn ctrl_c_exits_even_when_cancel_is_remapped_to_ctrl_c() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6544,6 +7313,7 @@ session_picker_view = "dense"
             request_sink.lock().unwrap().push(req);
         });
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6588,6 +7358,7 @@ session_picker_view = "dense"
     async fn enter_on_row_without_resolvable_thread_id_shows_inline_error() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6597,6 +7368,8 @@ session_picker_view = "dense"
         );
 
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: Some(PathBuf::from("/tmp/missing.jsonl")),
             preview: String::from("missing metadata"),
             thread_id: None,
@@ -6627,6 +7400,7 @@ session_picker_view = "dense"
     async fn enter_on_pathless_thread_uses_thread_id() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6636,6 +7410,8 @@ session_picker_view = "dense"
         );
         let thread_id = ThreadId::new();
         let row = Row {
+            backend_id: None,
+            history_mode: None,
             path: None,
             preview: String::from("pathless thread"),
             thread_id: Some(thread_id),
@@ -6655,6 +7431,7 @@ session_picker_view = "dense"
 
         match selection {
             Some(SessionSelection::Resume(SessionTarget {
+                backend_id: _,
                 path: None,
                 thread_id: selected_thread_id,
                 cwd: None,
@@ -6714,7 +7491,7 @@ session_picker_view = "dense"
         use crate::thread_transcript::thread_to_transcript_cells;
 
         let thread_id = ThreadId::new();
-        let thread = Thread {
+        let mut thread = Thread {
             originator: None,
             environments: None,
             id: thread_id.to_string(),
@@ -6751,26 +7528,27 @@ session_picker_view = "dense"
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![
-                    ThreadItem::UserMessage {
+                    ThreadItem::untimed(ThreadItemPayload::UserMessage {
                         id: String::from("user-1"),
                         client_id: None,
                         content: vec![codex_app_server_protocol::UserInput::Text {
                             text: String::from("hello from user"),
                             text_elements: Vec::new(),
                         }],
-                    },
-                    ThreadItem::AgentMessage {
+                    }),
+                    ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                        moderation: None,
                         id: String::from("agent-1"),
                         text: String::from("hello from assistant"),
                         phase: None,
                         memory_citation: None,
                         delivery: None,
                         questions: None,
-                    },
-                    ThreadItem::Plan {
+                    }),
+                    ThreadItem::untimed(ThreadItemPayload::Plan {
                         id: String::from("plan-1"),
                         text: String::from("1. Do the thing"),
-                    },
+                    }),
                 ],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -6780,6 +7558,18 @@ session_picker_view = "dense"
             }],
         };
 
+        thread.turns.push(codex_app_server_protocol::Turn {
+            id: String::from("turn-2"),
+            items: Vec::new(),
+            status: codex_app_server_protocol::TurnStatus::Failed,
+            error: Some(codex_app_server_protocol::TurnError {
+                message: String::from("Connection lost"),
+                codex_error_info: None,
+                additional_details: None,
+                misalignment: None,
+            }),
+            ..thread.turns[0].clone()
+        });
         let rendered = thread_to_transcript_cells(
             thread,
             RawReasoningVisibility::Visible,
@@ -6795,6 +7585,7 @@ session_picker_view = "dense"
         assert!(rendered.contains("hello from assistant"));
         assert!(rendered.contains("Proposed Plan"));
         assert!(rendered.contains("Do the thing"));
+        insta::assert_snapshot!(rendered.lines().last().unwrap(), @"■ Connection lost");
     }
 
     #[test]
@@ -6838,11 +7629,11 @@ session_picker_view = "dense"
                 id: String::from("turn-1"),
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::Reasoning {
+                items: vec![ThreadItem::untimed(ThreadItemPayload::Reasoning {
                     id: String::from("reasoning-1"),
                     summary: Vec::new(),
                     content: vec![String::from("private raw chain of thought")],
-                }],
+                })],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
                 started_at: None,
@@ -6917,11 +7708,11 @@ session_picker_view = "dense"
                 id: String::from("turn-1"),
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::Reasoning {
+                items: vec![ThreadItem::untimed(ThreadItemPayload::Reasoning {
                     id: String::from("reasoning-1"),
                     summary: vec![String::from("public summary")],
                     content: vec![String::from("raw reasoning content")],
-                }],
+                })],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
                 started_at: None,
@@ -6948,6 +7739,7 @@ session_picker_view = "dense"
     async fn moving_to_last_card_scrolls_when_cards_exceed_viewport() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -6990,6 +7782,7 @@ session_picker_view = "dense"
     async fn up_from_bottom_keeps_viewport_stable_when_card_remains_visible() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7032,6 +7825,7 @@ session_picker_view = "dense"
     async fn up_scrolls_only_after_crossing_top_edge() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7070,6 +7864,7 @@ session_picker_view = "dense"
     fn list_reports_more_rows_above_and_below() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7111,6 +7906,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7137,11 +7933,14 @@ session_picker_view = "dense"
             assert_eq!(guard.len(), 1);
             guard[0].clone()
         };
+        state.set_query("later".to_string());
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
 
         state
             .handle_background_event(BackgroundEvent::Page {
                 request_token: first_request.request_token,
                 search_token: first_request.search_token,
+                mode: first_request.mode,
                 page: Ok(page(
                     vec![make_row("/tmp/beta.jsonl", "2025-01-02T00:00:00Z", "beta")],
                     Some("2025-01-03T00:00:00Z"),
@@ -7164,11 +7963,12 @@ session_picker_view = "dense"
             .handle_background_event(BackgroundEvent::Page {
                 request_token: second_request.request_token,
                 search_token: second_request.search_token,
+                mode: second_request.mode,
                 page: Ok(page(
                     vec![make_row(
                         "/tmp/match.jsonl",
                         "2025-01-03T00:00:00Z",
-                        "target log",
+                        "later log",
                     )],
                     Some("2025-01-04T00:00:00Z"),
                     /*num_scanned_files*/ 7,
@@ -7193,6 +7993,7 @@ session_picker_view = "dense"
             .handle_background_event(BackgroundEvent::Page {
                 request_token: second_request.request_token,
                 search_token: second_request.search_token,
+                mode: second_request.mode,
                 page: Ok(page(
                     Vec::new(),
                     /*next_cursor*/ None,
@@ -7204,19 +8005,43 @@ session_picker_view = "dense"
             .unwrap();
         assert_eq!(recorded_requests.lock().unwrap().len(), 1);
 
+        let mut pending_page = page(
+            Vec::new(),
+            /*next_cursor*/ None,
+            /*num_scanned_files*/ 3,
+            /*reached_scan_cap*/ false,
+        );
+        pending_page.next_cursor = Some(PageCursor::SourcesPending);
         state
             .handle_background_event(BackgroundEvent::Page {
                 request_token: active_request.request_token,
                 search_token: active_request.search_token,
-                page: Ok(page(
-                    Vec::new(),
-                    /*next_cursor*/ None,
-                    /*num_scanned_files*/ 3,
-                    /*reached_scan_cap*/ true,
-                )),
+                mode: active_request.mode,
+                page: Ok(pending_page),
             })
             .await
             .unwrap();
+        assert!(state.search_state.is_active());
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
+        state.set_query("updated".to_string());
+        assert!(state.search_state.is_active());
+        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
+
+        state
+            .handle_background_event(BackgroundEvent::PartialPage {
+                listing_token: state.listing_token,
+                page: page(
+                    vec![make_row("/s", "2025-01-04T00:00:00Z", "slow")],
+                    Some("2025-01-05T00:00:00Z"),
+                    /*num_scanned_files*/ 1,
+                    /*reached_scan_cap*/ false,
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(recorded_requests.lock().unwrap().len(), 2);
+        state.pagination.reached_scan_cap = true;
+        state.continue_search_if_needed();
 
         assert!(state.filtered_rows.is_empty());
         assert!(!state.search_state.is_active());
@@ -7227,6 +8052,7 @@ session_picker_view = "dense"
     async fn paste_appends_to_existing_query() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7245,6 +8071,7 @@ session_picker_view = "dense"
     async fn whitespace_only_paste_is_ignored() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7268,6 +8095,7 @@ session_picker_view = "dense"
         });
 
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7300,6 +8128,7 @@ session_picker_view = "dense"
     async fn esc_with_empty_query_starts_fresh() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),
@@ -7320,6 +8149,7 @@ session_picker_view = "dense"
     async fn esc_with_query_clears_search_and_preserves_selected_result() {
         let loader = page_only_loader(|_| {});
         let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
             FrameRequester::test_dummy(),
             loader,
             ProviderFilter::MatchDefault(String::from("openai")),

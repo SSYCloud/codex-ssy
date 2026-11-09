@@ -30,6 +30,28 @@ fn sleep_tool_config_rejects_unknown_mode() {
 }
 
 #[test]
+fn runtime_auth_config_accepts_modes_without_implicitly_enabling_the_feature() {
+    for mode in ["dual_header", "assertion_only"] {
+        let config: FeaturesToml =
+            toml::from_str(&format!("[runtime_agent_instances]\nmode = '{mode}'")).unwrap();
+        let mut features = Features::with_defaults();
+        features.apply_toml(&config);
+        assert!(!features.enabled(Feature::RuntimeAgentInstances));
+
+        let config: FeaturesToml = toml::from_str(&format!(
+            "[runtime_agent_instances]\nenabled = true\nmode = '{mode}'"
+        ))
+        .unwrap();
+        features.apply_toml(&config);
+        assert!(features.enabled(Feature::RuntimeAgentInstances));
+    }
+    assert!(
+        toml::from_str::<FeaturesToml>("[runtime_agent_instances]\nmode = 'credential_only'")
+            .is_err()
+    );
+}
+
+#[test]
 fn under_development_features_are_disabled_by_default() {
     for spec in crate::FEATURES {
         // Instant interrupts are enabled by default while retaining their development stage.
@@ -120,13 +142,16 @@ fn codex_apps_mcp_protocol_can_be_enabled_independently_of_generic_mcp() {
 }
 
 #[test]
-fn default_enabled_features_are_stable() {
+fn default_enabled_features_have_shipped() {
     for spec in crate::FEATURES {
         // Instant interrupts are enabled by default while retaining their development stage.
         if spec.default_enabled && spec.id != Feature::InstantInterrupt {
             assert!(
-                matches!(spec.stage, Stage::Stable | Stage::Removed),
-                "feature `{}` is enabled by default but is not stable/removed ({:?})",
+                matches!(
+                    spec.stage,
+                    Stage::Stable | Stage::Deprecated | Stage::Removed
+                ),
+                "feature `{}` is enabled by default at stage {:?}",
                 spec.key,
                 spec.stage
             );
@@ -187,6 +212,43 @@ fn guardian_v2_feature_config_preserves_boolean_toggle() {
         features.entries(),
         BTreeMap::from([("guardianv2".to_owned(), true)])
     );
+}
+
+#[test]
+fn guardian_v3_feature_config_resolves_base_and_profile_toggles() {
+    for (base, profile, enabled) in [
+        ("guardianv3 = true", "", true),
+        ("guardianv3 = false", "", false),
+        ("[guardianv3]", "", false),
+        ("[guardianv3]\nenabled = true", "", true),
+        ("[guardianv3]\nenabled = false", "", false),
+        (
+            "[guardianv3]\nenabled = true",
+            "[guardianv3]\nenabled = false",
+            false,
+        ),
+        (
+            "[guardianv3]\nenabled = false",
+            "[guardianv3]\nenabled = true",
+            true,
+        ),
+        ("[guardianv3]\nenabled = true", "[guardianv3]", true),
+    ] {
+        let base = toml::from_str::<FeaturesToml>(base).expect("base features");
+        let profile = toml::from_str::<FeaturesToml>(profile).expect("profile features");
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&base),
+                ..Default::default()
+            },
+            FeatureConfigSource {
+                features: Some(&profile),
+                ..Default::default()
+            },
+            FeatureOverrides::default(),
+        );
+        assert_eq!(features.enabled(Feature::GuardianV3), enabled);
+    }
 }
 
 #[test]
@@ -270,6 +332,8 @@ max_recent_non_user_entries = 12
     assert_eq!(
         features.guardianv2,
         Some(FeatureToml::Config(crate::GuardianV2ConfigToml {
+            sync_elastic_budgeting: None,
+            sync_elastic_sections: None,
             transcript_mode: None,
             async_classifier_mode: None,
             async_classifier_conversation_token_limit: Some(120_000),
@@ -755,11 +819,13 @@ usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
 subagent_developer_instructions = "Delegate carefully."
+preserve_fork_prefix = true
 multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 expose_spawn_agent_model_overrides = true
 wait_agent_enabled = false
+disable_native_tools = true
 disable_direct_message = true
 message_board_in_memory = true
 non_code_mode_only = true
@@ -784,11 +850,13 @@ non_code_mode_only = true
             root_agent_usage_hint_text: Some("Root guidance.".to_string()),
             subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
             subagent_developer_instructions: Some("Delegate carefully.".to_string()),
+            preserve_fork_prefix: Some(true),
             multi_agent_mode_hint_text: Some("Custom mode guidance.".to_string()),
             tool_namespace: Some("agents".to_string()),
             hide_spawn_agent_metadata: Some(true),
             expose_spawn_agent_model_overrides: Some(true),
             wait_agent_enabled: Some(false),
+            disable_native_tools: Some(true),
             disable_direct_message: Some(true),
             message_board_in_memory: Some(true),
             message_board_remote: None,
@@ -896,4 +964,41 @@ code_mode = true
         "Under-development features enabled: code_mode. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.".to_string(),
         message
     );
+}
+
+#[test]
+fn retired_worktree_and_voice_config_overrides_are_ignored() {
+    for enabled in [false, true] {
+        let features_toml = FeaturesToml::from(BTreeMap::from([
+            ("worktrees".to_string(), enabled),
+            ("realtime_conversation".to_string(), enabled),
+        ]));
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&features_toml),
+                ..Default::default()
+            },
+            FeatureConfigSource::default(),
+            FeatureOverrides::default(),
+        );
+        assert_eq!(features, Features::with_defaults());
+    }
+}
+
+#[test]
+fn model_change_suppression_config_preserves_omission_and_explicit_values() {
+    for (input, expected) in [
+        ("", false),
+        ("suppress_model_change_announcements = false", false),
+        ("suppress_model_change_announcements = true", true),
+    ] {
+        let config: FeaturesToml = toml::from_str(input).unwrap();
+        let mut features = Features::with_defaults();
+        features.apply_toml(&config);
+        assert_eq!(
+            features.enabled(Feature::SuppressModelChangeAnnouncements),
+            expected,
+            "{input}"
+        );
+    }
 }

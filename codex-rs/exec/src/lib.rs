@@ -28,6 +28,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
@@ -39,7 +40,10 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
-use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemsListCursor;
+use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadReadParams;
@@ -59,7 +63,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_cloud_config::managed_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
@@ -72,6 +76,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigTomlLoadResult;
 use codex_core::config::bootstrap_auth_config;
+use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_oss_provider;
@@ -97,6 +102,11 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::TrustLevel;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL;
+use codex_protocol::mcp_approval_meta::CANCELLATION_REASON_KEY;
+use codex_protocol::mcp_approval_meta::McpApprovalCancellationReason;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -152,6 +162,7 @@ pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -261,6 +272,11 @@ fn exec_stderr_env_filter() -> EnvFilter {
 }
 
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    if cli.trust && cli.ignore_user_config {
+        anyhow::bail!(
+            "--trust cannot be combined with --ignore-user-config: saved project trust decisions must be checked"
+        );
+    }
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
@@ -272,6 +288,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         thread_source,
         cyber_access_program,
         skip_git_repo_check,
+        trust,
         ephemeral,
         ignore_user_config,
         ignore_rules,
@@ -348,7 +365,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
         Err(e) => {
@@ -404,9 +421,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             CloudConfigBundleLoader::default(),
         )
         .await;
-        let gate_cloud_config = cloud_config_bundle_loader_for_storage(
+        let gate_cloud_config = managed_config_bundle_loader_for_storage(
             embedded_network_policy
                 .bind_bootstrap_auth(bootstrap_auth_config(&codex_home, &gate_bootstrap)?),
+            gate_bootstrap.config_layer_stack.requirements_toml(),
             /*enable_codex_api_key_env*/ false,
         )
         .await?;
@@ -422,11 +440,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(gate_cloud_config.clone())
             .build()
             .await?;
-        if !gate_config.features.enabled(Feature::Worktrees) {
-            anyhow::bail!(
-                "--worktree requires the worktrees feature; enable it with --enable worktrees"
-            );
-        }
         if let Some(ExecCommand::Fork(args)) = command.as_mut() {
             let saved_cwd = worktree::fork_source(
                 args,
@@ -509,8 +522,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     // API keys cannot fetch workspace-managed configuration. Preserve the
     // existing ChatGPT bootstrap identity even when model requests allow
     // CODEX_API_KEY.
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+    let cloud_config_bundle = managed_config_bundle_loader_for_storage(
         bootstrap_auth_config,
+        bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
@@ -535,9 +549,36 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             );
         }
     }
-    let run_cli_overrides = cli_kv_overrides.clone();
-    let run_loader_overrides = loader_overrides.clone();
-    let run_cloud_config_bundle = cloud_config_bundle.clone();
+    if trust {
+        // Honor the caller's project discovery settings while checking saved trust.
+        let mut discovery_overrides = cli_kv_overrides.clone();
+        discovery_overrides.retain(|(key, _)| key != "projects" && !key.starts_with("projects."));
+        let saved_config = load_bootstrap_config_or_exit(
+            &codex_home,
+            Some(&config_cwd),
+            discovery_overrides,
+            loader_overrides.clone(),
+            strict_config,
+            cloud_config_bundle.clone(),
+        )
+        .await;
+        if let Some(project) = saved_config.config_layer_stack.project_trust {
+            match project.trust_level {
+                Some(TrustLevel::Untrusted) => anyhow::bail!(
+                    "{} is marked as untrusted. Update its trust setting first.",
+                    project.trust_key
+                ),
+                Some(TrustLevel::Trusted) => {}
+                None => {
+                    let user_config = loader_overrides.user_config_path(&codex_home)?;
+                    ConfigEditsBuilder::for_config_path(user_config.as_path())
+                        .set_project_trust_level(project.trust_key, TrustLevel::Trusted)
+                        .apply()
+                        .await?;
+                }
+            }
+        }
+    }
 
     let model_provider = if oss {
         let bootstrap_config_with_cloud_config;
@@ -595,14 +636,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         permission_profile: None,
         default_permissions: None,
         persisted_permission_profile_id: None,
+        persisted_permission_profile: None,
         cwd: resolved_cwd,
         workspace_roots: None,
         model_provider: model_provider.clone(),
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
-        default_zsh_path: None,
+        main_execve_wrapper_exe: None,
         base_instructions: None,
         developer_instructions: None,
         personality: None,
@@ -631,6 +672,19 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await?;
     embedded_network_policy.activate(&mut config);
+    #[allow(clippy::print_stderr)]
+    if config
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .any(|layer| {
+            matches!(layer.name, codex_config::ConfigLayerSource::Project { .. })
+                && layer.disabled_reason.is_some()
+        })
+    {
+        eprintln!(
+            "warning: Untrusted project-local configuration is disabled. Run `codex exec --trust` to allow project configuration and MCP servers for this and future chats in the project, including MCP commands outside the sandbox. Explicitly untrusted projects must have their trust setting updated first."
+        );
+    }
     let daybreak_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "daybreak")
@@ -715,7 +769,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
     );
     let state_db = codex_core::init_state_db(&config).await;
-    let environment_manager = if run_loader_overrides.ignore_user_config {
+    let environment_manager = if loader_overrides.ignore_user_config {
         EnvironmentManager::from_env(
             Some(local_runtime_paths),
             embedded_network_policy.bind(config.http_client_factory()),
@@ -729,13 +783,24 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         )
         .await?
     };
+    if let Some(provider) = &model_provider {
+        // Keep app-server config reloads aligned with the explicit --oss selection.
+        cli_kv_overrides.push(("model_provider".to_string(), provider.clone().into()));
+    }
+
     let in_process_start_args = InProcessClientStartArgs {
+        required_human_approval: false,
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),
-        cli_overrides: run_cli_overrides,
-        loader_overrides: run_loader_overrides,
+        cli_overrides: cli_kv_overrides,
+        // An explicit thread/start cwd can grant trust when the sandbox is writable.
+        // Give the embedded server its working directory as a default instead.
+        loader_overrides: LoaderOverrides {
+            default_cwd: Some(config.cwd.clone()),
+            ..loader_overrides
+        },
         strict_config,
-        cloud_config_bundle: run_cloud_config_bundle,
+        cloud_config_bundle,
         embedded_network_policy,
         feedback: CodexFeedback::new(),
         log_db: None,
@@ -1019,6 +1084,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // Bind before starting the agent. Sandbox activity cannot redirect the final write.
+    let bound_output = last_message_file
+        .as_deref()
+        .map(|path| {
+            codex_exec_server::BoundOutput::open(path).map_err(|error| {
+                anyhow::anyhow!("Failed to open last message file {path:?}: {error}")
+            })
+        })
+        .transpose()?;
+
     let mut request_ids = RequestIdSequencer::new();
     let mut client = InProcessAppServerClient::start(in_process_start_args)
         .await
@@ -1028,7 +1103,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let mut daybreak_enabled = config.daybreak_enabled;
     // Resolve resume and fork through existing app-server thread lifecycle APIs.
-    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
+    let (history_mode, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
         command.as_ref()
     {
         if let Some(thread_id) =
@@ -1054,7 +1129,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             daybreak_enabled = daybreak_override
                 .or(response.thread.daybreak_enabled)
                 .unwrap_or(false);
-            (session_configured.thread_id, session_configured)
+            (response.thread.history_mode, session_configured)
         } else {
             let response = start_thread(&client, &mut request_ids, &config, &thread_source)
                 .await
@@ -1062,7 +1137,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             let session_configured =
                 session_configured_from_thread_start_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
+            (response.thread.history_mode, session_configured)
         }
     } else if let Some(ExecCommand::Fork(args)) = command.as_ref() {
         let source_args = crate::cli::ResumeArgs {
@@ -1150,16 +1225,17 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             .or(response.thread.daybreak_enabled)
             .or(source_daybreak)
             .unwrap_or(false);
-        (session_configured.thread_id, session_configured)
+        (response.thread.history_mode, session_configured)
     } else {
         let response = start_thread(&client, &mut request_ids, &config, &thread_source)
             .await
             .map_err(anyhow::Error::msg)?;
         let session_configured = session_configured_from_thread_start_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
+        (response.thread.history_mode, session_configured)
     };
 
+    let primary_thread_id = fallback_session_configured.thread_id;
     if let Some(worktree) = managed_worktree.as_ref() {
         worktree
             .manager
@@ -1205,7 +1281,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 .shutdown()
                 .await
                 .map_err(|err| anyhow::anyhow!("in-process app-server shutdown failed: {err}"))?;
-            event_processor.print_final_output();
+            event_processor.print_final_output(bound_output)?;
             return Ok(());
         }
         InitialOperation::UserTurn {
@@ -1216,10 +1292,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 Some(program) => Some(program),
                 None if config.features.enabled(Feature::CliDaybreak) => {
                     daybreak::program_for_turn(
+                        &config.features,
                         &client,
                         &mut request_ids,
                         &session_configured.model,
                         &session_configured.model_provider_id,
+                        config
+                            .model_providers
+                            .get(&session_configured.model_provider_id),
                         daybreak_enabled,
                     )
                     .await?
@@ -1240,6 +1320,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         input: items.into_iter().map(Into::into).collect(),
                         tool_output: None,
                         responsesapi_client_metadata: None,
+                        responsesapi_client_metadata_patch: None,
                         additional_context: None,
                         environments: None,
                         cwd: Some(default_cwd),
@@ -1365,6 +1446,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 ) {
                     maybe_backfill_turn_completed_items(
                         config.ephemeral,
+                        history_mode,
                         &client,
                         &mut request_ids,
                         &mut notification,
@@ -1399,7 +1481,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     if let Err(err) = client.shutdown().await {
         warn!("in-process app-server shutdown failed: {err}");
     }
-    event_processor.print_final_output();
+    event_processor.print_final_output(bound_output)?;
     if error_seen {
         std::process::exit(1);
     }
@@ -1450,7 +1532,6 @@ fn thread_start_params_from_config(
     ThreadStartParams {
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
-        cwd: Some(config.cwd.to_string_lossy().to_string()),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: Some(config.approvals_reviewer.into()),
@@ -1735,14 +1816,13 @@ fn should_process_notification(
 
 async fn maybe_backfill_turn_completed_items(
     thread_ephemeral: bool,
+    history_mode: ThreadHistoryMode,
     client: &InProcessAppServerClient,
     request_ids: &mut RequestIdSequencer,
     notification: &mut ServerNotification,
 ) {
     // In-process delivery may drop non-terminal item notifications under backpressure while still
-    // guaranteeing `turn/completed`. Because app-server currently emits that completion with an
-    // empty `turn.items`, exec does one last `thread/read` here so human/json output can recover
-    // the final message and reconcile any still-running items before shutdown.
+    // guaranteeing `turn/completed`. Recover the completed turn's items before shutdown.
     if !should_backfill_turn_completed_items(thread_ephemeral, notification) {
         return;
     }
@@ -1750,6 +1830,64 @@ async fn maybe_backfill_turn_completed_items(
     let ServerNotification::TurnCompleted(payload) = notification else {
         return;
     };
+
+    if history_mode == ThreadHistoryMode::Paginated {
+        let completion_items = payload.turn.items.clone();
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let page: ThreadItemsListResponse = match client
+                .request_typed(ClientRequest::ThreadItemsList {
+                    request_id: request_ids.next(),
+                    params: ThreadItemsListParams {
+                        thread_id: payload.thread_id.clone(),
+                        turn_id: Some(payload.turn.id.clone()),
+                        cursor,
+                        limit: None,
+                        sort_direction: None,
+                        defer_output: None,
+                    },
+                })
+                .await
+            {
+                Ok(page) => page,
+                Err(err) => {
+                    warn!("thread/items/list failed during turn completion: {err}");
+                    return;
+                }
+            };
+            for entry in page.data {
+                match ThreadItem::try_from(entry) {
+                    Ok(item) => items.push(item),
+                    Err(err) => {
+                        warn!(
+                            "thread/items/list returned an incomplete item during turn completion: {err}"
+                        );
+                        return;
+                    }
+                }
+            }
+            let Some(next) = page.next_cursor else { break };
+            if !seen_cursors.insert(next.clone()) {
+                warn!("thread/items/list returned a repeated cursor during turn completion");
+                return;
+            }
+            cursor = Some(ThreadItemsListCursor::Opaque(next));
+        }
+        for completion_item in completion_items {
+            if let Some(item) = items
+                .iter_mut()
+                .find(|item| item.id() == completion_item.id())
+            {
+                *item = completion_item;
+            } else {
+                items.push(completion_item);
+            }
+        }
+        payload.turn.items = items;
+        return;
+    }
 
     let response = send_request_with_response::<ThreadReadResponse>(
         client,
@@ -1792,7 +1930,7 @@ fn should_backfill_turn_completed_items(
 fn turn_items_for_thread(
     thread: &AppServerThread,
     turn_id: &str,
-) -> Option<Vec<AppServerThreadItem>> {
+) -> Option<Vec<codex_app_server_protocol::ThreadItem>> {
     thread
         .turns
         .iter()
@@ -1826,8 +1964,10 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
 
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let reader = codex_rollout::open_rollout_seekable_reader(&path).ok()?;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        let reader =
+            codex_rollout::open_rollout_seekable_reader(&path, || stop.is_closed()).ok()?;
         let mut scanner = codex_rollout::ReverseJsonlScanner::new(reader).ok()?;
         while let Some(outcome) = scanner.scan_next_rollout_line().ok()? {
             if let codex_rollout::ScanOutcome::Parsed(RolloutLine {
@@ -1842,7 +1982,9 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+    drop(keep_running);
+    result
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
@@ -1866,7 +2008,9 @@ async fn resolve_resume_thread_id(
                 ClientRequest::ThreadList {
                     request_id: RequestId::Integer(0),
                     params: ThreadListParams {
+                        current_account_only: true,
                         excluded_thread_ids: None,
+                        attached_to_thread_id: None,
                         originators: None,
                         cursor,
                         limit: Some(100),
@@ -1953,7 +2097,9 @@ async fn resolve_resume_thread_id(
             ClientRequest::ThreadList {
                 request_id: RequestId::Integer(0),
                 params: ThreadListParams {
+                    current_account_only: false,
                     excluded_thread_ids: None,
+                    attached_to_thread_id: None,
                     originators: None,
                     cursor,
                     limit: Some(100),
@@ -2002,11 +2148,19 @@ fn resume_lookup_model_providers(
     }
 }
 
-fn canceled_mcp_server_elicitation_response() -> Result<Value, String> {
+fn canceled_mcp_server_elicitation_response(
+    request: &McpServerElicitationRequest,
+) -> Result<Value, String> {
+    let tool_approval = matches!(request, McpServerElicitationRequest::Form { meta: Some(meta), .. }
+        if meta.get(APPROVAL_KIND_KEY).and_then(Value::as_str) == Some(APPROVAL_KIND_MCP_TOOL_CALL));
     serde_json::to_value(McpServerElicitationRequestResponse {
         action: McpServerElicitationAction::Cancel,
         content: None,
-        meta: None,
+        meta: tool_approval.then(|| {
+            serde_json::json!({
+                CANCELLATION_REASON_KEY: McpApprovalCancellationReason::NonInteractive,
+            })
+        }),
     })
     .map_err(|err| format!("failed to encode mcp elicitation response: {err}"))
 }
@@ -2077,11 +2231,11 @@ async fn handle_server_request(
 ) {
     let method = server_request_method_name(&request);
     let handle_result = match request {
-        ServerRequest::McpServerElicitationRequest { request_id, .. } => {
+        ServerRequest::McpServerElicitationRequest { request_id, params } => {
             // Exec auto-cancels elicitation instead of surfacing it
             // interactively. Preserve that behavior for attached subagent
             // threads too so we do not turn a cancel into a decline/error.
-            match canceled_mcp_server_elicitation_response() {
+            match canceled_mcp_server_elicitation_response(&params.request) {
                 Ok(value) => {
                     resolve_server_request(
                         client,

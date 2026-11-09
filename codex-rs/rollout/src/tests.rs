@@ -25,11 +25,11 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::find_rollout_path_by_rollout_id;
 use crate::find_thread_path_by_id_str;
-use crate::list::Cursor;
 use crate::list::ThreadItem;
 use crate::list::ThreadSortKey;
 use crate::list::ThreadsPage;
 use crate::list::get_threads;
+use crate::list::parse_cursor;
 use crate::list::read_head_for_summary;
 use crate::rollout_date_parts;
 use anyhow::Result;
@@ -227,12 +227,17 @@ async fn filesystem_lookup_distinguishes_thread_ids_from_rollout_ids() {
         "sessions/2025/01/04/rollout-{reverted_ts}-{thread_uuid}_{rollout_uuid}.jsonl"
     ));
     fs::rename(reverted_source, reverted_path.as_path()).unwrap();
+    let subsequent_rollout_uuid = Uuid::from_u128(403);
+    let subsequent_path = home.join(format!(
+        "sessions/2025/01/04/rollout-{reverted_ts}-{thread_uuid}_{subsequent_rollout_uuid}.jsonl"
+    ));
+    fs::copy(&reverted_path, &subsequent_path).unwrap();
 
     assert_eq!(
         find_thread_path_by_id_str(home, &thread_uuid.to_string(), /*state_db_ctx*/ None)
             .await
             .unwrap(),
-        Some(reverted_path.clone())
+        Some(subsequent_path)
     );
     assert_eq!(
         find_rollout_path_by_rollout_id(home, thread_id_from_uuid(rollout_uuid))
@@ -240,6 +245,39 @@ async fn filesystem_lookup_distinguishes_thread_ids_from_rollout_ids() {
             .unwrap(),
         Some(reverted_path)
     );
+}
+
+#[tokio::test]
+async fn sibling_rollout_prefetch_preserves_first_match_for_duplicate_ids() -> Result<()> {
+    let home = TempDir::new()?;
+    let sessions = home.path().join("sessions");
+    let directory = sessions.join("2025/01/03");
+    fs::create_dir_all(&directory)?;
+    let owner = ThreadId::new();
+    let child = ThreadId::new();
+    let first = ThreadId::new();
+    let second = ThreadId::new();
+    let child_path = directory.join(format!("rollout-2025-01-03T12-00-00-{owner}_{child}.jsonl"));
+    let first_sibling =
+        directory.join(format!("rollout-2025-01-03T12-00-00-{owner}_{first}.jsonl"));
+    let second_sibling = directory.join(format!(
+        "rollout-2025-01-03T12-00-00-{owner}_{second}.jsonl"
+    ));
+    let earlier_duplicate = sessions.join(format!("rollout-2025-01-02T12-00-00-{first}.jsonl"));
+    for path in [
+        &child_path,
+        &first_sibling,
+        &second_sibling,
+        &earlier_duplicate,
+    ] {
+        fs::write(path, b"")?;
+    }
+
+    let paths = crate::prefetch_sibling_rollout_paths(home.path(), &child_path, first).await?;
+
+    assert_eq!(paths.get(&first), Some(&earlier_duplicate));
+    assert_eq!(paths.get(&second), Some(&second_sibling));
+    Ok(())
 }
 
 #[tokio::test]
@@ -922,7 +960,7 @@ async fn test_pagination_cursor() {
         .join(format!("rollout-2025-03-04T09-00-00-{u4}.jsonl"));
     let updated_page1: Vec<Option<String>> =
         page1.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor1: Cursor = serde_json::from_str("\"2025-03-04T09-00-00\"").unwrap();
+    let expected_cursor1 = parse_cursor(&format!("2025-03-04T09:00:00Z|{u4}")).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -1010,7 +1048,7 @@ async fn test_pagination_cursor() {
         .join(format!("rollout-2025-03-02T09-00-00-{u2}.jsonl"));
     let updated_page2: Vec<Option<String>> =
         page2.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor2: Cursor = serde_json::from_str("\"2025-03-02T09-00-00\"").unwrap();
+    let expected_cursor2 = parse_cursor(&format!("2025-03-02T09:00:00Z|{u2}")).unwrap();
     let expected_page2 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -1453,6 +1491,8 @@ async fn read_head_for_summary_omits_harness_metadata() {
     let temp = TempDir::new().unwrap();
     let rollout_path = temp.path().join("rollout.jsonl");
     let response_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -1551,8 +1591,10 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
     let meta_line = RolloutLine {
         timestamp: ts.to_string(),
         ordinal: None,
-        item: RolloutItem::SessionMeta(SessionMetaLine {
+        item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
+                account_scoped: false,
+                attached_thread: false,
                 creator_user_id: None,
                 creator_account_id: None,
                 session_id: conversation_id.into(),
@@ -1582,7 +1624,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
                 context_window: None,
             },
             git: None,
-        }),
+        })),
     };
     writeln!(file, "{}", serde_json::to_string(&meta_line)?)?;
 
@@ -1606,9 +1648,13 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
             timestamp: format!("{ts}-{idx:02}"),
             ordinal: None,
             item: RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "assistant".into(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: format!("reply-{idx}"),
                 }],
                 phase: None,
@@ -1647,7 +1693,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
+async fn test_filesystem_cursor_pages_through_same_timestamp_ties() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();
 
@@ -1709,7 +1755,7 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
         .join(format!("rollout-2025-07-01T00-00-00-{u2}.jsonl"));
     let updated_page1: Vec<Option<String>> =
         page1.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor1: Cursor = serde_json::from_str(&format!("\"{ts}\"")).unwrap();
+    let expected_cursor1 = parse_cursor(&format!("{ts}|{u2}")).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -1771,27 +1817,31 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
     };
     assert_eq!(page1, expected_page1);
 
-    let page2 = get_threads(
-        home,
-        /*page_size*/ 2,
-        page1.next_cursor.as_ref(),
-        ThreadSortKey::CreatedAt,
-        INTERACTIVE_SESSION_SOURCES.as_slice(),
-        Some(provider_filter.as_slice()),
-        /*cwd_filters*/ None,
-        TEST_PROVIDER,
-    )
-    .await
-    .unwrap();
-    // The filesystem fallback only has second-precision timestamps in filenames. The primary
-    // SQLite-backed listing uses unique millisecond timestamps and does not have this tie.
-    let expected_page2 = ThreadsPage {
-        items: Vec::new(),
-        next_cursor: None,
-        num_scanned_files: 3,
-        reached_scan_cap: false,
-    };
-    assert_eq!(page2, expected_page2);
+    let legacy_cursor = parse_cursor(ts).unwrap();
+    for (cursor, expected_ids) in [
+        (expected_cursor1, vec![thread_id_from_uuid(u1)]),
+        (legacy_cursor, vec![]),
+    ] {
+        let page = get_threads(
+            home,
+            /*page_size*/ 2,
+            Some(&cursor),
+            ThreadSortKey::CreatedAt,
+            INTERACTIVE_SESSION_SOURCES.as_slice(),
+            Some(provider_filter.as_slice()),
+            /*cwd_filters*/ None,
+            TEST_PROVIDER,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = page
+            .items
+            .iter()
+            .map(|item| item.thread_id.unwrap())
+            .collect();
+        assert_eq!(ids, expected_ids);
+        assert_eq!(page.next_cursor, None);
+    }
 }
 
 #[tokio::test]

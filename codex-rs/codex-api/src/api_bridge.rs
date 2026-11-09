@@ -1,6 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
-use crate::error::parse_flex_unavailable;
+use crate::error::parse_terminal_provider_error;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -24,17 +24,22 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::Retryable { retry_after, .. }
         | ApiError::RateLimitExceeded { retry_after, .. }
         | ApiError::ServerOverloaded { retry_after }
+        | ApiError::PolicyCapacityUnavailable { retry_after }
         | ApiError::Transport(TransportError::Http { retry_after, .. }) => *retry_after,
         ApiError::Transport(_)
         | ApiError::Api { .. }
         | ApiError::Stream(_)
         | ApiError::ContentFilter
+        | ApiError::ResponseIncomplete(_)
         | ApiError::ContextWindowExceeded
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
+        | ApiError::SessionBudgetExceeded
         | ApiError::FlexUnavailable
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
+        | ApiError::InvalidAudioInput { .. }
+        | ApiError::ModelNotFound { .. }
         | ApiError::InvalidPrompt { .. }
         | ApiError::CyberPolicy { .. }
         | ApiError::BioPolicy { .. }
@@ -52,13 +57,20 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+        ApiError::SessionBudgetExceeded => CodexErr::SessionBudgetExceeded,
         ApiError::Retryable { message, .. } => CodexErr::Stream(message),
         ApiError::RateLimitExceeded { message, .. } => {
             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
         }
         ApiError::Stream(msg) => CodexErr::Stream(msg),
         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
+        ApiError::ResponseIncomplete(incomplete) => {
+            CodexErr::new(CodexErrorDetails::ResponseIncomplete(incomplete))
+        }
         ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+        ApiError::PolicyCapacityUnavailable { .. } => {
+            CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable)
+        }
         ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
@@ -74,6 +86,16 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ApiError::InvalidAudioInput {
+            message,
+            per_recording,
+        } => CodexErr::new(CodexErrorDetails::InvalidAudioInput {
+            message,
+            per_recording,
+        }),
+        ApiError::ModelNotFound { message, status } => {
+            CodexErr::new(CodexErrorDetails::ModelNotFound { message, status })
+        }
         ApiError::InvalidPrompt { message } => {
             CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
         }
@@ -97,12 +119,19 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 ..
             } => {
                 let body_text = body.unwrap_or_default();
+                let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
+                let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
+                if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
+                    return map_api_error_details(error);
+                }
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && let Some(error) = value.get("error")
+                    && let Some(error) = provider_error
                 {
                     match error.get("code").and_then(Value::as_str) {
+                        Some("policy_capacity_unavailable") => {
+                            return CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable);
+                        }
                         Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
                         Some("slow_down") => {
                             return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
@@ -119,8 +148,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
 
                 if (status == http::StatusCode::BAD_REQUEST
                     || status == http::StatusCode::FORBIDDEN)
-                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                    && let Some(error) = parsed.get("error")
+                    && let Some(error) = provider_error
                     && error.get("code").and_then(Value::as_str)
                         == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
                 {
@@ -141,8 +169,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
+                    if let Some(error) = provider_error
                         && let Some(
                             code @ (CYBER_POLICY_ERROR_CODE
                             | BIO_POLICY_ERROR_CODE
@@ -179,11 +206,6 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
-                    if let Ok(body) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = body.get("error").and_then(parse_flex_unavailable)
-                    {
-                        return map_api_error(error);
-                    }
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
                             let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);

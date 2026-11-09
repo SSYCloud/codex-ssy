@@ -181,9 +181,11 @@ fn wrapped_question_url_keeps_its_complete_destination() {
 }
 
 #[test]
-fn multiline_question_preserves_line_breaks_and_link_destinations() {
+fn markdown_question_preserves_formatting_and_link_destinations() {
     let url = "https://example.com/diagnostics?view=full";
-    let title = format!("Run this command:\n\n```sh\nprintf '診断'\n```\nThen review ({url})?\n");
+    let title = format!(
+        "Run **this command**:\n\n```sh\nprintf '診断'\n```\nThen review the [diagnostics]({url})?\n"
+    );
     let mut rendered = Vec::new();
     for line_ending in ["\n", "\r\n"] {
         let mut editor = editor();
@@ -207,9 +209,17 @@ fn multiline_question_preserves_line_breaks_and_link_destinations() {
                     })
                 })
                 .collect::<String>();
-            assert_eq!(linked_text, url);
+            assert!(linked_text.contains("diagnostics"));
             let text = crate::terminal_hyperlinks::strip_osc8(&buffer_text(&buffer));
             if width == 60 {
+                let bold_text = buffer
+                    .content
+                    .iter()
+                    .filter(|cell| cell.modifier.contains(Modifier::BOLD))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>();
+                assert!(bold_text.contains("this command"));
+                assert!(!bold_text.contains("Run "));
                 rendered.push(text);
             }
         }
@@ -366,7 +376,7 @@ fn question_options_reserve_wrapped_height_at_the_width_boundary() {
     let mut editor = editor();
     editor.state.pending.remove(/*index*/ 0);
     editor.state.pending[0].question.options =
-        Some(vec!["abcdefgh ijklmno".into(), "pqrstuvw xyzabcd".into()]);
+        Some(vec!["abcdefgh *ijklmno*".into(), "pqrstuvw xyzabcd".into()]);
     editor.restore_current_draft();
 
     // The five-column option prefix makes each named choice exactly 21 columns.
@@ -579,15 +589,20 @@ fn named_choices_share_selection_while_other_keeps_its_inline_cursor() {
         || {
             let mut editor = editor();
             editor.navigate(/*forward*/ true);
+            editor.state.pending[1].question.options =
+                Some(vec!["*Named* [guide](https://example.com)".into()]);
+            let linked_g = crate::terminal_hyperlinks::osc8_hyperlink("https://example.com", "g");
             for width in [40, 80] {
                 editor.select_option(/*index*/ 0);
                 let buffer = render_editor(&editor, width, /*height*/ 16);
+                assert!(buffer.content.iter().any(|cell| cell.symbol() == linked_g));
                 let cell = buffer
                     .content
                     .iter()
                     .find(|cell| cell.symbol() == "N")
                     .unwrap();
                 assert_eq!(cell.bg, crate::bottom_pane::selection_style().bg.unwrap());
+                assert!(cell.modifier.contains(Modifier::ITALIC));
                 editor.select_option(/*index*/ 1);
                 let buffer = render_editor(&editor, width, /*height*/ 16);
                 let cursor = editor.cursor_pos(buffer.area).unwrap();

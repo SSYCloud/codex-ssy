@@ -19,6 +19,10 @@ use crate::RetainedUserMessage;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::RawFileSystemSandboxPolicy;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -34,6 +38,9 @@ pub(super) enum RolloutItemWire<'a> {
     SessionMeta {
         payload: Cow<'a, SessionMetaLine>,
     },
+    DynamicToolsUpdated {
+        payload: DynamicToolsUpdatedPayload<'a>,
+    },
     ResponseItem {
         payload: Cow<'a, ResponseItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,9 +53,10 @@ pub(super) enum RolloutItemWire<'a> {
         payload: InterAgentCommunicationMetadataPayload,
     },
     Compacted {
-        payload: Cow<'a, CompactedItem>,
+        payload: Cow<'a, Box<CompactedItem>>,
     },
     TurnContext {
+        #[serde(serialize_with = "serialize_turn_context")]
         payload: Cow<'a, TurnContextItem>,
     },
     TokenUsageRecord {
@@ -71,11 +79,77 @@ pub(super) enum RolloutItemWire<'a> {
     },
 }
 
+fn serialize_turn_context<S>(context: &TurnContextItem, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // Keep older rollout readers usable during deployment and rollback. Runtime
+    // contexts stay profile-only; compatibility fields exist only on the wire.
+    #[derive(Serialize)]
+    struct Wire<'a> {
+        #[serde(flatten)]
+        context: &'a TurnContextItem,
+        sandbox_policy: SandboxPolicy,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_system_sandbox_policy: Option<RawFileSystemSandboxPolicy>,
+    }
+
+    let cwd = context.cwd.as_path();
+    let (file_system, network) = context.permission_profile.to_runtime_permissions();
+    let sandbox_policy = context
+        .permission_profile
+        .to_legacy_sandbox_policy(cwd)
+        .unwrap_or_else(|_| {
+            let tmpdir_writable = std::env::var_os("TMPDIR")
+                .filter(|path| !path.is_empty())
+                .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
+                .is_some_and(|path| file_system.can_write_local_path_with_cwd(path.as_path(), cwd));
+            let slash_tmp = std::path::Path::new("/tmp");
+            let slash_tmp_writable = slash_tmp.is_absolute()
+                && slash_tmp.is_dir()
+                && file_system.can_write_local_path_with_cwd(slash_tmp, cwd);
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: file_system
+                    .get_writable_roots_with_cwd(cwd)
+                    .into_iter()
+                    .map(|root| root.root)
+                    .filter(|root| root != &context.cwd)
+                    .collect(),
+                network_access: network.is_enabled(),
+                exclude_tmpdir_env_var: !tmpdir_writable,
+                exclude_slash_tmp: !slash_tmp_writable,
+            }
+        });
+    let legacy_file_system =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, cwd);
+    let file_system_sandbox_policy = (file_system != legacy_file_system)
+        .then(|| file_system.try_into().ok())
+        .flatten();
+    Wire {
+        context,
+        sandbox_policy,
+        file_system_sandbox_policy,
+    }
+    .serialize(serializer)
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub(super) struct DynamicToolsUpdatedPayload<'a> {
+    thread_id: codex_protocol::ThreadId,
+    tools: Cow<'a, [codex_protocol::dynamic_tools::DynamicToolSpec]>,
+}
+
 impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
     fn from(item: &'a RolloutItem) -> Self {
         match item {
             RolloutItem::SessionMeta(payload) => Self::SessionMeta {
                 payload: Cow::Borrowed(payload),
+            },
+            RolloutItem::DynamicToolsUpdated { thread_id, tools } => Self::DynamicToolsUpdated {
+                payload: DynamicToolsUpdatedPayload {
+                    thread_id: *thread_id,
+                    tools: Cow::Borrowed(tools),
+                },
             },
             RolloutItem::ResponseItem(envelope) => Self::ResponseItem {
                 payload: Cow::Borrowed(&envelope.item),
@@ -120,9 +194,15 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
                 };
                 Self::ResponseItem {
                     payload: Cow::Owned(ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: message.message_id.clone().map(ResponseItemId::from_server),
                         role: "assistant".to_owned(),
-                        content: vec![ContentItem::OutputText { text }],
+                        content: vec![ContentItem::OutputText {
+                            annotations: None,
+                            logprobs: None,
+                            text,
+                        }],
                         // Older Guardian clients exclude commentary from root-to-worker
                         // review. Keep the phase unspecified so they can review this
                         // confirmed delivery without claiming it ended the turn.
@@ -160,7 +240,13 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
 impl From<RolloutItemWire<'_>> for RolloutItem {
     fn from(item: RolloutItemWire<'_>) -> Self {
         match item {
-            RolloutItemWire::SessionMeta { payload } => Self::SessionMeta(payload.into_owned()),
+            RolloutItemWire::SessionMeta { payload } => {
+                Self::SessionMeta(Box::new(payload.into_owned()))
+            }
+            RolloutItemWire::DynamicToolsUpdated { payload } => Self::DynamicToolsUpdated {
+                thread_id: payload.thread_id,
+                tools: payload.tools.into_owned(),
+            },
             RolloutItemWire::ResponseItem { payload, metadata } => {
                 if let (
                     ResponseItem::Message {
@@ -173,7 +259,7 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                     Some(metadata),
                 ) = (payload.as_ref(), metadata.as_deref())
                     && role == "assistant"
-                    && let [ContentItem::OutputText { text }] = content.as_slice()
+                    && let [ContentItem::OutputText { text, .. }] = content.as_slice()
                     && let Some(turn_id) = passthrough.turn_id.as_ref()
                     && let Some(acceptance_order) = metadata.user_input_order
                     && let Some(marker) = metadata.delivered_assistant_message.as_deref()

@@ -128,7 +128,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             "id": id, "sessionId": id, "preview": "only once", "ephemeral": false,
             "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
             "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0", "source": "cli",
-            "turns": [test_turn("accepted", TurnStatus::Completed, vec![ThreadItem::UserMessage {
+            "turns": [test_turn("accepted", TurnStatus::Completed, vec![ThreadItemPayload::UserMessage {
                 id: "input-1".into(), client_id: None, content: vec![UserInput::Text { text: "only once".into(), text_elements: Vec::new() }],
             }])]
         });
@@ -188,10 +188,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
                 app.app_event_tx.clone(),
                 app.dynamic_tool_status_updates.clone(),
                 /*managed_requirement*/ None,
-                crate::dynamic_tools_mcp::ToolServices {
-                    task_tools: true,
-                    worktrees: None,
-                },
+                /*worktrees*/ None,
             )
             .await?,
         ));
@@ -295,7 +292,9 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             .unwrap()
             .creating_worktree = true;
         let old_sender = app.app_event_tx.clone();
+        let backend_id = session.backend_id();
         let connected = reconnect(
+            session.backend_id(),
             app.app_server_target.clone(),
             app.config.clone(),
             app.local_settings.clone(),
@@ -312,6 +311,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
         );
         app.finish_reconnect(&mut tui, &mut session, &mut events, connected, "2.1.0")
             .await?;
+        assert_eq!(session.backend_id(), backend_id);
         if edit_offline {
             assert!(!app.chat_widget.has_active_view());
             assert!(
@@ -568,6 +568,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.begin_reconnect();
     let connected = reconnect(
+        session.backend_id(),
         app.app_server_target.clone(),
         app.config.clone(),
         app.local_settings.clone(),
@@ -638,27 +639,32 @@ async fn reconnect_exhaustion_and_unknown_initial_thread_stay_offline() -> Resul
     drop(listener);
     tokio::time::pause();
     let start = tokio::time::Instant::now();
-    for id in [Some(ThreadId::new()), None] {
-        assert!(
-            reconnect(
-                app.app_server_target.clone(),
-                app.config.clone(),
-                app.local_settings.clone(),
-                id,
-                /*remote_cwd*/ None,
-                crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
-                ReconnectPresentation::Conversation
-            )
-            .await
-            .is_err()
-        );
-    }
+    let reconnect_thread = |id| {
+        reconnect(
+            crate::backend_id::BackendId::new(),
+            app.app_server_target.clone(),
+            app.config.clone(),
+            app.local_settings.clone(),
+            id,
+            /*remote_cwd*/ None,
+            crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+            ReconnectPresentation::Conversation,
+        )
+    };
+    assert!(reconnect_thread(None).await.is_err());
+    let error = reconnect_thread(Some(ThreadId::new()))
+        .await
+        .err()
+        .expect("reconnect should time out");
     assert_eq!(start.elapsed().as_secs(), 120);
     app.begin_reconnect();
     app.chat_widget.reconnect_failed();
     assert_snapshot!(
         "reconnect_failed",
-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        format!(
+            "{error}\n{}",
+            render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        )
     );
     tokio::time::resume();
     Ok(())
@@ -680,10 +686,13 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             serve_reconnect_requests(
                 tokio_tungstenite::accept_async(stream).await?,
                 move |request| async move {
-                    assert_eq!(request.method, "thread/resume");
-                    tokio::time::pause();
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    tokio::time::resume();
+                    if request.method == "thread/resume" {
+                        tokio::time::pause();
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        tokio::time::resume();
+                    } else {
+                        assert_eq!(request.method, "thread/read");
+                    }
                     Some(json!({"error": {"code": -32600, "message": "thread no longer exists"}}))
                 },
             )
@@ -691,6 +700,7 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
         });
         let start = tokio::time::Instant::now();
         let result = reconnect(
+            crate::backend_id::BackendId::new(),
             AppServerTarget::Remote {
                 endpoint: endpoint.clone(),
             },
@@ -762,7 +772,10 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             );
         } else {
             tokio::time::resume();
-            assert!(result.is_err());
+            assert_eq!(
+                result.err().expect("resume should time out").to_string(),
+                "Automatic reconnect timed out while resuming the conversation."
+            );
             assert_eq!(elapsed, 120);
             server.abort();
         }

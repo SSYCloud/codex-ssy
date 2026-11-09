@@ -2,7 +2,6 @@
 //! Provisioning and durable board ownership belong to the research host.
 
 use crate::RemoteAgentMessageBoard;
-use codex_agent_message_board_extension::MessageBoardHost;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -12,6 +11,7 @@ use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStartPhase;
 use codex_extension_api::TurnStopInput;
+use codex_message_board::MessageBoardHost;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrKind;
 use futures::channel::oneshot;
@@ -112,7 +112,7 @@ impl TurnLifecycleContributor for Notifications {
 }
 
 /// Installs live notification delivery. The host resolves the existing remote
-/// client and a delivery host bound to this exact turn; idle agents are never woken.
+/// client and delivery host. Accepted notices use the host's ordinary message policy.
 /// The turn store owns the receiver and cancels it when the turn ends.
 pub fn install_notifications<C: Sync>(
     registry: &mut ExtensionRegistryBuilder<C>,

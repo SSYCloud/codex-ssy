@@ -3,13 +3,12 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use mxc_sdk::mxc_common as wxc_common;
+use mxc_sdk::mxc_common::logger::Logger;
+use mxc_sdk::mxc_common::logger::Mode;
+use mxc_sdk::mxc_common::models::ExecutionRequest;
+use mxc_sdk::mxc_common::sandbox_process::SandboxBackend;
+use mxc_sdk::mxc_common::sandbox_process::StdioMode;
 use mxc_sdk::process_container_common::base_container_runner::BaseContainerRunner;
-use wxc_common::logger::Logger;
-use wxc_common::logger::Mode;
-use wxc_common::models::ExecutionRequest;
-use wxc_common::sandbox_process::SandboxBackend;
-use wxc_common::sandbox_process::StdioMode;
 
 // The ETW functions used by tracelogging are documented Advapi32 exports on
 // both Windows toolchains; 1.2.3 leaves their import library to the application.

@@ -38,6 +38,8 @@ pub struct Prompt {
     /// Whether the Responses API should strictly validate `output_schema`.
     pub output_schema_strict: bool,
 
+    pub(crate) prompt_cache_ttl: Option<crate::PromptCacheTtl>,
+
     pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
 }
 
@@ -50,6 +52,7 @@ impl Default for Prompt {
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,
+            prompt_cache_ttl: None,
             cyber_access_program: None,
         }
     }
@@ -116,8 +119,9 @@ fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelIn
 }
 
 pub struct ResponseStream {
+    pub(crate) routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
-    pub(crate) interrupt: Option<oneshot::Sender<()>>,
+    pub(crate) interrupt: Option<oneshot::Sender<codex_api::ResponseInterrupt>>,
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,

@@ -36,6 +36,8 @@ use hyperlinks::wrap_two_column_row;
 #[derive(Default)]
 pub(crate) struct GenericDisplayRow {
     pub name: String,
+    /// Rich label already laid out at the picker width, including its gutter and links.
+    pub wrapped_name: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
     /// Optional full-width selection treatment; other rows use the shared text accent.
     pub selection_style: Option<Style>,
     pub name_prefix_spans: Vec<Span<'static>>,
@@ -176,12 +178,30 @@ fn compute_desc_col(
         .min(max_auto_desc_col);
     if column_width
         .description_layout
-        .should_hide(content_width, desc_col)
+        .should_hide_column(content_width, desc_col)
     {
         0
     } else {
         desc_col
     }
+}
+
+pub(super) fn should_show_selected_description_below(
+    rows_all: &[GenericDisplayRow],
+    state: &ScrollState,
+    max_results: usize,
+    width: u16,
+    column_width: ColumnWidthConfig,
+) -> bool {
+    if rows_all.is_empty() {
+        return false;
+    }
+    let visible_items = max_results.min(rows_all.len());
+    let start_idx = compute_item_window_start(rows_all, state, visible_items);
+    let desc_col = compute_desc_col(rows_all, start_idx, visible_items, width, column_width);
+    column_width
+        .description_layout
+        .should_show_selected_below(width, desc_col)
 }
 
 /// Determine how many spaces to indent wrapped lines for a row.

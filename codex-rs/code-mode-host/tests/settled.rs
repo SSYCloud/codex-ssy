@@ -109,6 +109,7 @@ async fn assert_partial_results(provider: &dyn CodeModeSessionProvider) {
                     WaitRequest {
                         cell_id: cell_id.clone(),
                         yield_time_ms: 10,
+                        max_output_tokens: None,
                     },
                     /*preempt*/ None,
                 )
@@ -133,6 +134,7 @@ async fn assert_partial_results(provider: &dyn CodeModeSessionProvider) {
                 WaitRequest {
                     cell_id: cell_id.clone(),
                     yield_time_ms: 5_000,
+                    max_output_tokens: None,
                 },
                 /*preempt*/ None,
             )
@@ -146,6 +148,9 @@ async fn assert_partial_results(provider: &dyn CodeModeSessionProvider) {
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: json!({"index": 0, "status": "fulfilled", "value": "slow"}).to_string(),
                 }],
+                result_buffered_for: completed
+                    .result_buffered_for()
+                    .expect("completed result includes buffering duration"),
                 error_text: None,
             })
         );

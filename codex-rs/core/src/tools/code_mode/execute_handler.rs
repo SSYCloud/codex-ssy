@@ -4,7 +4,6 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_features::Feature;
 use codex_prompts::ResolvedModelMessages;
 use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::ToolName;
@@ -56,18 +55,12 @@ impl CodeModeExecuteHandler {
             .config
             .code_mode
             .tool_input_schema_max_bytes;
-        let tool_description_first = step_context
-            .turn
-            .config
-            .features
-            .enabled(Feature::CodeModeToolDescriptionFirst);
         let mut enabled_tools = Vec::with_capacity(self.nested_tool_specs.len());
         for (spec, cached_runtime) in &self.nested_tool_specs {
             let definitions = prepare_code_mode_tool_definitions(
                 cached_runtime.as_deref(),
                 || Cow::Borrowed(spec.as_ref()),
                 code_mode_input_schema_max_bytes,
-                tool_description_first,
             );
             match definitions {
                 Cow::Borrowed(definitions) => enabled_tools.extend_from_slice(definitions),
@@ -144,7 +137,12 @@ impl CodeModeExecuteHandler {
         code_cell_trace.record_initial_response(&response);
         // Yielded cells keep running, so terminal lifecycle is only emitted
         // here when the first response also ended the runtime.
-        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+        if matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+            telemetry.record_cell_timing(
+                &cell_id,
+                codex_extension_api::CodeModeCellTiming::ExecYielded,
+            );
+        } else {
             code_cell_trace.record_ended(&response);
             exec.session
                 .services
@@ -167,6 +165,7 @@ impl CodeModeExecuteHandler {
             &step_context.settings.model_info,
             response,
             args.max_output_tokens,
+            exec.session.services.code_mode_service.output_truncation(),
             wall_time,
             exec.turn.config.code_mode.experimental_show_cell_overhead,
         ))

@@ -9,15 +9,22 @@ use self::git::clone_git_source;
 use self::git::git_remote_revision;
 use crate::PluginGitMode;
 use crate::installed_marketplaces::marketplace_install_root;
+use crate::marketplace::has_symlinked_marketplace_manifest;
 use crate::marketplace::validate_marketplace_root;
 use crate::marketplace_add::MarketplaceSource;
 use crate::marketplace_policy::MarketplacePolicy;
 use crate::marketplace_policy::validate_marketplace_name_for_add;
+use crate::marketplace_staging::MarketplaceStagingDir;
+use crate::marketplace_staging::cleanup_marketplace_staging;
 use codex_config::ConfigLayerStack;
 use codex_config::types::MarketplaceConfig;
 use codex_config::types::MarketplaceSourceType;
 use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +53,21 @@ struct ConfiguredGitMarketplace {
     source: String,
     ref_name: Option<String>,
     sparse_paths: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct CheckoutInputs {
+    configured_name: Box<str>,
+    source_sha256: Box<str>,
+    ref_name: Option<Box<str>>,
+    sparse_paths: Box<[Box<str>]>,
+    revision: Box<str>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MarketplaceNameMismatch {
+    inputs: CheckoutInputs,
+    found_name: Box<str>,
 }
 
 #[derive(Default)]
@@ -93,6 +115,8 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     mode: PluginGitMode,
     reload_config: &ConfigLayerReload,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
+    let install_root = marketplace_install_root(codex_home);
+    cleanup_marketplace_staging(&install_root);
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
         .marketplaces
@@ -108,7 +132,6 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
         return ConfiguredMarketplaceUpgradeOutcome::default();
     }
 
-    let install_root = marketplace_install_root(codex_home);
     let mut selected_marketplaces = marketplaces
         .iter()
         .map(|marketplace| marketplace.name.clone())
@@ -254,22 +277,48 @@ fn upgrade_configured_git_marketplace(
         return Ok(None);
     }
 
-    let staging_parent = install_root.join(".staging");
-    std::fs::create_dir_all(&staging_parent).map_err(|err| {
+    let name_mismatch = |found: &str| {
         format!(
-            "failed to create marketplace upgrade staging directory {}: {err}",
-            staging_parent.display()
+            "upgraded marketplace name `{found}` does not match configured marketplace `{}`",
+            marketplace.name
+        )
+    };
+    // An unchanged checkout will declare the same name. Keep one rejection per
+    // marketplace outside its untrusted checkout, without persisting the source URL.
+    let rejection = match mode {
+        PluginGitMode::Manual => None,
+        PluginGitMode::Automatic => {
+            let path = codex_home
+                .join("cache/marketplaces")
+                .join(format!("{}.json", marketplace.name));
+            let inputs = CheckoutInputs {
+                configured_name: Box::from(marketplace.name.as_str()),
+                source_sha256: format!("{:x}", Sha256::digest(source)).into_boxed_str(),
+                ref_name: ref_name.map(Box::from),
+                sparse_paths: marketplace
+                    .sparse_paths
+                    .iter()
+                    .map(|path| Box::from(path.as_str()))
+                    .collect(),
+                revision: remote_revision.into_boxed_str(),
+            };
+            Some((path, inputs))
+        }
+    };
+    if let Some((path, inputs)) = &rejection
+        && let Ok(contents) = std::fs::read(path)
+        && let Ok(cached) = serde_json::from_slice::<MarketplaceNameMismatch>(&contents)
+        && cached.inputs == *inputs
+    {
+        return Err(name_mismatch(&cached.found_name));
+    }
+
+    let staged_dir = MarketplaceStagingDir::new(install_root).map_err(|err| {
+        format!(
+            "failed to create temporary marketplace upgrade directory in {}: {err}",
+            install_root.display()
         )
     })?;
-    let staged_dir = tempfile::Builder::new()
-        .prefix("marketplace-upgrade-")
-        .tempdir_in(&staging_parent)
-        .map_err(|err| {
-            format!(
-                "failed to create temporary marketplace upgrade directory in {}: {err}",
-                staging_parent.display()
-            )
-        })?;
 
     let activated_revision = clone_git_source(
         codex_home,
@@ -283,13 +332,22 @@ fn upgrade_configured_git_marketplace(
     let marketplace_name = validate_marketplace_root(staged_dir.path())
         .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;
     if marketplace_name != marketplace.name {
-        return Err(format!(
-            "upgraded marketplace name `{marketplace_name}` does not match configured marketplace `{}`",
-            marketplace.name
-        ));
+        let error = name_mismatch(&marketplace_name);
+        // HEAD may have moved since ls-remote. Only cache the revision we validated.
+        if let Some((path, inputs)) = rejection
+            && activated_revision.as_str() == inputs.revision.as_ref()
+            && !has_symlinked_marketplace_manifest(staged_dir.path())
+            && let Ok(contents) = serde_json::to_string_pretty(&MarketplaceNameMismatch {
+                inputs,
+                found_name: marketplace_name.into_boxed_str(),
+            })
+        {
+            let _ = codex_utils_path::write_atomically(&path, &contents);
+        }
+        return Err(error);
     }
     write_installed_marketplace_metadata(staged_dir.path(), marketplace, &activated_revision)?;
-    activate_marketplace_root(&destination, staged_dir, &previous_snapshot, || {
+    activate_marketplace_root(&destination, staged_dir.path(), &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)
     })?;
 

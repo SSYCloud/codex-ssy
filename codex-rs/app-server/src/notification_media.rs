@@ -1,6 +1,7 @@
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -10,11 +11,11 @@ use codex_protocol::models::ResponseItem;
 pub(crate) fn without_notification_media(notification: ServerNotification) -> ServerNotification {
     match notification {
         ServerNotification::ItemStarted(mut notification) => {
-            notification.item = without_thread_item_media(notification.item);
+            notification.item.payload = without_thread_item_media(notification.item.payload);
             ServerNotification::ItemStarted(notification)
         }
         ServerNotification::ItemCompleted(mut notification) => {
-            notification.item = without_thread_item_media(notification.item);
+            notification.item.payload = without_thread_item_media(notification.item.payload);
             ServerNotification::ItemCompleted(notification)
         }
         ServerNotification::RawResponseItemCompleted(mut notification) => {
@@ -57,6 +58,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         ServerNotification::Error(_)
         | ServerNotification::ThreadStarted(_)
         | ServerNotification::ThreadStatusChanged(_)
+        | ServerNotification::ThreadReadStateChanged(_)
         | ServerNotification::ThreadArchived(_)
         | ServerNotification::ThreadDeleted(_)
         | ServerNotification::ThreadUnarchived(_)
@@ -64,6 +66,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadReverted(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::ThreadNameUpdated(_)
+        | ServerNotification::ThreadSectionChanged(_)
         | ServerNotification::ThreadAttachmentUpdated(_)
         | ServerNotification::ThreadGoalUpdated(_)
         | ServerNotification::ThreadPredictionUpdated(_)
@@ -140,9 +143,9 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
     }
 }
 
-fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
+fn without_thread_item_media(mut item: ThreadItemPayload) -> ThreadItemPayload {
     match &mut item {
-        ThreadItem::UserMessage { content, .. } => {
+        ThreadItemPayload::UserMessage { content, .. } => {
             content.retain(|item| match item {
                 UserInput::Image { .. } | UserInput::Audio { .. } => false,
                 UserInput::Text { .. }
@@ -152,7 +155,7 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                 | UserInput::Mention { .. } => true,
             });
         }
-        ThreadItem::DynamicToolCall {
+        ThreadItemPayload::DynamicToolCall {
             content_items: Some(content_items),
             ..
         } => {
@@ -162,7 +165,7 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                 DynamicToolCallOutputContentItem::InputText { .. } => true,
             });
         }
-        ThreadItem::FunctionCallOutput {
+        ThreadItemPayload::FunctionCallOutput {
             output: FunctionCallOutputBody::ContentItems(items),
             ..
         } => {
@@ -173,7 +176,7 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                 | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
             });
         }
-        ThreadItem::McpToolCall {
+        ThreadItemPayload::McpToolCall {
             result: Some(result),
             ..
         } => {
@@ -189,30 +192,34 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                     .is_none()
             });
         }
-        ThreadItem::ImageGeneration(item) => item.result.clear(),
-        ThreadItem::HookPrompt { .. }
-        | ThreadItem::AgentMessage { .. }
-        | ThreadItem::Plan { .. }
-        | ThreadItem::Reasoning { .. }
-        | ThreadItem::FunctionCallOutput {
+        ThreadItemPayload::ImageGeneration(item) => {
+            item.image = GeneratedImageRef::Inline {
+                result: String::new(),
+            };
+        }
+        ThreadItemPayload::HookPrompt { .. }
+        | ThreadItemPayload::AgentMessage { .. }
+        | ThreadItemPayload::Plan { .. }
+        | ThreadItemPayload::Reasoning { .. }
+        | ThreadItemPayload::FunctionCallOutput {
             output: FunctionCallOutputBody::Text(_),
             ..
         }
-        | ThreadItem::CommandExecution { .. }
-        | ThreadItem::FileChange { .. }
-        | ThreadItem::McpToolCall { result: None, .. }
-        | ThreadItem::DynamicToolCall {
+        | ThreadItemPayload::CommandExecution { .. }
+        | ThreadItemPayload::FileChange { .. }
+        | ThreadItemPayload::McpToolCall { result: None, .. }
+        | ThreadItemPayload::DynamicToolCall {
             content_items: None,
             ..
         }
-        | ThreadItem::CollabAgentToolCall { .. }
-        | ThreadItem::SubAgentActivity { .. }
-        | ThreadItem::WebSearch(_)
-        | ThreadItem::ImageView { .. }
-        | ThreadItem::Sleep(_)
-        | ThreadItem::EnteredReviewMode { .. }
-        | ThreadItem::ExitedReviewMode { .. }
-        | ThreadItem::ContextCompaction { .. } => {}
+        | ThreadItemPayload::CollabAgentToolCall { .. }
+        | ThreadItemPayload::SubAgentActivity { .. }
+        | ThreadItemPayload::WebSearch(_)
+        | ThreadItemPayload::ImageView { .. }
+        | ThreadItemPayload::Sleep(_)
+        | ThreadItemPayload::EnteredReviewMode { .. }
+        | ThreadItemPayload::ExitedReviewMode { .. }
+        | ThreadItemPayload::ContextCompaction { .. } => {}
     }
     item
 }

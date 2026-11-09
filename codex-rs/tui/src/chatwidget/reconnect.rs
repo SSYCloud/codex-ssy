@@ -6,28 +6,44 @@ use super::*;
 use crate::bottom_pane::RestrictedInputMode;
 
 impl ChatWidget {
-    pub(crate) fn pause_for_disconnect(&mut self) {
-        self.permission_discovery = None;
-        self.invalidate_permission_discovery();
-        self.cancel_startup_submission();
-        self.cancel_image_submission();
-        // The app-server transport can fail while the separate WebRTC helper
-        // still sends microphone audio. Retire local media before showing offline UI.
+    pub(crate) fn record_realtime_disconnect_failure(&mut self) {
         if matches!(
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
         ) || self.realtime_retry_cleanup_pending()
         {
-            self.record_realtime_failure();
+            self.record_realtime_failure(RealtimeFailureCause::AppServerDisconnect);
         }
+    }
+
+    pub(crate) fn pause_for_disconnect(&mut self) {
+        self.pause_for_disconnect_inner(/*preserve_startup_input*/ false);
+    }
+
+    pub(crate) fn pause_for_rejected_startup(&mut self) {
+        self.pause_for_disconnect_inner(/*preserve_startup_input*/ true);
+    }
+
+    fn pause_for_disconnect_inner(&mut self, preserve_startup_input: bool) {
+        self.permission_discovery = None;
+        self.invalidate_permission_discovery();
+        if !preserve_startup_input {
+            self.cancel_startup_submission();
+        }
+        self.cancel_image_submission();
+        // The app-server transport can fail while the separate WebRTC helper
+        // still sends microphone audio. Retire local media before showing offline UI.
+        self.record_realtime_disconnect_failure();
         let _ = self.reset_realtime_conversation();
         if let Some(questions) = &mut self.bottom_pane.questions {
             questions.delivery_enabled = false;
         }
         self.input_queue.suppress_queue_autosend = true;
-        self.set_initial_user_message_submit_suppressed(/*suppressed*/ true);
-        if let Some(message) = self.initial_user_message.take() {
-            self.restore_user_message_to_composer(message);
+        if !preserve_startup_input {
+            self.set_initial_user_message_submit_suppressed(/*suppressed*/ true);
+            if let Some(message) = self.initial_user_message.take() {
+                self.restore_user_message_to_composer(message);
+            }
         }
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane
@@ -110,19 +126,11 @@ impl ChatWidget {
     }
 
     pub(super) fn reconcile_recovered_messages(&mut self, confirmed_message_ids: &[String]) {
-        let mut index = 0;
-        self.input_queue.queued_user_messages.retain(|message| {
-            let confirmed = matches!(&message.delivery,
-                MessageDelivery::Unconfirmed(Some(id)) if confirmed_message_ids.contains(id));
-            if confirmed {
-                self.input_queue
-                    .queued_user_message_history_records
-                    .remove(index);
-            } else {
-                index += 1;
-            }
-            !confirmed
-        });
+        super::user_messages::remove_confirmed_queued_messages(
+            &mut self.input_queue.queued_user_messages,
+            &mut self.input_queue.queued_user_message_history_records,
+            confirmed_message_ids,
+        );
         self.refresh_pending_input_preview();
     }
 
@@ -157,16 +165,93 @@ impl ChatWidget {
         self.refresh_pending_input_preview();
     }
 
-    pub(crate) fn handle_disconnected_view_key(&mut self, key: KeyEvent) {
-        self.bottom_pane.handle_key_event(key);
+    pub(crate) fn handle_disconnected_view_key(
+        &mut self,
+        key: KeyEvent,
+        activation_key: Option<crate::key_hint::KeyBinding>,
+    ) {
+        if crate::key_hint::ctrl(KeyCode::Char('c')).is_press(key) {
+            let _ = self.cancel_active_disconnected_view();
+        } else {
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key, activation_key);
+        }
     }
 
-    pub(crate) fn handle_restricted_key(&mut self, key: KeyEvent, mode: RestrictedInputMode) {
+    pub(crate) fn active_view_accepts_input_when_disconnected(&self) -> bool {
+        self.bottom_pane
+            .active_view_accepts_input_when_disconnected()
+    }
+
+    pub(crate) fn cancel_active_disconnected_view(&mut self) -> bool {
+        let had_view = self.active_view_accepts_input_when_disconnected();
+        if had_view {
+            self.revert_terminal_title_setup_preview();
+            let _ = self.bottom_pane.on_ctrl_c();
+        }
+        had_view
+    }
+
+    pub(crate) fn active_view_is(&self, view_id: &'static str) -> bool {
+        self.bottom_pane.active_view_id() == Some(view_id)
+    }
+
+    pub(crate) fn composer_paste_deadline(&self) -> Option<Instant> {
+        self.bottom_pane.composer_paste_deadline()
+    }
+
+    pub(crate) fn handle_restricted_key(
+        &mut self,
+        key: KeyEvent,
+        mode: RestrictedInputMode,
+    ) -> KeyEventAction {
         if self.external_writer_view {
-            return;
+            return KeyEventAction::None;
+        }
+        if mode == RestrictedInputMode::DraftHandoff {
+            // Buffered typing also belongs to the draft. Queue the usual quit only when
+            // Ctrl+D has no draft or active input surface to edit.
+            if Self::is_ctrl_d_press(key)
+                && self.composer_is_empty()
+                && self.bottom_pane.no_modal_or_popup_active()
+                && self.on_ctrl_d()
+            {
+                return KeyEventAction::None;
+            }
+            if !self.startup_submission_has_protected_input()
+                && !self.blocks_direct_input
+                && self.bottom_pane.composer_input_enabled()
+                && let Some(action) =
+                    self.image_paste_key_action(key, ClipboardPasteContext::DraftHandoff)
+            {
+                return action;
+            }
+            self.bottom_pane.handle_restricted_key(key, mode);
+            self.refresh_startup_recovery();
+            return KeyEventAction::None;
+        }
+        let startup_key_handled = self.input_queue.startup_submission.is_some()
+            && !self.startup_submission_has_protected_input()
+            && (key.code == KeyCode::Null || self.handle_startup_submission_key(key));
+        if mode == RestrictedInputMode::Disconnected {
+            self.set_footer_hint_override(Some(vec![(
+                crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
+                "quit".into(),
+            )]));
+        }
+        if startup_key_handled {
+            return KeyEventAction::None;
+        }
+        if self.input_queue.startup_submission.is_some()
+            && !self.startup_submission_has_protected_input()
+        {
+            // Cursor movement must preserve the confirmed draft's paste provenance.
+            let result = self.bottom_pane.handle_key_event(key);
+            self.handle_composer_input_result(result, /*had_modal_or_popup*/ false);
+            return KeyEventAction::None;
         }
         if self.handle_question_key(key) {
-            return;
+            return KeyEventAction::None;
         }
         if key.kind == KeyEventKind::Press && self.chat_keymap.edit_queued_message.is_pressed(key) {
             if let Some(composer) = self.pop_latest_queued_composer_state() {
@@ -188,6 +273,7 @@ impl ChatWidget {
             let result = self.bottom_pane.handle_restricted_key(key, mode);
             self.handle_composer_input_result(result, /*had_modal_or_popup*/ false);
         }
+        KeyEventAction::None
     }
 
     pub(crate) fn reconnect_failed(&mut self) {

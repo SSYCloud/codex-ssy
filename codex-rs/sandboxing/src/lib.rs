@@ -59,7 +59,6 @@ pub use windows::WindowsSandboxFilesystemOverrides;
 pub use windows::permission_profile_supports_windows_restricted_token_sandbox;
 pub use windows::resolve_windows_elevated_filesystem_overrides;
 pub use windows::resolve_windows_restricted_token_filesystem_overrides;
-pub use windows::unsupported_windows_restricted_token_sandbox_reason;
 pub use windows::windows_sandbox_uses_elevated_backend;
 
 use codex_protocol::error::CodexErr;
@@ -75,7 +74,8 @@ pub fn system_bwrap_warning(
 impl From<SandboxTransformError> for CodexErr {
     fn from(err: SandboxTransformError) -> Self {
         match err {
-            error @ SandboxTransformError::InvalidCommandCwd { .. }
+            error @ SandboxTransformError::InvalidPolicy(_)
+            | error @ SandboxTransformError::InvalidCommandCwd { .. }
             | error @ SandboxTransformError::InvalidSandboxPolicyCwd { .. } => {
                 CodexErr::InvalidRequest(error.to_string())
             }

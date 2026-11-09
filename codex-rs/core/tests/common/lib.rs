@@ -25,17 +25,22 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
+#[cfg(unix)]
+pub mod code_mode_host;
 pub mod context_snapshot;
+pub mod exec_server;
 pub mod hooks;
+pub mod network_policy_mcp;
+pub mod oauth;
 pub mod process;
 pub mod responses;
+pub mod runtime_auth;
 pub mod startup;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
 mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
 
 pub(crate) use test_environment::TestEnvironment;
 pub use test_environment::TestTargetOs;
@@ -269,6 +274,16 @@ where
 {
     use tokio::time::Duration;
     wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
+}
+
+pub async fn wait_for_successful_turn(codex: &CodexThread) {
+    use codex_protocol::protocol::EventMsg;
+
+    let event = wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        matches!(&event, EventMsg::TurnComplete(completed) if completed.error.is_none()),
+        "turn failed: {event:?}"
+    );
 }
 
 /// Waits for a configured MCP server to finish startup and requires it to be ready.

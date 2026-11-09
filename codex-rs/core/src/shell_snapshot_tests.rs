@@ -165,6 +165,80 @@ async fn get_snapshot(shell_type: ShellType) -> Result<String> {
     Ok(content)
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_helpers_preserve_thread_without_caching_exec_metadata() -> Result<()> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("shell_snapshot::tests::snapshot_helper_exec_metadata_child")
+        .arg("--nocapture")
+        .env("CODEX_TEST_SNAPSHOT_HELPER_CHILD", "1")
+        .env("CODEX_THREAD_ID", "helper-thread")
+        .env("CODEX_TOOL_CALL_ID", "stale-call")
+        .env("BASH_ENV", "/dev/null")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "snapshot helper child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_helper_exec_metadata_child() -> Result<()> {
+    if std::env::var_os("CODEX_TEST_SNAPSHOT_HELPER_CHILD").is_none() {
+        return Ok(());
+    }
+    assert_eq!(
+        std::env::var("CODEX_THREAD_ID").as_deref(),
+        Ok("helper-thread")
+    );
+    assert_eq!(
+        std::env::var("CODEX_TOOL_CALL_ID").as_deref(),
+        Ok("stale-call")
+    );
+
+    let dir = tempdir()?;
+    let shell = crate::shell::get_shell(ShellType::Bash).context("No available Bash shell")?;
+    let helper_env = run_script_with_timeout(
+        &shell,
+        "printf '%s|%s' \"${CODEX_THREAD_ID-unset}\" \"${CODEX_TOOL_CALL_ID-unset}\"",
+        SNAPSHOT_TIMEOUT,
+        SnapshotShellMode::NonLogin,
+        &dir.path().abs(),
+        /*credential_broker*/ None,
+        /*sandbox*/ None,
+    )
+    .await?;
+    assert_eq!(helper_env, "helper-thread|unset");
+    let snapshot = get_snapshot(ShellType::Bash).await?;
+    assert!(!snapshot.contains("CODEX_THREAD_ID"));
+    assert!(!snapshot.contains("CODEX_TOOL_CALL_ID"));
+    assert!(!snapshot.contains("helper-thread"));
+    assert!(!snapshot.contains("stale-call"));
+
+    let validation_path = dir.path().join("validation.sh").abs();
+    fs::write(
+        &validation_path,
+        "test \"${CODEX_THREAD_ID-missing}\" = helper-thread && \
+         test \"${CODEX_TOOL_CALL_ID-missing}\" = missing\n",
+    )
+    .await?;
+    validate_snapshot(
+        &shell,
+        &validation_path,
+        &dir.path().abs(),
+        /*credential_broker*/ None,
+        /*sandbox*/ None,
+    )
+    .await?;
+    Ok(())
+}
+
 #[test]
 fn snapshot_file_name_parser_supports_legacy_and_suffixed_names() {
     let session_id = "019cf82b-6a62-7700-bbbd-46909794ef89";
@@ -302,6 +376,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         /*prefer_executor_snapshots*/ false,
     );
     let mut config = EnvironmentConfig {
+        environment_hooks: Default::default(),
         allow_login_shell: false,
         workspace_roots: Vec::new(),
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -374,6 +449,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
                 updated.clone(),
                 /*non_blocking_snapshots*/ false,
             );
+            child.activate_configured(async_channel::unbounded().0);
             let child = child.snapshot().await;
             assert!(!Arc::ptr_eq(
                 &updated.primary().expect("parent turn").shell_snapshot_cache,
@@ -595,8 +671,12 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
 
 #[cfg(unix)]
 async fn credential_snapshot_proxy() -> Result<crate::config::StartedNetworkProxy> {
-    let mut network_config = NetworkProxyConfig::default();
+    let mut network_config = NetworkProxyConfig {
+        enabled: true,
+        ..NetworkProxyConfig::default()
+    };
     network_config.set_credential_broker_enabled(/*enabled*/ true);
+    network_config.set_allowed_domains(vec!["*".to_string()]);
     network_config.allow_local_binding = Some(true);
     network_config.credential_providers.insert(
         "local".to_string(),

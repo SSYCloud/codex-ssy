@@ -3,6 +3,7 @@
 use super::session_lifecycle_requests::HistoryCapabilities;
 use super::session_lifecycle_requests::start_recording_app_server_with_history;
 use super::*;
+use codex_context_fragments::side_conversation_boundary;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -71,7 +72,7 @@ sandbox = "unelevated"
     server
         .thread_inject_items(
             app.chat_widget.thread_id().expect("fresh task"),
-            vec![App::side_boundary_prompt_item()],
+            vec![side_conversation_boundary()],
         )
         .await?;
     let fresh_destination = tempfile::tempdir()?;
@@ -103,17 +104,16 @@ sandbox = "unelevated"
         ))?;
     let saved = server.start_thread(&readonly).await?;
     server
-        .thread_inject_items(
-            saved.session.thread_id,
-            vec![App::side_boundary_prompt_item()],
-        )
+        .thread_inject_items(saved.session.thread_id, vec![side_conversation_boundary()])
         .await?;
     tui.pause_events();
     app.launch_cwd = source.path().to_path_buf();
+    let backend_id = server.backend_id();
     app.resume_target_session(
         &mut tui,
         &mut server,
         SessionTarget {
+            backend_id,
             path: None,
             thread_id: saved.session.thread_id,
             cwd: Some(source.path().to_path_buf()),
@@ -216,7 +216,7 @@ sandbox = "unelevated"
     server
         .thread_inject_items(
             app.chat_widget.thread_id().expect("new project task"),
-            vec![App::side_boundary_prompt_item()],
+            vec![side_conversation_boundary()],
         )
         .await?;
     app.change_working_directory(&mut tui, &mut server, source.path().abs())
@@ -282,9 +282,11 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings() 
         } else {
             ""
         };
+        let shared_settings =
+            format!("{windows}[projects.{parent_path}]\ntrust_level = \"untrusted\"\n");
         std::fs::write(
             home.path().join("config.toml"),
-            format!("{settings}{windows}[projects.{parent_path}]\ntrust_level = \"untrusted\"\n"),
+            format!("{settings}{shared_settings}"),
         )?;
         let overrides = ConfigOverrides {
             cwd: Some(cwd),
@@ -296,6 +298,10 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings() 
             .harness_overrides(overrides.clone())
             .build()
             .await?;
+        if expected_approval.is_some() {
+            // The client loaded an approval policy that the server will not see.
+            std::fs::write(home.path().join("config.toml"), shared_settings)?;
+        }
         let original_approval = if settings.is_empty() && !project_marker {
             Approval::Granular(codex_protocol::protocol::GranularApprovalConfig {
                 sandbox_approval: false,
@@ -334,6 +340,9 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings() 
             &EnvironmentManager::default_for_tests(),
         )
         .await?;
+        if expected_approval.is_some() {
+            assert_eq!(startup.approval_policy, None);
+        }
         assert_eq!(
             startup.prompt_windows_sandbox,
             cfg!(target_os = "windows") && !sandbox_ready && settings.is_empty() && !project_marker

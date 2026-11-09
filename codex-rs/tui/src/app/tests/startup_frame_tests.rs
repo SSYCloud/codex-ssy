@@ -94,7 +94,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
 async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Result<()> {
     for items in [
         Vec::new(),
-        vec![ThreadItem::AgentMessage {
+        vec![ThreadItemPayload::AgentMessage {
+            moderation: None,
             id: "answer".into(),
             text: "Retained **answer** after resume.".into(),
             phase: None,
@@ -106,6 +107,7 @@ async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Res
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         app.local_settings.tui.show_tooltips = false;
         let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let backend_id = app_server.backend_id();
         let mut tui = crate::tui::test_support::make_test_tui()?;
         tui.set_owned_screen(/*owned*/ true)?;
         let thread_id = ThreadId::new();
@@ -117,6 +119,7 @@ async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Res
         startup.update_session_selection(
             &mut tui,
             &SessionSelection::Resume(crate::resume_picker::SessionTarget {
+                backend_id,
                 path: None,
                 thread_id,
                 cwd: None,

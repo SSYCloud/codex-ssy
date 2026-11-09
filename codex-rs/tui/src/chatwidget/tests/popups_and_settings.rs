@@ -2,9 +2,9 @@ use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::chatwidget::connectors::ConnectorsCacheState;
+use crate::hooks_rpc::HooksListTarget;
 use codex_app_server_protocol::HookErrorInfo;
 use codex_app_server_protocol::HooksListEntry;
-use codex_app_server_protocol::HooksListResponse;
 use codex_app_server_protocol::MarketplaceLoadErrorInfo;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::PluginAvailability;
@@ -136,18 +136,18 @@ async fn marketplace_upgrade_failure_includes_backend_messages_snapshot() {
 async fn hooks_popup_shows_list_diagnostics() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let cwd = chat.config.cwd.clone();
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
 
     chat.on_hooks_loaded(
-        cwd.to_path_buf(),
-        Ok(HooksListResponse {
-            data: vec![HooksListEntry {
-                cwd: cwd.to_path_buf(),
-                hooks: Vec::new(),
-                warnings: vec!["skipped invalid matcher for PreToolUse".to_string()],
-                errors: vec![HookErrorInfo {
-                    path: test_path_buf("/tmp/hooks.json"),
-                    message: "failed to parse hooks config".to_string(),
-                }],
+        HooksListTarget::Thread(thread_id),
+        Ok(HooksListEntry {
+            cwd: cwd.to_path_buf(),
+            hooks: Vec::new(),
+            warnings: vec!["skipped invalid matcher for PreToolUse".to_string()],
+            errors: vec![HookErrorInfo {
+                path: test_path_buf("/tmp/hooks.json"),
+                message: "failed to parse hooks config".to_string(),
             }],
         }),
     );
@@ -1157,17 +1157,17 @@ async fn plugins_popup_admin_disabled_installed_plugin_has_no_toggle_hint() {
             && popup.contains("Disabled")
             && popup.contains("Press Enter to view plugin details")
             && !popup.contains("Disabled by admin")
-            && !popup.contains("Space to disable"),
+            && !popup.contains("Tab to disable"),
         "expected admin-disabled installed row to omit toggle hint, got:\n{popup}"
     );
 
     while rx.try_recv().is_ok() {}
     let before = render_bottom_popup(&chat, /*width*/ 120);
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
     let after = render_bottom_popup(&chat, /*width*/ 120);
     assert!(
         rx.try_recv().is_err(),
-        "space should not toggle admin-disabled installed plugins"
+        "tab should not toggle admin-disabled installed plugins"
     );
     assert_eq!(after, before);
 }
@@ -1633,13 +1633,13 @@ async fn plugins_popup_refreshes_installed_counts_after_install() {
         "expected /plugins to refresh installed counts after install, got:\n{after}"
     );
     assert!(
-        after.contains("Installed   Space to disable; Enter view details"),
+        after.contains("Installed   Tab to disable; Enter view details"),
         "expected refreshed selected row copy to reflect the installed plugin state, got:\n{after}"
     );
 }
 
 #[tokio::test]
-async fn plugins_popup_space_toggles_installed_plugin_from_list() {
+async fn plugins_popup_toggle_keys_preserve_search_and_selection() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
 
@@ -1685,17 +1685,68 @@ async fn plugins_popup_space_toggles_installed_plugin_from_list() {
         other => panic!("expected SetPluginEnabled event, got {other:?}"),
     }
 
+    type_plugins_search_query(&mut chat, "dr");
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+
+    match rx.try_recv() {
+        Ok(AppEvent::SetPluginEnabled {
+            cwd: event_cwd,
+            plugin_id,
+            enabled,
+        }) => {
+            assert_eq!(event_cwd, cwd);
+            assert_eq!(plugin_id, "plugin-drive");
+            assert!(enabled);
+        }
+        other => panic!("expected SetPluginEnabled event, got {other:?}"),
+    }
+
     chat.on_plugin_enabled_set(
         cwd,
         "plugin-drive".to_string(),
-        /*enabled*/ false,
+        /*enabled*/ true,
         Ok(()),
     );
 
     let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert_chatwidget_snapshot!("plugins_popup_toggle_refresh_preserves_search", popup);
     assert!(
-        popup.contains("› [ ] Drive"),
-        "expected selected plugin row to stay selected after refresh, got:\n{popup}"
+        popup.lines().any(|line| line.trim() == "dr")
+            && popup.contains("› [*] Drive")
+            && popup.contains("Tab to disable"),
+        "expected the filtered plugin and search query to survive refresh, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn plugins_popup_hides_tab_toggle_hint_when_tab_is_configured() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.list.move_down = vec![crate::key_hint::plain(KeyCode::Tab)];
+    chat.bottom_pane.set_keymap_bindings(&keymap);
+
+    let popup = render_loaded_plugins_popup(
+        &mut chat,
+        plugins_test_response(vec![plugins_test_curated_marketplace(vec![
+            plugins_test_summary(
+                "plugin-drive",
+                "drive",
+                Some("Drive"),
+                Some("Document access."),
+                /*installed*/ true,
+                /*enabled*/ true,
+                PluginInstallPolicy::Available,
+            ),
+        ])]),
+    );
+
+    assert_chatwidget_snapshot!("plugins_popup_custom_tab_binding_hides_toggle_hint", popup);
+    assert!(
+        popup.contains("Installed   Press Enter to view plugin details")
+            && !popup.contains("Tab to disable")
+            && !popup.contains("tab toggle"),
+        "expected configured Tab binding to hide unavailable toggle hints, got:\n{popup}"
     );
 }
 
@@ -3055,7 +3106,7 @@ async fn experimental_features_popup_snapshot() {
             enabled: true,
         },
         ExperimentalFeatureItem {
-            key: Feature::RealtimeConversation.key().to_string(),
+            key: "voice_conversations".to_string(),
             writable: true,
             name: "Voice conversations".to_string(),
             description: "Talk with Codex using /voice.".to_string(),
@@ -3261,6 +3312,11 @@ async fn memories_reset_confirmation_snapshot() {
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("memories_reset_confirmation", popup);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Choose how Codex uses"));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(chat.no_modal_or_popup_active());
 }
 
 #[tokio::test]
@@ -3756,17 +3812,13 @@ async fn model_reasoning_selection_popup_applies_custom_effort() {
 
     let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|event| match event {
-            AppEvent::UpdateReasoningEffort(effort) => Some((None, effort)),
-            AppEvent::PersistModelSelection { model, effort } => Some((Some(model), effort)),
+            AppEvent::ApplyModelSelection { model, effort } => Some((model, effort)),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
         selected_effort_events,
-        vec![
-            (None, Some(custom_effort.clone())),
-            (Some("gpt-5.5".to_string()), Some(custom_effort)),
-        ]
+        vec![("gpt-5.5".to_string(), Some(custom_effort))]
     );
 }
 
@@ -3858,11 +3910,7 @@ async fn max_reasoning_selection_persists_model_selection() {
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(events.iter().any(|event| matches!(
         event,
-        AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Max))
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AppEvent::PersistModelSelection {
+        AppEvent::ApplyModelSelection {
             model,
             effort: Some(ReasoningEffortConfig::Max),
         } if model == "gpt-5.5"
@@ -4209,7 +4257,7 @@ async fn single_reasoning_option_skips_selection() {
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
+            .any(|ev| matches!(ev, AppEvent::ApplyModelSelection { effort: Some(effort), .. } if *effort == ReasoningEffortConfig::High)),
         "expected reasoning effort to be applied automatically; events: {events:?}"
     );
 }

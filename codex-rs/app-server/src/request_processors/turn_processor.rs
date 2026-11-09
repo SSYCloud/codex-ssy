@@ -1,21 +1,21 @@
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
-use codex_agent_extension::AgentInvocation;
-use codex_agent_extension::AgentRun;
-use codex_agent_extension::AgentRunner;
 use codex_app_server_protocol::ImageReference as V2ImageReference;
+use codex_app_server_protocol::ThreadGuardianAssessment;
+use codex_app_server_protocol::ThreadGuardianReviewParams;
+use codex_app_server_protocol::ThreadGuardianReviewResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference as CoreImageReference;
-use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
-use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
-use codex_skills::system_cache_root_dir;
+use codex_protocol::turn_input::AnnotatedResponseItem;
+use codex_protocol::turn_input::ResponseItemAnnotations;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
@@ -80,14 +80,12 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
 
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
-    agent_runner: AgentRunner,
-    auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config: Arc<Config>,
     config_manager: ConfigManager,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: PendingThreadUnloads,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     skills_watcher: Arc<SkillsWatcher>,
@@ -101,18 +99,15 @@ fn map_additional_context(
         .unwrap_or_default()
         .into_iter()
         .map(|(key, entry)| {
-            (
-                key,
-                CoreAdditionalContextEntry {
-                    value: entry.value,
-                    kind: match entry.kind {
-                        AdditionalContextKind::Untrusted => CoreAdditionalContextKind::Untrusted,
-                        AdditionalContextKind::Application => {
-                            CoreAdditionalContextKind::Application
-                        }
-                    },
+            let entry = CoreAdditionalContextEntry {
+                value: entry.value,
+                kind: match entry.kind {
+                    AdditionalContextKind::Untrusted => CoreAdditionalContextKind::Untrusted,
+                    AdditionalContextKind::Application => CoreAdditionalContextKind::Application,
                 },
-            )
+                name: entry.name,
+            };
+            (key, entry)
         })
         .collect()
 }
@@ -143,22 +138,18 @@ struct ThreadSettingsBuildParams {
 impl TurnRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config: Arc<Config>,
         config_manager: ConfigManager,
-        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+        pending_thread_unloads: PendingThreadUnloads,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
         skills_watcher: Arc<SkillsWatcher>,
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     ) -> Self {
-        let agent_runner = AgentRunner::new(Arc::downgrade(&thread_manager));
         Self {
-            agent_runner,
-            auth_manager,
             thread_manager,
             outgoing,
             analytics_events_client,
@@ -188,6 +179,54 @@ impl TurnRequestProcessor {
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_guardian_review(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadGuardianReviewParams,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (thread_id, thread) = self.load_thread(&params.thread_id).await?;
+        self.ensure_direct_input_allowed(request_id, thread.as_ref())
+            .await?;
+        self.config_manager
+            .check_thread_model_provider(thread.config().await.as_ref())
+            .await
+            .map_err(|error| config_load_error(&error))?;
+        match self
+            .ensure_conversation_listener(
+                thread_id,
+                request_id.connection_id,
+                /*raw_events_enabled*/ false,
+            )
+            .await?
+        {
+            EnsureConversationListenerResult::Attached => {}
+            EnsureConversationListenerResult::ConnectionClosed => return Ok(None),
+        }
+        let result =
+            thread
+                .guardian_review(cancellation)
+                .await
+                .map_err(|err| match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("Guardian review failed: {err}")),
+                })?;
+        Ok(Some(
+            ThreadGuardianReviewResponse {
+                call_id: result.call_id,
+                assessment: result
+                    .assessment
+                    .map(|assessment| ThreadGuardianAssessment {
+                        outcome: assessment.outcome,
+                        risk_level: assessment.risk_level.into(),
+                        user_authorization: assessment.user_authorization.into(),
+                        rationale: assessment.rationale,
+                    }),
+            }
+            .into(),
+        ))
     }
 
     pub(crate) async fn thread_inject_items(
@@ -280,8 +319,9 @@ impl TurnRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: ThreadRealtimeStartParams,
+        sideband_base_url: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_realtime_start_inner(request_id, params)
+        self.thread_realtime_start_inner(request_id, params, sideband_base_url)
             .await
             .map(|response| response.map(Into::into))
     }
@@ -342,20 +382,25 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: ReviewStartParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        if matches!(params.delivery, Some(ApiReviewDelivery::Detached)) {
-            self.outgoing
-                .send_server_notification_to_connections(
-                    &[request_id.connection_id],
-                    ServerNotification::DeprecationNotice(DeprecationNoticeNotification {
-                        summary: "review/start with delivery \"detached\" is deprecated and will be removed in a future release.".to_string(),
-                        details: Some("Use thread/start followed by review/start with delivery \"inline\" for a separate review thread, or thread/fork followed by turn/start with your own review instructions.".to_string()),
-                    }),
-                )
-                .await;
-        }
-        self.review_start_inner(request_id, params)
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        self.ensure_direct_input_allowed(request_id, thread.as_ref())
+            .await?;
+        self.config_manager
+            .check_thread_model_provider(thread.config().await.as_ref())
             .await
-            .map(|()| None)
+            .map_err(|error| config_load_error(&error))?;
+        let (review_request, display_text) = Self::review_request_from_target(params.target)?;
+        let turn_id = self
+            .submit_core_op(request_id, thread.as_ref(), Op::Review { review_request })
+            .await
+            .map_err(|err| internal_error(format!("failed to start review: {err}")))?;
+        Ok(Some(
+            ReviewStartResponse {
+                turn: Self::build_review_turn(turn_id, display_text),
+                review_thread_id: params.thread_id,
+            }
+            .into(),
+        ))
     }
 
     fn track_error_response(
@@ -420,66 +465,41 @@ impl TurnRequestProcessor {
 
     fn review_request_from_target(
         target: ApiReviewTarget,
-    ) -> Result<(ReviewRequest, String, String), JSONRPCErrorError> {
-        let cleaned_target = match target {
-            ApiReviewTarget::UncommittedChanges => ApiReviewTarget::UncommittedChanges,
+    ) -> Result<(ReviewRequest, String), JSONRPCErrorError> {
+        let core_target = match target {
+            ApiReviewTarget::UncommittedChanges => CoreReviewTarget::UncommittedChanges,
             ApiReviewTarget::BaseBranch { branch } => {
                 let branch = branch.trim().to_string();
                 if branch.is_empty() {
-                    return Err(invalid_request("branch must not be empty".to_string()));
+                    return Err(invalid_request("branch must not be empty"));
                 }
-                ApiReviewTarget::BaseBranch { branch }
+                CoreReviewTarget::BaseBranch { branch }
             }
             ApiReviewTarget::Commit { sha, title } => {
                 let sha = sha.trim().to_string();
                 if sha.is_empty() {
-                    return Err(invalid_request("sha must not be empty".to_string()));
+                    return Err(invalid_request("sha must not be empty"));
                 }
                 let title = title
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty());
-                ApiReviewTarget::Commit { sha, title }
+                CoreReviewTarget::Commit { sha, title }
             }
             ApiReviewTarget::Custom { instructions } => {
-                let trimmed = instructions.trim().to_string();
-                if trimmed.is_empty() {
-                    return Err(invalid_request(
-                        "instructions must not be empty".to_string(),
-                    ));
+                let instructions = instructions.trim().to_string();
+                if instructions.is_empty() {
+                    return Err(invalid_request("instructions must not be empty"));
                 }
-                ApiReviewTarget::Custom {
-                    instructions: trimmed,
-                }
+                CoreReviewTarget::Custom { instructions }
             }
         };
-
-        let core_target = match cleaned_target {
-            ApiReviewTarget::UncommittedChanges => CoreReviewTarget::UncommittedChanges,
-            ApiReviewTarget::BaseBranch { branch } => CoreReviewTarget::BaseBranch { branch },
-            ApiReviewTarget::Commit { sha, title } => CoreReviewTarget::Commit { sha, title },
-            ApiReviewTarget::Custom { instructions } => CoreReviewTarget::Custom { instructions },
-        };
-        let target_prompt = match &core_target {
-            CoreReviewTarget::UncommittedChanges => {
-                "Review the current code changes (staged, unstaged, and untracked files)."
-                    .to_string()
-            }
-            CoreReviewTarget::BaseBranch { branch } => {
-                format!("Review the code changes against the base branch {branch:?}.")
-            }
-            CoreReviewTarget::Commit { sha, .. } => {
-                format!("Review the changes introduced by commit {sha:?}.")
-            }
-            CoreReviewTarget::Custom { instructions } => instructions.clone(),
-        };
-
         let hint = codex_core::review_prompts::user_facing_hint(&core_target);
         let review_request = ReviewRequest {
             target: core_target,
             user_facing_hint: Some(hint.clone()),
         };
 
-        Ok((review_request, hint, target_prompt))
+        Ok((review_request, hint))
     }
 
     async fn request_trace_context(
@@ -578,6 +598,15 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
+        // Validate before changing the thread's live MCP policy.
+        let additional_context = map_additional_context(params.additional_context);
+        additional_context
+            .values()
+            .try_for_each(CoreAdditionalContextEntry::validate)
+            .map_err(invalid_request)
+            .inspect_err(|error| {
+                self.track_error_response(&request_id, error, /*error_type*/ None);
+            })?;
         Self::set_app_server_client_info(
             thread.as_ref(),
             app_server_client_name,
@@ -593,7 +622,6 @@ impl TurnRequestProcessor {
         let environment_requests =
             resolve_turn_environment_requests(self.thread_manager.as_ref(), params.environments)?;
 
-        let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !params.input.is_empty();
         let input = if let Some(tool_output) = params.tool_output {
             let item = ResponseItem::FunctionCallOutput {
@@ -608,7 +636,14 @@ impl TurnRequestProcessor {
                 internal_chat_message_metadata_passthrough: None,
             };
             validate_response_item_image_urls(std::slice::from_ref(&item))?;
-            TurnInput::ResponseItem(item)
+            if tool_output.retain {
+                TurnInput::AnnotatedResponseItem(AnnotatedResponseItem {
+                    item,
+                    annotations: ResponseItemAnnotations { retain: true },
+                })
+            } else {
+                TurnInput::ResponseItem(item)
+            }
         } else {
             TurnInput::UserInput {
                 content: params
@@ -656,23 +691,33 @@ impl TurnRequestProcessor {
                     .on_start(TurnStartOptions {
                         turn_trigger: params.turn_trigger,
                         parent_turn_id: params.parent_turn_id,
-                        initiating_agent_path: None,
                         root_turn_id: params.root_turn_id,
                         final_output_json_schema: params.output_schema,
                         service_tier: params.service_tier_for_turn,
+                        prompt_cache_ttl: None,
                         cyber_access_program: params.cyber_access_program.map(Into::into),
+                        ..Default::default()
                     })
                     .with_additional_context(additional_context)
                     .with_responses_metadata(params.responsesapi_client_metadata)
+                    .with_responses_metadata_patch(params.responsesapi_client_metadata_patch)
                     .with_trace(self.request_trace_context(&request_id).await),
             )
             .await
             .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
+                let error = match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("failed to submit turn input: {err}")),
+                };
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 error
             })?;
         let (turn_id, root_turn_id, started) = match submission {
+            TurnInputSubmission::Accepted => {
+                return Err(internal_error(
+                    "user input unexpectedly returned agent acceptance".to_string(),
+                ));
+            }
             TurnInputSubmission::Started {
                 turn_id,
                 root_turn_id,
@@ -697,7 +742,6 @@ impl TurnRequestProcessor {
             if config_snapshot.is_primary_environment_configured() {
                 codex_memories_write::start_memories_startup_task(
                     Arc::clone(&self.thread_manager),
-                    Arc::clone(&self.auth_manager),
                     thread_id,
                     Arc::clone(&thread),
                     thread.config().await,
@@ -890,6 +934,7 @@ impl TurnRequestProcessor {
                     runtime_workspace_roots: runtime_workspace_roots.clone(),
                     approval_policy,
                     approvals_reviewer,
+                    requested_approvals_reviewer: None,
                     sandbox_policy: sandbox_policy.clone(),
                     permission_profile: permission_profile.clone(),
                     active_permission_profile: active_permission_profile.clone(),
@@ -1079,12 +1124,16 @@ impl TurnRequestProcessor {
                     client_id: params.client_user_message_id,
                 })
                 .with_additional_context(additional_context)
-                .with_responses_metadata(params.responsesapi_client_metadata),
+                .with_responses_metadata(params.responsesapi_client_metadata)
+                .with_responses_metadata_patch(params.responsesapi_client_metadata_patch),
                 params.expected_turn_id,
             )
             .await
             .map_err(|err| {
-                let error = internal_error(format!("failed to steer turn: {err}"));
+                let error = match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("failed to steer turn: {err}")),
+                };
                 self.track_error_response(request_id, &error, /*error_type*/ None);
                 error
             })?;
@@ -1204,6 +1253,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: ThreadRealtimeStartParams,
+        sideband_base_url: Option<String>,
     ) -> Result<Option<ThreadRealtimeStartResponse>, JSONRPCErrorError> {
         let attaches_existing_call = matches!(
             &params.transport,
@@ -1274,6 +1324,7 @@ impl TurnRequestProcessor {
                 realtime_end_instructions: params.realtime_end_instructions,
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
+                voice_session_id: params.voice_session_id,
                 transport: params.transport.map(|transport| match transport {
                     ThreadRealtimeStartTransport::Websocket => {
                         ConversationStartTransport::Websocket
@@ -1281,10 +1332,10 @@ impl TurnRequestProcessor {
                     ThreadRealtimeStartTransport::Webrtc { sdp } => {
                         ConversationStartTransport::Webrtc { sdp }
                     }
-                    ThreadRealtimeStartTransport::ExistingCall { call_id } => {
+                    ThreadRealtimeStartTransport::ExistingCall { call_id, .. } => {
                         ConversationStartTransport::ExistingCall {
                             call_id,
-                            sideband_base_url: None,
+                            sideband_base_url,
                         }
                     }
                 }),
@@ -1396,25 +1447,20 @@ impl TurnRequestProcessor {
         Ok(Some(ThreadRealtimeStopResponse::default()))
     }
 
-    fn build_review_turn(turn_id: String, display_text: &str) -> Turn {
-        let items = if display_text.is_empty() {
-            Vec::new()
-        } else {
-            vec![ThreadItem::UserMessage {
-                id: turn_id.clone(),
-                client_id: None,
-                content: vec![V2UserInput::Text {
-                    text: display_text.to_string(),
-                    // Review prompt display text is synthesized; no UI element ranges to preserve.
-                    text_elements: Vec::new(),
-                }],
-            }]
-        };
+    fn build_review_turn(turn_id: String, display_text: String) -> Turn {
+        let item = ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: turn_id.clone(),
+            client_id: None,
+            content: vec![V2UserInput::Text {
+                text: display_text,
+                text_elements: Vec::new(),
+            }],
+        });
 
         Turn {
             id: turn_id,
             root_turn_id: None,
-            items,
+            items: vec![item],
             items_view: TurnItemsView::NotLoaded,
             error: None,
             status: TurnStatus::InProgress,
@@ -1422,189 +1468,6 @@ impl TurnRequestProcessor {
             completed_at: None,
             duration_ms: None,
         }
-    }
-
-    async fn emit_review_started(
-        &self,
-        request_id: &ConnectionRequestId,
-        turn: Turn,
-        review_thread_id: String,
-    ) {
-        let response = ReviewStartResponse {
-            turn,
-            review_thread_id,
-        };
-        self.outgoing
-            .send_response(request_id.clone(), response)
-            .await;
-    }
-
-    async fn start_inline_review(
-        &self,
-        request_id: &ConnectionRequestId,
-        parent_thread: Arc<CodexThread>,
-        review_request: ReviewRequest,
-        display_text: &str,
-        parent_thread_id: String,
-    ) -> std::result::Result<(), JSONRPCErrorError> {
-        let turn_id = self
-            .submit_core_op(
-                request_id,
-                parent_thread.as_ref(),
-                Op::Review { review_request },
-            )
-            .await
-            .map_err(|err| internal_error(format!("failed to start review: {err}")))?;
-        let turn = Self::build_review_turn(turn_id, display_text);
-        self.emit_review_started(request_id, turn, parent_thread_id)
-            .await;
-        Ok(())
-    }
-
-    async fn start_detached_review(
-        &self,
-        request_id: &ConnectionRequestId,
-        parent_thread: Arc<CodexThread>,
-        prompt: &str,
-    ) -> std::result::Result<(), JSONRPCErrorError> {
-        // AgentRunner::start still delegates to spawn_legacy_subagent, which forks from the parent's
-        // full history. Paginated threads only allow bounded model-context reads, so keep this
-        // closed until detached review has a bounded fork path.
-        if matches!(
-            parent_thread.config_snapshot().await.history_mode,
-            codex_protocol::protocol::ThreadHistoryMode::Paginated
-        ) {
-            return Err(invalid_request(
-                "paginated threads do not support detached review",
-            ));
-        }
-        let mut config = parent_thread.config().await.as_ref().clone();
-        if let Some(review_model) = &config.review_model {
-            config.model = Some(review_model.clone());
-        }
-
-        let AgentRun {
-            thread_id,
-            thread: review_thread,
-            turn_id,
-        } = self
-            .agent_runner
-            .start(
-                parent_thread.startup_metadata().thread_id,
-                AgentInvocation {
-                    config,
-                    prompt: prompt.to_string(),
-                    parent_trace: self.request_trace_context(request_id).await,
-                },
-            )
-            .await
-            .map_err(|err| internal_error(format!("failed to start detached review: {err}")))?;
-
-        let fallback_provider = self.config.model_provider_id.as_str();
-        let stored_thread = match review_thread
-            .read_thread(
-                /*include_archived*/ true, /*include_history*/ false,
-            )
-            .await
-        {
-            Ok(stored_thread) => {
-                let (thread, _) =
-                    thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
-                Some(thread)
-            }
-            Err(err) => {
-                tracing::warn!("failed to load summary for review thread {thread_id}: {err}");
-                None
-            }
-        };
-
-        if let Some(mut thread) = stored_thread {
-            let config_snapshot = review_thread.config_snapshot().await;
-            apply_live_thread_settings(&mut thread, &config_snapshot);
-            thread.session_id = review_thread.startup_metadata().session_id.to_string();
-            self.thread_watch_manager
-                .upsert_thread_silently(&thread.id)
-                .await;
-            thread.status = resolve_thread_status(
-                self.thread_watch_manager
-                    .loaded_status_for_thread(&thread.id)
-                    .await,
-                /*has_in_progress_turn*/ false,
-            );
-            let notif = thread_started_notification(thread);
-            self.outgoing
-                .send_server_notification(ServerNotification::ThreadStarted(notif))
-                .await;
-        }
-
-        log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "review thread",
-        );
-
-        let turn = Self::build_review_turn(turn_id, prompt);
-        let review_thread_id = thread_id.to_string();
-        self.emit_review_started(request_id, turn, review_thread_id)
-            .await;
-
-        Ok(())
-    }
-
-    async fn review_start_inner(
-        &self,
-        request_id: &ConnectionRequestId,
-        params: ReviewStartParams,
-    ) -> Result<(), JSONRPCErrorError> {
-        let ReviewStartParams {
-            thread_id,
-            target,
-            delivery,
-        } = params;
-
-        let (_, parent_thread) = self.load_thread(&thread_id).await?;
-        self.ensure_direct_input_allowed(request_id, parent_thread.as_ref())
-            .await?;
-        self.config_manager
-            .check_thread_model_provider(parent_thread.config().await.as_ref())
-            .await
-            .map_err(|error| config_load_error(&error))?;
-        let (review_request, display_text, target_prompt) =
-            Self::review_request_from_target(target)?;
-        match delivery.unwrap_or(ApiReviewDelivery::Inline).to_core() {
-            CoreReviewDelivery::Inline => {
-                self.start_inline_review(
-                    request_id,
-                    parent_thread,
-                    review_request,
-                    &display_text,
-                    thread_id,
-                )
-                .await?;
-            }
-            CoreReviewDelivery::Detached => {
-                let review_skill_path = system_cache_root_dir(&self.config.codex_home)
-                    .join("review-agent")
-                    .join("SKILL.md");
-                let prompt = format!(
-                    "Use [$review-agent]({}) for this review.\n\n{target_prompt}",
-                    review_skill_path.display()
-                );
-                let actual_chars = prompt.chars().count();
-                if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
-                    return Err(Self::input_too_large_error(actual_chars));
-                }
-                self.start_detached_review(request_id, parent_thread, &prompt)
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     async fn turn_interrupt_inner(
@@ -1679,7 +1542,6 @@ impl TurnRequestProcessor {
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             thread_watch_manager: self.thread_watch_manager.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
-            thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
         }

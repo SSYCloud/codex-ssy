@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -53,6 +54,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::WebSocketCompression;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
@@ -93,6 +95,9 @@ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool 
     )
 }
 
+pub use codex_agent_message_board_host::delete_agent_message_boards;
+pub use codex_agent_message_board_host::install_agent_message_board;
+
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;
@@ -103,6 +108,10 @@ mod code_mode_host;
 mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
+mod startup_config;
+pub use startup_config::StartupConfigArgs;
+pub use startup_config::print_startup_config;
+
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
@@ -130,6 +139,7 @@ mod model_catalog;
 mod models;
 mod models_refresh_worker;
 mod notification_media;
+mod otel_config;
 mod otel_reloader;
 mod outgoing_message;
 mod plugin_config_reload;
@@ -137,6 +147,8 @@ mod request_processors;
 mod request_serialization;
 mod server_request_error;
 mod skills_watcher;
+mod startup_warnings;
+mod thread_sample;
 mod thread_state;
 mod thread_status;
 mod transport;
@@ -153,6 +165,7 @@ pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use crate::transport::verified_local_daemon_socket;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
@@ -473,6 +486,8 @@ pub enum PluginStartupTasks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    /// Optional host-owned frozen cloud skill catalog and resources, loaded once at startup.
+    pub cloud_skills_snapshot: Option<std::path::PathBuf>,
     pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
@@ -483,6 +498,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            cloud_skills_snapshot: None,
             code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
@@ -504,6 +520,18 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
+    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
+        Some(path) => {
+            let provider = tokio::task::spawn_blocking(move || {
+                codex_skills_extension::FrozenCloudSkillProvider::from_file(&path)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
+            Some(Arc::new(provider) as Arc<dyn codex_skills_extension::SkillProvider>)
+        }
+        None => None,
+    };
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
@@ -544,21 +572,12 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    let bootstrap_config = config_manager
-        .load_startup_config(startup_cwd.clone())
+    let startup = config_manager
+        .load_managed_startup_config(startup_cwd.clone())
         .await?;
-    let bootstrap_auth =
-        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
-            .await
-            .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        bootstrap_auth,
-        bootstrap_config.chatgpt_base_url.clone(),
-        bootstrap_config.http_client_factory(),
-    );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager.load_latest_config(startup_cwd).await {
+    let config = match startup.config {
         Ok(config) => config,
         Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
             return Err(err);
@@ -579,16 +598,13 @@ pub async fn run_main_with_transport_options(
             })?
         }
     };
+    config.validate_windows_mxc_requirement()?;
     config.auth_config().validate()?;
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
             .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager.clone(),
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
+    config_manager.update_managed_config_loader(auth_manager.clone(), &config);
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -660,7 +676,7 @@ pub async fn run_main_with_transport_options(
         Ok(state_db_init) => state_db_init,
         Err(err) => {
             return Err(std::io::Error::other(format!(
-                "failed to initialize sqlite state runtime under {}: {err}",
+                "failed to initialize sqlite state runtime under {}: {err:#}",
                 config.sqlite_config().home().display()
             )));
         }
@@ -702,8 +718,15 @@ pub async fn run_main_with_transport_options(
         });
     }
 
-    let analytics_events_client =
-        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
+    let runtime_auth_slot = config
+        .features
+        .enabled(Feature::RuntimeAgentInstances)
+        .then(codex_runtime_agent_instance::RuntimeAuthSlot::default);
+    let analytics_events_client = analytics_events_client_from_config(
+        Arc::clone(&auth_manager),
+        &config,
+        runtime_auth_slot.clone(),
+    );
     let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
         outgoing_tx,
         analytics_events_client.clone(),
@@ -719,12 +742,12 @@ pub async fn run_main_with_transport_options(
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
@@ -789,6 +812,14 @@ pub async fn run_main_with_transport_options(
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
+    let websocket_compression = if config
+        .features
+        .enabled(Feature::AppServerWebSocketCompression)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
@@ -819,6 +850,7 @@ pub async fn run_main_with_transport_options(
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -829,6 +861,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -862,6 +895,9 @@ pub async fn run_main_with_transport_options(
 
     let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
         RemoteControlStartConfig {
+            runtime_auth: runtime_auth_slot
+                .clone()
+                .map(|slot| (slot, config.runtime_auth_mode)),
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
             policy: remote_control_policy,
@@ -972,26 +1008,37 @@ pub async fn run_main_with_transport_options(
     });
 
     let recovery_file = daemon_recovery_file_path(&config.codex_home);
+    let daemon_settings_file = managed_daemon.then(|| {
+        config
+            .codex_home
+            .as_path()
+            .join("app-server-daemon/settings.json")
+    });
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
-        let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
+        let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
             config: Arc::new(config),
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
             config_warnings,
+            startup_warnings_tx,
             session_source,
             user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
                 &auth_manager,
             ))),
             auth_manager,
+            runtime_auth_slot,
             installation_id,
             code_mode_session_provider,
             rpc_transport: analytics_rpc_transport(&transport),
@@ -1001,7 +1048,9 @@ pub async fn run_main_with_transport_options(
                 PluginStartupTasks::Start
             )
             .then_some(plugin_startup_config),
-        }));
+        });
+        processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
+        let processor = Arc::new(processor);
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
@@ -1266,6 +1315,9 @@ pub async fn run_main_with_transport_options(
                             }
                         }
                     }
+                    Some(message) = startup_warnings_rx.recv(), if connections.values().any(|state| state.session.initialized()) => {
+                        startup_warnings::send_warning(&initialize_notification_sender, message).await;
+                    }
                     _ = connection_cleanup_tasks.reap_next() => {}
                     result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
                         if let Some(Err(err)) = result {
@@ -1487,10 +1539,8 @@ fn sqlite_recovery_notice(
 fn emit_state_db_backup_warning(message: &str) {
     warn!("{message}");
     if !tracing::dispatcher::has_been_set() {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!("{message}");
-        }
+        let _ =
+            codex_app_server_daemon::stderr_writer().write_all(format!("{message}\n").as_bytes());
     }
 }
 
@@ -1541,87 +1591,5 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 }
 
 #[cfg(test)]
-#[path = "stderr_logging_tests.rs"]
-mod stderr_logging_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::LogFormat;
-    use super::ShutdownAction;
-    use super::ShutdownSignal;
-    use super::ShutdownState;
-    #[cfg(debug_assertions)]
-    use super::loader_overrides_with_test_user_config_file;
-    use super::turn_admission::TurnAdmission;
-    #[cfg(debug_assertions)]
-    use codex_config::LoaderOverrides;
-    #[cfg(debug_assertions)]
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn shutdown_waits_for_admitted_requests_but_force_remains_available() {
-        let admission = TurnAdmission::default();
-        let active = admission.subscribe_active();
-        let in_flight = admission.admit().expect("request admitted");
-        let mut shutdown = ShutdownState::default();
-        let connection_count = 1;
-        let running_turn_count = 0;
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Noop
-        ));
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(shutdown.forced());
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Finish
-        ));
-        drop(in_flight);
-    }
-
-    #[test]
-    fn log_format_from_env_value_matches_json_values_case_insensitively() {
-        assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("JSON")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("  Json  ")), LogFormat::Json);
-    }
-
-    #[test]
-    fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(
-            LogFormat::from_env_value(/*value*/ None),
-            LogFormat::Default
-        );
-        assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn debug_test_user_config_file_overrides_loader_path() {
-        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
-        let loader_overrides = loader_overrides_with_test_user_config_file(
-            LoaderOverrides::default(),
-            Some(path.clone()),
-        )
-        .expect("test config path should be valid");
-
-        assert_eq!(
-            loader_overrides.user_config_path,
-            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

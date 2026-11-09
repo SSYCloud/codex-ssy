@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use super::session::Session;
 use super::step_context::StepContext;
+use super::turn_context::TurnContext;
+use crate::agent::host::AgentRuntimeServices;
+use crate::agent::host::AgentSessionReader;
 use crate::connectors;
 use crate::context::TokenBudgetContext;
 use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
-use crate::context::world_state::BaseInstructionsState;
 use crate::context::world_state::CollaborationModeState;
 use crate::context::world_state::CompactPermissionsState;
 use crate::context::world_state::ContextWindowGuidanceState;
@@ -24,6 +26,7 @@ use crate::context::world_state::RealtimeState;
 use crate::context::world_state::ToolsState;
 use crate::context::world_state::TopLevelToolsState;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::format_agent_paths;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_extension_api::WorldStateContributionInput;
@@ -34,18 +37,31 @@ use codex_prompts::ResolvedModelMessages;
 use codex_prompts::render_model_instructions;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::models::ContentItemNamespace;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolName;
-
-const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
-const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
+use codex_tools::ToolSpec;
 
 impl Session {
+    pub(super) fn host_roster_reader(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Option<&Arc<dyn AgentSessionReader>> {
+        if turn_context.config.include_environment_context
+            && turn_context.multi_agent_version == MultiAgentVersion::V2
+            && let AgentRuntimeServices::Host(services) = &self.agent_runtime
+        {
+            services.session_reader.as_ref()
+        } else {
+            None
+        }
+    }
+
     pub(crate) async fn current_window_uses_incremental_tools(
         &self,
         step_context: &StepContext,
     ) -> bool {
-        if !step_context.settings.model_info.use_responses_lite {
+        if step_context.incremental_tools_feature().is_none() {
             return false;
         }
         let state = self.state.lock().await;
@@ -72,63 +88,79 @@ impl Session {
         let model_info = settings.model_info.as_ref();
         let model_messages = ResolvedModelMessages::from_model(model_info);
         tracing::trace!(
-            selected_capability_root_count = step_context.selected_capability_roots.len(),
+            selected_capability_root_count = step_context
+                .extension_data
+                .get::<Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>>()
+                .map_or(0, |roots| roots.len()),
             "building step world state"
         );
-        let model_instructions = render_model_instructions(model_info);
-        let model_instructions = if !turn_context.config.update_plan_enabled
-            && turn_context.config.model_catalog.is_none()
-            && (turn_context.config.base_instructions.is_none()
-                || matches!(
-                    turn_context.config.base_instructions_provenance,
-                    Some(BaseInstructionsProvenance::Model { .. })
-                )) {
-            codex_prompts::without_update_plan_instructions(&model_instructions)
+        let render_current_instructions = || {
+            let instructions = render_model_instructions(model_info);
+            if !turn_context.config.update_plan_enabled
+                && turn_context.config.model_catalog.is_none()
+                && (incremental_tools
+                    || turn_context.config.base_instructions.is_none()
+                    || matches!(
+                        turn_context.config.base_instructions_provenance,
+                        Some(BaseInstructionsProvenance::Model { .. })
+                    ))
+            {
+                codex_prompts::without_update_plan_instructions(&instructions)
+            } else {
+                instructions
+            }
+        };
+        let model_state = if incremental_tools {
+            let base_instructions = self.get_base_instructions().await;
+            let instructions = match base_instructions.provenance {
+                Some(BaseInstructionsProvenance::Model { .. }) => render_current_instructions(),
+                Some(BaseInstructionsProvenance::Custom) | None => base_instructions.text,
+            };
+            ModelInstructionsState::for_incremental_tools(
+                &model_info.slug,
+                instructions,
+                turn_context
+                    .config
+                    .features
+                    .enabled(Feature::SuppressModelChangeAnnouncements),
+            )
         } else {
-            model_instructions
+            let model_instructions = render_current_instructions();
+            let base_instructions = self.get_prompt_base_instructions().await.text;
+            let previous_model = {
+                let state = self.state.lock().await;
+                state
+                    .previous_turn_settings()
+                    .map(|previous| previous.model)
+                    .or_else(|| {
+                        state
+                            .base_instructions_provenance
+                            .as_ref()
+                            .and_then(|provenance| match provenance {
+                                BaseInstructionsProvenance::Model { model } => Some(model),
+                                BaseInstructionsProvenance::Custom => None,
+                            })
+                            .filter(|_| base_instructions != model_instructions)
+                            .cloned()
+                    })
+            };
+            ModelInstructionsState::new(
+                &model_info.slug,
+                previous_model.as_deref(),
+                model_instructions,
+            )
         };
-        let base_instructions = self.get_prompt_base_instructions().await.text;
-        let previous_model = {
-            let state = self.state.lock().await;
-            state
-                .previous_turn_settings()
-                .map(|previous| previous.model)
-                .or_else(|| {
-                    state
-                        .base_instructions_provenance
-                        .as_ref()
-                        .and_then(|provenance| match provenance {
-                            BaseInstructionsProvenance::Model { model } => Some(model),
-                            BaseInstructionsProvenance::Custom => None,
-                        })
-                        .filter(|_| base_instructions != model_instructions)
-                        .cloned()
-                })
-        };
-        let environment_subagents = if turn_context.config.include_environment_context {
+        let environment_subagents = if turn_context.config.include_environment_context
+            && matches!(self.agent_runtime, AgentRuntimeServices::Controller)
+        {
             match turn_context.multi_agent_version {
-                MultiAgentVersion::V2 => {
-                    let agent_paths = self
-                        .services
+                MultiAgentVersion::V2 => format_agent_paths(
+                    self.services
                         .agent_control
                         .child_agent_paths(self.thread_id)
-                        .await;
-                    let mut lines =
-                        Vec::with_capacity(agent_paths.len().min(MAX_ENVIRONMENT_SUBAGENTS));
-                    let mut rendered_bytes = "  <subagents>\n  </subagents>\n".len();
-                    for agent_path in agent_paths {
-                        if lines.len() == MAX_ENVIRONMENT_SUBAGENTS {
-                            break;
-                        }
-                        let line = format!(r#"<agent name="{agent_path}" />"#);
-                        let line_bytes = "    \n".len() + line.len();
-                        if rendered_bytes + line_bytes <= MAX_ENVIRONMENT_SUBAGENT_BYTES {
-                            rendered_bytes += line_bytes;
-                            lines.push(line);
-                        }
-                    }
-                    lines.join("\n")
-                }
+                        .await
+                        .into_iter(),
+                ),
                 MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
                     self.services
                         .local_agent_runtime
@@ -140,23 +172,53 @@ impl Session {
             String::new()
         };
         let mut world_state = WorldState::default();
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::CommandSessionsWorldState)
+        {
+            let mut sessions =
+                crate::unified_exec::command_sessions_state(&self.services.unified_exec_manager)
+                    .await;
+            if step_context
+                .tool_router
+                .exposes_tool(&ToolName::plain("write_stdin"))
+            {
+                world_state.add_section(sessions);
+            } else {
+                sessions.polling_unavailable = true;
+                world_state.add_section(crate::context::world_state::DisabledCommandSessionsState(
+                    sessions,
+                ));
+            }
+        } else {
+            world_state
+                .add_section(crate::context::world_state::DisabledCommandSessionsState::default());
+        }
         let extension_metrics = super::extension_metrics::from_session_telemetry(
             step_context.session_telemetry.clone(),
         );
-        if incremental_tools {
+        let preserve_parent_tool_declarations =
+            !new_window && self.preserve_parent_tool_declarations();
+        if incremental_tools && !preserve_parent_tool_declarations {
             let specs = step_context.tool_router.model_visible_specs();
+            let specs = specs
+                .iter()
+                .filter(|tool| !matches!(tool, ToolSpec::WebSearch { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
             let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
-            world_state.add_section(TopLevelToolsState::new(
+            let mut top_level = TopLevelToolsState::new(
+                model_messages.incremental_tools(),
                 definitions,
                 Some(Arc::clone(&extension_metrics)),
-            )?);
-            world_state.add_section(BaseInstructionsState(base_instructions));
+            )?;
+            if let Some(entries) = step_context.tool_router.exec_definitions() {
+                top_level = top_level.with_incremental_exec_tools(Some(entries));
+            }
+            world_state.add_section(top_level);
         }
-        world_state.add_section(ModelInstructionsState::new(
-            &model_info.slug,
-            previous_model.as_deref(),
-            model_instructions,
-        ));
+        world_state.add_section(model_state);
         let token_budget_enabled = turn_context.config.features.enabled(Feature::TokenBudget)
             && step_context
                 .settings
@@ -164,7 +226,7 @@ impl Session {
                 .resolved_context_window()
                 .is_some();
         if token_budget_enabled {
-            let window_ids = self.state.lock().await.auto_compact_window_ids();
+            let window_ids = self.state.lock().await.auto_compact_window_ids().clone();
             world_state.add_section(TokenBudgetContext::new(
                 turn_context
                     .session_source
@@ -173,7 +235,6 @@ impl Session {
                 window_ids.first_window_id,
                 window_ids.previous_window_id,
                 window_ids.window_id,
-                /*thread_hint*/ None,
             ));
         }
         let guidance = step_context
@@ -203,10 +264,12 @@ impl Session {
             .services
             .exec_policy
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
+        let approval_context =
+            ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages);
         if turn_context.config.include_permissions_instructions {
             let environment = step_context.environments.primary();
             let sandbox = environment
-                .filter(|environment| environment.environment.is_remote())
+                .filter(|environment| environment.environment().is_remote())
                 .map(|environment| {
                     environment.sandbox_context(/*additional_permissions*/ None)
                 });
@@ -222,7 +285,7 @@ impl Session {
             world_state.add_section(PermissionsState::new(
                 &permission_profile,
                 settings.approval_policy(),
-                ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages),
+                approval_context,
                 exec_policy.as_ref(),
                 &cwd,
                 paths.as_ref(),
@@ -236,7 +299,10 @@ impl Session {
                     .enabled(Feature::RequestPermissionsTool),
             ));
         } else {
-            world_state.add_section(CompactPermissionsState::new(exec_policy.as_ref()));
+            world_state.add_section(CompactPermissionsState::new(
+                exec_policy.as_ref(),
+                approval_context.approved_command_prefix_saved_heading(),
+            ));
         }
         if turn_context.config.include_collaboration_mode_instructions {
             world_state.add_section(CollaborationModeState::from_collaboration_mode(
@@ -247,14 +313,13 @@ impl Session {
             ));
         }
         if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
-            let send_user_message_async_available =
-                !turn_context.session_source.is_non_root_agent()
-                    && step_context
-                        .settings
-                        .model_info
-                        .experimental_supported_tools
-                        .iter()
-                        .any(|tool| tool == "send_user_message_async");
+            let send_user_message_async_available = !turn_context.root_capabilities_restricted
+                && step_context
+                    .settings
+                    .model_info
+                    .experimental_supported_tools
+                    .iter()
+                    .any(|tool| tool == "send_user_message_async");
             world_state.add_section(PersistentModeState::new(
                 turn_context.config.features.persistent_execution_enabled(
                     step_context.settings.effective_reasoning_effort().as_ref(),
@@ -264,15 +329,19 @@ impl Session {
             ));
         }
         if turn_context.config.include_environment_context {
-            let current_date = self
-                .read_clock_for_context(turn_context, "environment_date")
-                .await?
-                .map(|current_time| {
-                    current_time
-                        .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d")
-                        .to_string()
-                });
+            world_state.host_roster_reader = self.host_roster_reader(turn_context).cloned();
+            let current_date = if turn_context.config.include_environment_context_time {
+                self.read_clock_for_context(turn_context, "environment_date")
+                    .await?
+                    .map(|current_time| {
+                        current_time
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d")
+                            .to_string()
+                    })
+            } else {
+                None
+            };
             world_state.add_section(
                 EnvironmentsState::from_turn_context_with_environments(
                     turn_context,
@@ -308,9 +377,15 @@ impl Session {
         ));
         let plugins_usage_instructions_available =
             step_context.mcp.plugins_available() && model_info.include_plugin_usage_instructions;
-        world_state.add_section(PluginsInstructionsState::new(
-            plugins_usage_instructions_available,
-        ));
+        let plugins_state = {
+            let state = self.state.lock().await;
+            PluginsInstructionsState::new(
+                plugins_usage_instructions_available,
+                model_messages.generic_plugin(),
+                state.history.raw_items(),
+            )
+        };
+        world_state.add_section(plugins_state);
         if turn_context
             .config
             .features
@@ -322,11 +397,6 @@ impl Session {
             ));
         }
         let environments = step_context.environments.to_selections();
-        let ready_selected_capability_roots = step_context
-            .selected_capability_roots
-            .iter()
-            .map(|root| root.selected_root().clone())
-            .collect::<Vec<_>>();
         let previous_world_state = self.state.lock().await.history.world_state_checkpoint();
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
@@ -335,10 +405,6 @@ impl Session {
                     turn_id: turn_context.sub_id.as_str(),
                     model_info: &step_context.settings.model_info,
                     environments: &environments,
-                    ready_selected_capability_roots: &ready_selected_capability_roots,
-                    executor_capability_discovery: step_context
-                        .executor_capability_discovery
-                        .as_deref(),
                     extension_metrics: Some(Arc::clone(&extension_metrics)),
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
@@ -351,11 +417,20 @@ impl Session {
                 world_state.add_extension_section(section);
             }
         }
+        let v2_namespace = turn_context
+            .config
+            .multi_agent_v2
+            .tool_namespace
+            .clone()
+            .map(ContentItemNamespace::from)
+            .unwrap_or(ContentItemNamespace::Functions);
         let mut multi_agent_mode = MultiAgentModeState::new(
             super::multi_agents::effective_multi_agent_mode(step_context),
-        );
+        )
+        .with_namespace(v2_namespace.clone());
         if let Some(usage_hint_text) = super::multi_agents::usage_hint_text(step_context) {
-            let usage_hint = MultiAgentUsageHintState::new(usage_hint_text);
+            let usage_hint =
+                MultiAgentUsageHintState::new(usage_hint_text).with_namespace(v2_namespace.clone());
             multi_agent_mode = multi_agent_mode.with_usage_hint(&usage_hint);
             world_state.add_section(usage_hint);
         }
@@ -392,7 +467,12 @@ impl Session {
                 )
             } else {
                 ModelCatalogState::default()
-            },
+            }
+            .with_namespace(match turn_context.multi_agent_version {
+                MultiAgentVersion::Disabled => None,
+                MultiAgentVersion::V1 => Some(ContentItemNamespace::MultiAgentV1),
+                MultiAgentVersion::V2 => Some(v2_namespace),
+            }),
         );
         if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
             world_state.add_section(ManagedDeveloperInstructionsState::new(

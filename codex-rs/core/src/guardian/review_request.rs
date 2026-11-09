@@ -1,9 +1,11 @@
 //! Binds an immutable action and root lifetime to fresh per-attempt authorization evidence.
 //! The extension chooses effects; this adapter supplies evidence, validation and publication.
 
+use super::super::runtime::validate;
 use super::*;
 use crate::codex_thread::GuardianAuthorizationVersion;
 use codex_config::config_toml::CircuitBreakAction;
+use codex_guardian_reviewer::ReviewDeadline;
 use codex_guardian_reviewer::ReviewHost;
 use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::protocol::ErrorEvent;
@@ -20,8 +22,7 @@ pub(in crate::guardian) struct ApprovalEvidence {
     store: Arc<GuardianReviewEvidence>,
     authorization_version: GuardianAuthorizationVersion,
     review_context_revision: u64,
-    root_authorization_version: Option<GuardianAuthorizationVersion>,
-    root_review_context_revision: Option<u64>,
+    root_versions: Option<(GuardianAuthorizationVersion, u64)>,
 }
 
 /// Authorization captured before an attempt, checked while the reviewer is still reserved.
@@ -34,12 +35,19 @@ pub(in crate::guardian) struct ReviewAuthorization {
     history_reset: CancellationToken,
 }
 
+/// Keeps observed context changes separate from the invalidation outcome.
+/// A concurrent stop or history reset can take precedence over changed context.
+pub(in crate::guardian) struct ReviewInvalidation {
+    pub(in crate::guardian) outcome: codex_guardian_reviewer::GuardianReviewSessionOutcome,
+    pub(in crate::guardian) context_changed: bool,
+}
+
 impl ReviewAuthorization {
     pub(in crate::guardian) async fn invalidation(
         &self,
         session: &Session,
         cancellation: Option<&CancellationToken>,
-    ) -> Option<codex_guardian_reviewer::GuardianReviewSessionOutcome> {
+    ) -> Option<ReviewInvalidation> {
         use codex_guardian_reviewer::GuardianReviewSessionOutcome;
 
         let root_snapshot = session
@@ -62,19 +70,27 @@ impl ReviewAuthorization {
             authorization_changed || self.user_message_revision != history.user_message_revision();
         let review_context_changed = root_review_changed
             || self.review_context_revision != history.guardian_review_context_revision();
-        // An actual stop or history reset wins over a concurrent authorization change.
-        if self.history_reset.is_cancelled()
+        // An actual stop or history reset wins over a concurrent evidence change.
+        let outcome = if self.history_reset.is_cancelled()
             || cancellation.is_some_and(CancellationToken::is_cancelled)
             || root_history_changed
-            || review_context_changed
         {
             Some(GuardianReviewSessionOutcome::Aborted)
-        } else if authorization_changed {
-            tracing::info!(thread_id = %session.thread_id, "Guardian approval invalidated by an authorization change");
+        } else if authorization_changed || review_context_changed {
+            tracing::info!(
+                thread_id = %session.thread_id,
+                authorization_changed,
+                review_context_changed,
+                "Guardian approval invalidated by changed review evidence"
+            );
             Some(GuardianReviewSessionOutcome::StaleAuthorization)
         } else {
             None
-        }
+        };
+        outcome.map(|outcome| ReviewInvalidation {
+            outcome,
+            context_changed: authorization_changed || review_context_changed,
+        })
     }
 }
 
@@ -84,11 +100,9 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
 
     fn permissions(&self) -> Option<codex_guardian_context::PermissionContext> {
         let request = self.request.request.as_ref().ok()?;
-        crate::guardian::permissions::for_environment(
-            &self.context,
-            request.target_environment_id(),
-        )
-        .ok()
+        crate::guardian::permissions::for_request(request, Some(&self.context))
+            .ok()
+            .flatten()
     }
 
     async fn servicing_turn(
@@ -96,14 +110,14 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
     ) -> Option<(String, Arc<codex_protocol::openai_models::ModelInfo>)> {
         let active = self.session.active_turn.lock().await;
         let turn = &active.as_ref()?.task.as_ref()?.turn_context;
-        Some((turn.sub_id.clone(), Arc::clone(turn.model_info())))
+        Some((turn.sub_id.clone(), Arc::clone(&turn.model_info().model)))
     }
 
     async fn prepare(
         &self,
         review_id: &str,
         review_reason: GuardianReviewReason,
-        deadline: Instant,
+        deadline: ReviewDeadline,
         cancellation: &CancellationToken,
     ) -> Result<(PreparedApproval, codex_guardian_reviewer::ReviewReport), ReviewDecision> {
         let super::super::runtime::ReviewRuntime {
@@ -114,7 +128,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
             reasons: _,
             options,
         } = self.clone();
-        let request = match request.validate(&context) {
+        let request = match validate(&request, &context) {
             Ok(request) => request.clone(),
             Err(decision) => return Err(decision),
         };
@@ -133,10 +147,8 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
         let plugin_attribution = match plugin_attribution_override {
             Some(attribution) => Some(attribution),
             None if matches!(&request, GuardianApprovalRequest::ExecCommand { .. }) => {
-                let attribution_deadline = std::cmp::min(
-                    deadline,
-                    Instant::now() + GUARDIAN_PLUGIN_ATTRIBUTION_TIMEOUT,
-                );
+                let attribution_deadline =
+                    deadline.cap(Instant::now() + GUARDIAN_PLUGIN_ATTRIBUTION_TIMEOUT);
                 let attribution = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Err(ReviewDecision::Abort),
@@ -175,6 +187,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 action: guardian_assessment_action(&request),
                 review_reason,
                 model_context,
+                timeout: turn.config.guardian_review_timeout,
             });
         let root_history = session
             .services
@@ -196,7 +209,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
     async fn attempt(
         &self,
         prepared: &PreparedApproval,
-        deadline: Instant,
+        deadline: ReviewDeadline,
         cancellation: &CancellationToken,
     ) -> (
         GuardianReviewOutcome,
@@ -229,11 +242,13 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 None,
             );
         }
-        let root_authorization_version = root_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.authorization_version);
-        let root_review_context_revision =
-            root_snapshot.map(|snapshot| snapshot.review_context_revision);
+        let root_versions = root_snapshot.map(|snapshot| {
+            (
+                snapshot.authorization_version,
+                snapshot.review_context_revision,
+            )
+        });
+        let (root_authorization_version, root_review_context_revision) = root_versions.unzip();
         // Keep the authorization revision even when no cacheable review evidence exists.
         let history = session.conversation_history_snapshot().await;
         let user_message_revision = history.user_message_revision();
@@ -246,8 +261,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 authorization_version: store.authorization_version(history.as_ref()),
                 review_context_revision,
                 store,
-                root_authorization_version,
-                root_review_context_revision,
+                root_versions,
             });
         drop(history);
         let (outcome, analytics) = run_guardian_review_session_before_deadline(
@@ -292,7 +306,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
     }
 
     fn validate_action(&self) -> Result<(&str, Option<&str>), ReviewDecision> {
-        let request = self.request.validate(&self.context)?;
+        let request = validate(&self.request, &self.context)?;
         Ok((
             guardian_request_turn_id(request, &self.context.turn().sub_id),
             guardian_request_target_item_id(request),
@@ -315,8 +329,8 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 action,
                 evidence.authorization_version,
                 evidence.review_context_revision,
-                evidence.root_authorization_version,
-                evidence.root_review_context_revision,
+                evidence.root_versions,
+                &self.session.item_id_generator,
             );
         }
     }

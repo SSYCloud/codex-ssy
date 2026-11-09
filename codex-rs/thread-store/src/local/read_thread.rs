@@ -2,6 +2,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -34,6 +35,24 @@ pub(super) async fn read_thread(
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let sqlite_metadata = read_sqlite_metadata(store, thread_id).await;
+    if !params.include_history
+        && let Some((path, meta)) =
+            super::live_writer::unpersisted_session_meta(store, thread_id).await
+        && sqlite_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.rollout_path == path && metadata.archived_at.is_none())
+    {
+        // A new writer already owns its metadata. Missing JSONL is intentional, so neither
+        // filesystem discovery nor compression-race retries can find anything more authoritative.
+        return match sqlite_metadata {
+            Some(metadata) => Ok(stored_thread_from_metadata(store, metadata, Some(meta)).await),
+            // Preserve the saved-thread contract used by fork/resume. A live but untouched
+            // thread has no stored record yet; its absence is known without searching history.
+            None => Err(ThreadStoreError::InvalidRequest {
+                message: format!("no rollout found for thread id {thread_id}"),
+            }),
+        };
+    }
     let persisted_model_settings = sqlite_metadata
         .as_ref()
         .map(|metadata| (metadata.model.clone(), metadata.reasoning_effort.clone()));
@@ -227,17 +246,39 @@ pub(super) async fn resolve_requested_rollout_path(
         }
         _ => {}
     }
-    let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "failed to resolve rollout path `{}`: file does not exist",
-                path.display()
-            ),
-        });
-    };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
-    })
+    // Compression can replace the physical file after lookup, before canonicalization.
+    // Resolve again from the requested path so either representation remains usable.
+    let mut retries_remaining = 3;
+    loop {
+        let resolved_path = match codex_rollout::existing_rollout_path(path.as_path()).await {
+            Some(path) => path,
+            None if retries_remaining > 0 => {
+                retries_remaining -= 1;
+                continue;
+            }
+            None => {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: file does not exist",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        match std::fs::canonicalize(&resolved_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && retries_remaining > 0 => {
+                retries_remaining -= 1;
+            }
+            result => {
+                return result.map_err(|err| ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: {err}",
+                        resolved_path.display()
+                    ),
+                });
+            }
+        }
+    }
 }
 
 async fn attach_history_if_requested(
@@ -282,6 +323,8 @@ async fn read_thread_from_rollout_path(
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(path.as_path()));
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
+    thread.creator_user_id = meta_line.meta.creator_user_id;
+    thread.creator_account_id = meta_line.meta.creator_account_id;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
@@ -354,6 +397,14 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
             });
         }
     };
+    Ok(stored_thread_from_metadata(store, metadata, session_meta).await)
+}
+
+async fn stored_thread_from_metadata(
+    store: &LocalThreadStore,
+    metadata: ThreadMetadata,
+    session_meta: Option<SessionMeta>,
+) -> StoredThread {
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
     let history_mode = session_meta
@@ -362,6 +413,14 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
         .unwrap_or(metadata.history_mode);
     let name = thread_name_from_metadata(store, &metadata, history_mode).await;
     let mut thread = stored_thread_from_state_metadata(store, metadata, parent_thread_id);
+    if let Some(meta) = &session_meta {
+        thread.creator_user_id = thread
+            .creator_user_id
+            .or_else(|| meta.creator_user_id.clone());
+        thread.creator_account_id = thread
+            .creator_account_id
+            .or_else(|| meta.creator_account_id.clone());
+    }
     thread.originator = thread.originator.or_else(|| {
         session_meta
             .map(|meta| meta.originator)
@@ -370,7 +429,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
     thread.forked_from_id = forked_from_id;
     thread.history_mode = history_mode;
     thread.name = name;
-    Ok(thread)
+    thread
 }
 
 pub(super) fn stored_thread_from_state_metadata(
@@ -391,6 +450,8 @@ pub(super) fn stored_thread_from_state_metadata(
     let permission_profile =
         permission_profile_from_metadata_value(&metadata.sandbox_policy, metadata.cwd.as_path());
     StoredThread {
+        creator_user_id: metadata.creator_user_id,
+        creator_account_id: metadata.creator_account_id,
         thread_id: metadata.id,
         extra_config: None,
         rollout_path: Some(rollout_path),
@@ -494,6 +555,8 @@ fn stored_thread_from_meta_line(
         .unwrap_or(created_at);
     let rollout_path = codex_rollout::plain_rollout_path(path.as_path());
     StoredThread {
+        creator_user_id: meta_line.meta.creator_user_id,
+        creator_account_id: meta_line.meta.creator_account_id,
         thread_id: meta_line.meta.id,
         extra_config: None,
         rollout_path: Some(rollout_path),
@@ -873,6 +936,7 @@ mod tests {
         codex_rollout::append_rollout_item_to_path(
             &rollout_path,
             &RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id,
                 turn_id: "turn-1".to_string(),
                 item: TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {

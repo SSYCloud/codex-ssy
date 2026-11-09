@@ -7,7 +7,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
 use crate::clipboard_copy::CopyFormat;
-use crate::clipboard_copy::worker::CopyDestination;
 use crate::clipboard_copy::worker::CopyResult;
 use crate::text_selection::SelectionUnit;
 use crate::tui::Tui;
@@ -39,6 +38,55 @@ pub(super) struct Selection {
     origin: (Anchor, Anchor),
     unit: SelectionUnit,
     preferred_column: Option<u16>,
+}
+
+impl Selection {
+    pub(super) fn keyboard(snapshot: ViewSnapshot, cursor: Anchor) -> Self {
+        Self {
+            pending_copy: None,
+            primary_owner: None,
+            snapshot,
+            start: cursor,
+            end: cursor,
+            dragging: false,
+            moved: true,
+            moved_vertically: false,
+            pointer_origin_row: 0,
+            resume_on_empty: false,
+            pointer: None,
+            pressed_link: None,
+            origin: (cursor, cursor),
+            unit: SelectionUnit::Character,
+            preferred_column: None,
+        }
+    }
+
+    pub(super) fn set_keyboard_range(&mut self, start: Anchor, end: Anchor) {
+        if (self.start, self.end) != (start, end) {
+            self.primary_owner = None;
+            self.pending_copy = None;
+        }
+        self.start = start;
+        self.end = end;
+        self.origin = (start, end);
+        self.preferred_column = None;
+    }
+
+    pub(super) fn set_keyboard_marked_range(
+        &mut self,
+        start: Anchor,
+        end: Anchor,
+        origin: (Anchor, Anchor),
+        unit: SelectionUnit,
+    ) {
+        self.set_keyboard_range(start, end);
+        self.origin = origin;
+        self.unit = unit;
+    }
+
+    pub(super) fn unit(&self) -> SelectionUnit {
+        self.unit
+    }
 }
 
 impl TranscriptView {
@@ -139,6 +187,14 @@ impl TranscriptView {
         let Some(selection) = self.selection.take() else {
             return;
         };
+        if let Some(mode) = &mut self.select_mode {
+            let cursor = mode.cursor(&selection);
+            mode.mark = None;
+            let mut selection = selection;
+            selection.set_keyboard_range(cursor, cursor);
+            self.selection = Some(selection);
+            return;
+        }
         let empty = (selection.start.key, selection.start.offset)
             == (selection.end.key, selection.end.offset);
         if empty && selection.resume_on_empty {
@@ -273,47 +329,17 @@ impl TranscriptView {
 
     /// A PRIMARY write is silent: it neither claims CLIPBOARD was copied nor ends selection.
     pub(crate) fn publish_primary(&mut self, tui: &mut Tui, text: &str) {
-        let (_, owner) = tui.clipboard.select(
-            text.into(),
+        let (_, owner) = tui.copy_selection(
+            text,
             CopyFormat::PlainText,
-            CopyDestination::Primary,
-            tui.frame_requester(),
+            SelectionCopy::on_select(
+                /*clipboard*/ false, /*primary*/ true, /*clear_selection*/ false,
+            ),
+            text,
         );
         if let Some(selection) = &mut self.selection {
-            selection.primary_owner = Some(owner);
+            selection.primary_owner = owner;
         }
-    }
-
-    /// Both transcript surfaces honor the same automatic-copy and plaintext PRIMARY semantics.
-    pub(crate) fn copy_selected_text(
-        &mut self,
-        tui: &mut Tui,
-        cells: &[Arc<dyn HistoryCell>],
-        text: &str,
-        clear_selection: bool,
-    ) -> CopyResult {
-        let publish_primary = !clear_selection && self.primary_selection;
-        let mut primary_owner = None;
-        let result =
-            self.copy_selected_text_with(cells, text, clear_selection, |copy_text, format| {
-                if publish_primary {
-                    let (result, owner) = tui.clipboard.select(
-                        copy_text.into(),
-                        format,
-                        CopyDestination::ClipboardAndPrimary(text.into()),
-                        tui.frame_requester(),
-                    );
-                    primary_owner = Some(owner);
-                    result
-                } else {
-                    tui.clipboard
-                        .copy(copy_text.into(), format, tui.frame_requester())
-                }
-            });
-        if publish_primary && let Some(selection) = &mut self.selection {
-            selection.primary_owner = primary_owner;
-        }
-        result
     }
 
     /// Hide or cancel deferred publication without relinquishing the existing X11 selection.
@@ -323,8 +349,8 @@ impl TranscriptView {
         }
     }
 
-    /// Track delivery for the current selection. Explicit copies release it on confirmation;
-    /// automatic copies, failures, and unacknowledged terminal writes retain the revision.
+    /// Deselect only after confirmed delivery when the current copy policy requests it.
+    /// Failures and unacknowledged terminal writes retain the selection.
     pub(crate) fn copy_selected_text_with(
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
@@ -403,6 +429,63 @@ impl TranscriptView {
             | Err(_) => {}
         }
         result
+    }
+
+    /// Apply selection copy keys consistently in owned, overlay and rendered-region views.
+    /// Plain UI regions keep their visible text; transcript copies retain Markdown metadata.
+    /// PRIMARY is always plaintext, and automatic copies update both X11 selections.
+    pub(crate) fn copy_action(
+        &mut self,
+        tui: &mut Tui,
+        cells: &[Arc<dyn HistoryCell>],
+        action: &ViewAction,
+        format: crate::clipboard_copy::CopyFormat,
+    ) -> Option<(usize, CopyResult)> {
+        use crate::clipboard_copy::CopyFormat;
+        use crate::clipboard_copy::CopyStatus;
+
+        let text = match action {
+            ViewAction::Copy(text)
+            | ViewAction::CopyOnSelect(text)
+            | ViewAction::PrimarySelection(text)
+            | ViewAction::CopyAndFollow(text) => text.as_str(),
+            ViewAction::Changed | ViewAction::ExitSelectMode | ViewAction::OpenLink(_) => {
+                return None;
+            }
+        };
+        let selection_copy = self.selection_copy(action);
+        if !selection_copy.copies_clipboard() {
+            if selection_copy.publishes_primary() {
+                self.publish_primary(tui, text);
+            }
+            return None;
+        }
+        let clear_selection = selection_copy.clear_selection();
+        let mut primary_owner = None;
+        let result =
+            self.copy_selected_text_with(cells, text, clear_selection, |rich, rich_format| {
+                let (copy_text, format) = match format {
+                    CopyFormat::PlainText => (text, CopyFormat::PlainText),
+                    CopyFormat::Markdown => (rich, rich_format),
+                    CopyFormat::MarkdownSelection(source) => {
+                        (text, CopyFormat::MarkdownSelection(source))
+                    }
+                };
+                let (result, owner) = tui.copy_selection(copy_text, format, selection_copy, text);
+                primary_owner = owner;
+                result
+            });
+        if selection_copy.publishes_primary()
+            && let Some(selection) = &mut self.selection
+        {
+            selection.primary_owner = primary_owner;
+        }
+        if matches!(action, ViewAction::CopyAndFollow(_))
+            && matches!(result, Ok(CopyStatus::Pending(_)))
+        {
+            self.follow_pending_copy();
+        }
+        Some((text.chars().count(), result))
     }
 
     pub(crate) fn follow_pending_copy(&mut self) {
@@ -666,7 +749,11 @@ impl TranscriptView {
         }
     }
 
-    fn pin_selection_range(&mut self, cells: &[Arc<dyn HistoryCell>], selection: &mut Selection) {
+    pub(super) fn pin_selection_range(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        selection: &mut Selection,
+    ) {
         selection.start.index = self.resolve(cells, selection.start);
         selection.end.index = self.resolve(cells, selection.end);
         for index in selection.start.index.min(selection.end.index)
@@ -681,7 +768,7 @@ impl TranscriptView {
         }
     }
 
-    fn move_selection_endpoint(
+    pub(super) fn move_selection_endpoint(
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
         end: Anchor,

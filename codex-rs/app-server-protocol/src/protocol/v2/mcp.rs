@@ -87,6 +87,8 @@ pub struct McpServerStatus {
     pub server_info: Option<McpServerInfo>,
     /// Capabilities advertised by the initialized MCP server; null when unavailable.
     pub server_capabilities: Option<serde_json::Value>,
+    /// Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable.
+    pub tool_list_meta: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
     /// Tool discovery failed and no catalog was returned.
     /// Null when a catalog is returned, including cached or empty catalogs.
@@ -110,6 +112,10 @@ pub struct ListMcpServerStatusResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpResourceReadParams {
+    /// Additional MCP request metadata. Account and turn routing keys are reserved.
+    #[serde(rename = "_meta")]
+    #[ts(rename = "_meta", optional = nullable)]
+    pub meta: Option<serde_json::Map<String, JsonValue>>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
     /// Originating MCP tool call used to select the resource's app.

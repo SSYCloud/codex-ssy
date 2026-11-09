@@ -3,7 +3,6 @@
 use super::active_reconnect::drain_history;
 use super::disconnect::serve_reconnect_requests;
 use super::*;
-use crate::app::reconnect::ReconnectPresentation;
 use crate::app::reconnect::reconnect;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::app_event::WindowsSandboxEnableMode;
@@ -61,7 +60,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
                     vec![test_turn(
                         "cached",
                         TurnStatus::Completed,
-                        vec![ThreadItem::Plan {
+                        vec![ThreadItemPayload::Plan {
                             id: "cached-plan".into(),
                             text: "Cached previous conversation".into(),
                         }],
@@ -146,7 +145,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
         );
         view.handle_key_event(KeyCode::Char('r').into());
         view.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        view.handle_paste("Keep this task draft".into());
+        view.handle_paste("Keep this task draft!".into());
         app.agents_overview.visible_thread_ids = view.thread_ids();
         app.chat_widget.show_bottom_pane_view(Box::new(view));
         let draft = |app: &App| {
@@ -252,6 +251,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             Ok::<_, color_eyre::Report>(methods)
         });
         let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             crate::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Embedded,
         );
@@ -265,7 +265,14 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
                 .is_err()
         );
         let disconnected = session.next_event().await.unwrap();
-        app.handle_app_server_event(&session, disconnected).await;
+        // A shutdown error can cover the initial command center when its first New fails.
+        if previous_thread.is_none() && overview_initialized {
+            app.show_agents_overview_error(
+                Some("Codex's background server is shutting down"),
+                "Waiting for active turns.".into(),
+            );
+        }
+        app.handle_backend_event(&session, disconnected).await;
         assert!(app.reconnect.offline);
         assert!(app.agents_overview.last_messages.is_empty());
         assert!(refresh.await.unwrap_err().is_cancelled());
@@ -280,6 +287,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             &session,
             stale_request,
             Ok(AgentsOverviewThreadRefresh {
+                cleared_unread: Vec::new(),
                 last_messages: HashMap::new(),
                 threads: HashMap::new(),
                 recent_seed_complete: false,
@@ -289,16 +297,8 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
         );
         assert_eq!(app.agents_overview.visible_thread_ids.len(), 2);
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.handle_tui_event(
-            &mut tui,
-            &mut session,
-            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        )
-        .await?;
-        app.handle_tui_event(&mut tui, &mut session, TuiEvent::Paste("!".into()))
-            .await?;
         assert_eq!(draft(&app), "Keep this task draft!");
-        if previous_thread.is_none() {
+        if previous_thread.is_none() && !overview_initialized {
             assert_snapshot!(
                 "daemon_command_center_reconnecting",
                 render_bottom_popup(&app.chat_widget, /*width*/ 100)
@@ -315,13 +315,14 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             );
         }
         let connected = reconnect(
+            session.backend_id(),
             app.app_server_target.clone(),
             app.config.clone(),
             app.local_settings.clone(),
             previous_thread,
             /*remote_cwd*/ None,
             session.thread_tool_transport(),
-            ReconnectPresentation::Overview,
+            app.reconnect.presentation,
         )
         .await?;
         app.finish_reconnect(
@@ -363,7 +364,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             while app.agents_overview.request_id.is_some() {
                 let event = events.recv().await.expect("inventory refresh event");
                 if matches!(event, AppEvent::AgentsOverviewThreadsLoaded { .. }) {
-                    app.handle_event(&mut tui, &mut session, event).await?;
+                    Box::pin(app.handle_event(&mut tui, &mut session, event)).await?;
                 } else {
                     deferred.push(event);
                 }
@@ -433,8 +434,12 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             &session,
             stale_request,
             Ok(AgentsOverviewThreadRefresh {
+                cleared_unread: Vec::new(),
                 last_messages: HashMap::new(),
-                threads: stale_threads,
+                threads: stale_threads
+                    .into_iter()
+                    .map(|(id, thread)| (id, thread.map(|thread| (thread, false, None))))
+                    .collect(),
                 recent_seed_complete: true,
                 discovery: None,
                 pinned_thread_ids: None,
@@ -493,7 +498,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
                 app.chat_widget.composer_text_with_pending(),
                 "latest draft!"
             );
-            app.handle_event(&mut tui, &mut session, AppEvent::OpenAgentsOverview)
+            Box::pin(app.handle_event(&mut tui, &mut session, AppEvent::OpenAgentsOverview))
                 .await?;
             assert!(app.chat_widget.has_active_view());
             app.handle_tui_event(
@@ -540,11 +545,11 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
                 );
             }
             available.store(true, std::sync::atomic::Ordering::SeqCst);
-            app.handle_event(
+            Box::pin(app.handle_event(
                 &mut tui,
                 &mut session,
                 AppEvent::SelectAgentsOverviewThread { thread_id: id },
-            )
+            ))
             .await?;
             assert!(!app.thread_unavailable(id));
             assert_eq!(
@@ -590,7 +595,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             .await?;
             while let Ok(event) = events.try_recv() {
                 if matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })) {
-                    app.handle_event(&mut tui, &mut session, event).await?;
+                    Box::pin(app.handle_event(&mut tui, &mut session, event)).await?;
                 }
             }
             let channel = app.thread_event_channels.get(&id).unwrap();

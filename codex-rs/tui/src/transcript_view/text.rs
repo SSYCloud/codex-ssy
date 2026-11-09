@@ -41,13 +41,15 @@ use logical::logical_lines;
 use ratatui::text::Line;
 
 /// One cell's logical text and its width-dependent display rows.
-pub(super) struct TextLayout {
+pub(crate) struct TextLayout {
+    pub(super) image: Option<std::sync::Arc<crate::transcript_image::TranscriptImage>>,
     logical: Vec<LogicalLine>,
     text: String,
     rows: Vec<TextRow>,
     width: u16,
     pub(super) separated: bool,
     pub(super) disclosure: bool,
+    leading_blank_hidden: bool,
     disclosure_control: Option<DisclosureControl>,
 }
 
@@ -125,9 +127,33 @@ impl TextLayout {
         ranges
     }
 
-    pub(super) fn new(lines: Vec<HyperlinkLine>, width: u16) -> Self {
+    pub(crate) fn new(lines: Vec<HyperlinkLine>, width: u16) -> Self {
         let logical = logical_lines(&lines);
         Self::from_logical(logical, width)
+    }
+
+    /// Freeze the exact painted rows of a plain-text viewport, including tab stops.
+    /// Trim the selectable source so word and keyboard selection stay inside the viewport.
+    pub(crate) fn visible_plaintext(mut self, start: usize, height: u16) -> Self {
+        if start == 0 && self.rows.len() <= usize::from(height) {
+            return self;
+        }
+        self.rows.truncate(start + usize::from(height));
+        self.rows.drain(..start.min(self.rows.len()));
+        let from = self.rows.first().map_or(0, |row| row.source.start);
+        let to = self.rows.last().map_or(from, |row| row.source.end);
+        self.text = self.text[from..to].to_owned();
+        let lines = self
+            .text
+            .split('\n')
+            .map(|line| line.to_owned().into())
+            .collect::<Vec<_>>();
+        self.logical = logical_lines(&lines);
+        for row in &mut self.rows {
+            row.source = row.source.start - from..row.source.end - from;
+            row.line_end = row.line_end.map(|end| end.min(to) - from);
+        }
+        self
     }
 
     /// Reflow the same displayed content revision, retaining styles, links and disclosure label.
@@ -136,6 +162,10 @@ impl TextLayout {
         if let Some(control) = &self.disclosure_control {
             layout =
                 layout.with_disclosure_control_at(control.label.clone(), control.source_offset);
+        }
+        layout.image = self.image.clone();
+        if self.leading_blank_hidden {
+            layout = layout.without_leading_blank_row();
         }
         if self.separated {
             layout.with_leading_separator()
@@ -205,6 +235,22 @@ impl TextLayout {
         self
     }
 
+    /// Hide one leading blank row without changing selectable source offsets.
+    pub(super) fn without_leading_blank_row(mut self) -> Self {
+        if self
+            .rows
+            .first()
+            .is_some_and(|row| line_width(&row.line.line) == 0)
+        {
+            self.rows.remove(/*index*/ 0);
+            self.leading_blank_hidden = true;
+            if let Some(control) = &mut self.disclosure_control {
+                control.row = control.row.saturating_sub(/*rhs*/ 1);
+            }
+        }
+        self
+    }
+
     /// Reserve one presentation-only row before existing spacing and source text.
     pub(super) fn with_leading_spacer(mut self) -> Self {
         if !self.rows.is_empty() {
@@ -270,8 +316,27 @@ impl TextLayout {
         &self.text
     }
 
-    pub(super) fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
+        // Images occupy visual space, but have no searchable or selectable text rows.
+        self.text_row_count()
+            + self
+                .visible_image()
+                .map_or(0, |image| usize::from(image.rows))
+    }
+
+    pub(super) fn text_row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    pub(super) fn visible_image(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::transcript_image::TranscriptImage>> {
+        self.image.as_ref().filter(|image| {
+            image.columns + 2 <= self.width
+                && (image.protocol != crate::pets::ImageProtocol::Sixel
+                    || crate::transcript_image::terminal_cell_size()
+                        == Some((image.cell_width, image.cell_height)))
+        })
     }
 
     pub(super) fn disclosure_row(&self) -> Option<usize> {
@@ -286,7 +351,7 @@ impl TextLayout {
     }
 
     /// Paint visible rows, including inherited styles on empty rows and trailing columns.
-    pub(super) fn render(&self, area: Rect, buf: &mut Buffer, start_row: usize) {
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, start_row: usize) {
         for (screen_row, row) in self.visible_rows(area, start_row) {
             let mut row_area =
                 Rect::new(area.x, area.y + screen_row, area.width, /*height*/ 1);
@@ -314,8 +379,58 @@ impl TextLayout {
         row.source.end
     }
 
+    /// Resolve a keyboard caret to a grapheme start while leaving truly empty rows blank.
+    pub(super) fn cursor_position_at(&self, row: usize, column: u16) -> usize {
+        let offset = self.position_at(row, column);
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end || offset < row.source.end {
+            return offset;
+        }
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next_back()
+            .map_or(row.source.start, |(offset, _)| row.source.start + offset)
+    }
+
+    /// Return the first selectable source grapheme on a display row, excluding synthetic rows.
+    pub(super) fn first_cursor_position(&self, row: usize) -> Option<usize> {
+        let row = self.rows.get(row)?;
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next()
+            .map(|(offset, _)| row.source.start + offset)
+    }
+
+    /// Whether a source grapheme is actually painted on a display row.
+    pub(super) fn is_cursor_position(&self, offset: usize) -> bool {
+        self.rows.iter().any(|row| row.source.contains(&offset))
+    }
+
+    /// Advance one grapheme inside the caret's display row without crossing an empty row.
+    pub(super) fn after_cursor_grapheme(&self, row: usize, offset: usize) -> usize {
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end {
+            return offset;
+        }
+        let offset = self
+            .text
+            .floor_char_boundary(offset.clamp(row.source.start, row.source.end));
+        offset
+            + self.text[offset..row.source.end]
+                .graphemes(/*is_extended*/ true)
+                .next()
+                .map_or(/*default*/ 0, str::len)
+    }
+
     /// Find the display row containing a source position, including omitted wrapping whitespace.
     pub(super) fn row_for_offset(&self, offset: usize) -> usize {
+        if self.visible_image().is_some() && offset >= self.text.len() {
+            return self.row_count().saturating_sub(1);
+        }
         let before_control = if let Some(control_row) = self.disclosure_row() {
             let after_control = &self.rows[control_row + 1..];
             let matching_rows = after_control.partition_point(|row| row.source.start <= offset);
@@ -332,7 +447,12 @@ impl TextLayout {
     }
 
     pub(super) fn column_for_offset(&self, offset: usize) -> u16 {
-        let Some(row) = self.rows.get(self.row_for_offset(offset)) else {
+        self.column_for_offset_on_row(self.row_for_offset(offset), offset)
+    }
+
+    /// Resolve a source position within a specific display row when offsets are shared.
+    pub(super) fn column_for_offset_on_row(&self, row: usize, offset: usize) -> u16 {
+        let Some(row) = self.rows.get(row) else {
             return 0;
         };
         let offset = self
@@ -448,12 +568,14 @@ impl TextLayout {
             }
         }
         Self {
+            image: None,
             logical,
             text,
             rows,
             width,
             separated: false,
             disclosure: false,
+            leading_blank_hidden: false,
             disclosure_control: None,
         }
     }

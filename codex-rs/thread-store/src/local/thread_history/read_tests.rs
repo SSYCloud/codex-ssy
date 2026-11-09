@@ -335,7 +335,7 @@ async fn item_anchors_page_exclusively_while_the_turn_grows() {
 }
 
 #[tokio::test]
-async fn item_anchors_require_creation_order_without_an_update_watermark() {
+async fn item_anchors_require_creation_order_without_an_update_boundary() {
     let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
     insert_item(
         history_db(&store).await,
@@ -345,9 +345,10 @@ async fn item_anchors_require_creation_order_without_an_update_watermark() {
         /*rollout_ordinal*/ 1,
     )
     .await;
-    for (sort_key, after_updated_at_ordinal) in [
-        (ItemSortKey::UpdatedAtOrdinal, None),
-        (ItemSortKey::CreatedAtOrdinal, Some(0)),
+    for (sort_key, after_updated_at_ordinal, before_updated_at_ordinal) in [
+        (ItemSortKey::UpdatedAtOrdinal, None, None),
+        (ItemSortKey::CreatedAtOrdinal, Some(0), None),
+        (ItemSortKey::CreatedAtOrdinal, None, Some(2)),
     ] {
         let params = ListItemsParams {
             position: Some(ListItemsPosition::ItemAnchor {
@@ -355,6 +356,7 @@ async fn item_anchors_require_creation_order_without_an_update_watermark() {
             }),
             sort_key,
             after_updated_at_ordinal,
+            before_updated_at_ordinal,
             ..item_params(
                 thread_id,
                 Some("turn"),
@@ -368,7 +370,7 @@ async fn item_anchors_require_creation_order_without_an_update_watermark() {
             .await
             .expect_err("invalid anchor paging mode");
         assert!(matches!(error, ThreadStoreError::InvalidRequest { message }
-            if message == "item anchors require creation-order paging without an update watermark"));
+            if message == "item anchors require creation-order paging without an update boundary"));
     }
 }
 
@@ -844,6 +846,25 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
             .expect("creation-ordered filtered item page");
         assert_eq!(page.items, expected);
     }
+    for (sort_direction, expected) in [
+        (SortDirection::Asc, vec![item_2.clone(), item_3.clone()]),
+        (SortDirection::Desc, vec![item_3.clone(), item_2.clone()]),
+    ] {
+        let page = store
+            .list_items(ListItemsParams {
+                before_updated_at_ordinal: Some(4),
+                ..item_params(
+                    thread_id,
+                    /*turn_id*/ None,
+                    /*cursor*/ None,
+                    /*page_size*/ 2,
+                    sort_direction,
+                )
+            })
+            .await
+            .expect("creation-ordered before-filtered item page");
+        assert_eq!(page.items, expected);
+    }
 
     let first_page = store
         .list_items(updated_item_params(
@@ -898,7 +919,7 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
         })
         .await
         .expect("descending update-ordered item page");
-    assert_eq!(descending_page.items, vec![item_1, item_3]);
+    assert_eq!(descending_page.items, vec![item_1, item_3.clone()]);
     let descending_next_page = store
         .list_items(ListItemsParams {
             position: descending_page.next_cursor.map(ListItemsPosition::Cursor),
@@ -907,7 +928,43 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
         })
         .await
         .expect("next descending update-ordered item page");
-    assert_eq!(descending_next_page.items, vec![item_2]);
+    assert_eq!(descending_next_page.items, vec![item_2.clone()]);
+
+    let before_descending_page = store
+        .list_items(ListItemsParams {
+            after_updated_at_ordinal: None,
+            before_updated_at_ordinal: Some(4),
+            page_size: 1,
+            sort_direction: SortDirection::Desc,
+            ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
+        })
+        .await
+        .expect("descending before-filtered item page");
+    assert_eq!(before_descending_page.items, vec![item_3.clone()]);
+    let before_descending_next_page = store
+        .list_items(ListItemsParams {
+            after_updated_at_ordinal: None,
+            before_updated_at_ordinal: Some(4),
+            position: before_descending_page
+                .next_cursor
+                .map(ListItemsPosition::Cursor),
+            page_size: 1,
+            sort_direction: SortDirection::Desc,
+            ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
+        })
+        .await
+        .expect("next descending before-filtered item page");
+    assert_eq!(before_descending_next_page.items, vec![item_2]);
+    assert!(before_descending_next_page.next_cursor.is_none());
+
+    let error = store
+        .list_items(ListItemsParams {
+            before_updated_at_ordinal: Some(4),
+            ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
+        })
+        .await
+        .expect_err("after and before update ordinals should be mutually exclusive");
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
 
     let error = store
         .list_items(ListItemsParams {
@@ -929,16 +986,28 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
 async fn list_items_rejects_update_ordinals_outside_sqlite_integer_range() {
     let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
 
-    for sort_key in [ItemSortKey::CreatedAtOrdinal, ItemSortKey::UpdatedAtOrdinal] {
-        let error = store
-            .list_items(ListItemsParams {
-                sort_key,
-                ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ u64::MAX)
-            })
-            .await
-            .expect_err("out-of-range SQLite update ordinal should fail");
+    for (after_updated_at_ordinal, before_updated_at_ordinal) in
+        [(Some(u64::MAX), None), (None, Some(u64::MAX))]
+    {
+        for sort_key in [ItemSortKey::CreatedAtOrdinal, ItemSortKey::UpdatedAtOrdinal] {
+            let error = store
+                .list_items(ListItemsParams {
+                    sort_key,
+                    after_updated_at_ordinal,
+                    before_updated_at_ordinal,
+                    ..item_params(
+                        thread_id,
+                        /*turn_id*/ None,
+                        /*cursor*/ None,
+                        /*page_size*/ 2,
+                        SortDirection::Asc,
+                    )
+                })
+                .await
+                .expect_err("out-of-range SQLite update ordinal should fail");
 
-        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+            assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        }
     }
 }
 
@@ -1193,16 +1262,91 @@ async fn lineage_reads_page_across_parent_and_child_segments() {
         matches!(store.list_items(anchored).await, Err(ThreadStoreError::InvalidRequest { message }) if message == "cursor.itemId does not identify an item in the requested history scope")
     );
 
-    for sort_key in [ItemSortKey::CreatedAtOrdinal, ItemSortKey::UpdatedAtOrdinal] {
-        let error = store
-            .list_items(ListItemsParams {
-                sort_key,
-                ..updated_item_params(child_id, /*after_updated_at_ordinal*/ 0)
-            })
+    let inherited_lookup =
+        item_lookup_params(child_id, "root-1", &["root-agent", "root-user", "missing"]);
+    let inherited_lookup = store
+        .list_items(inherited_lookup)
+        .await
+        .expect("lookup inherited items");
+    assert_eq!(item_ids(&inherited_lookup), vec!["root-user", "root-agent"]);
+
+    let excluded_lookup = item_lookup_params(child_id, "excluded-root", &["excluded-item"]);
+    assert!(
+        store
+            .list_items(excluded_lookup)
             .await
-            .expect_err("incremental replay should reject forked lineages");
-        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
-    }
+            .expect("exclude source item after fork cutoff")
+            .items
+            .is_empty()
+    );
+
+    let mut creation_order_params =
+        updated_item_params(child_id, /*after_updated_at_ordinal*/ 0);
+    creation_order_params.page_size = 10;
+    creation_order_params.sort_key = ItemSortKey::CreatedAtOrdinal;
+    let creation_order_update_filter = store
+        .list_items(creation_order_params)
+        .await
+        .expect("creation-ordered lineage items with update filter");
+    assert_eq!(
+        item_ids(&creation_order_update_filter),
+        vec!["root-user", "root-agent", "root-2-item", "child-item"]
+    );
+
+    let first_updated_page = store
+        .list_items(updated_item_params(
+            child_id, /*after_updated_at_ordinal*/ 0,
+        ))
+        .await
+        .expect("first update-ordered lineage page");
+    assert_eq!(
+        item_ids(&first_updated_page),
+        vec!["root-user", "root-agent"]
+    );
+    let mut second_updated_params =
+        updated_item_params(child_id, /*after_updated_at_ordinal*/ 0);
+    second_updated_params.position = Some(ListItemsPosition::Cursor(
+        first_updated_page
+            .next_cursor
+            .expect("first update-ordered page has a cursor"),
+    ));
+    let second_updated_page = store
+        .list_items(second_updated_params)
+        .await
+        .expect("second update-ordered lineage page");
+    assert_eq!(
+        item_ids(&second_updated_page),
+        vec!["root-2-item", "child-item"]
+    );
+    assert!(second_updated_page.next_cursor.is_none());
+
+    let mut backward_updated_params =
+        updated_item_params(child_id, /*after_updated_at_ordinal*/ 0);
+    backward_updated_params.after_updated_at_ordinal = None;
+    backward_updated_params.before_updated_at_ordinal = Some(9);
+    backward_updated_params.sort_direction = SortDirection::Desc;
+    let first_backward_updated_page = store
+        .list_items(backward_updated_params.clone())
+        .await
+        .expect("first backward update-ordered lineage page");
+    assert_eq!(
+        item_ids(&first_backward_updated_page),
+        vec!["child-item", "root-2-item"]
+    );
+    backward_updated_params.position = Some(ListItemsPosition::Cursor(
+        first_backward_updated_page
+            .next_cursor
+            .expect("first backward update-ordered page has a cursor"),
+    ));
+    let second_backward_updated_page = store
+        .list_items(backward_updated_params)
+        .await
+        .expect("second backward update-ordered lineage page");
+    assert_eq!(
+        item_ids(&second_backward_updated_page),
+        vec!["root-agent", "root-user"]
+    );
+    assert!(second_backward_updated_page.next_cursor.is_none());
 
     let first_occurrences = store
         .search_thread_occurrences(SearchThreadOccurrencesParams {
@@ -1551,7 +1695,7 @@ fn write_rollout_with_end(
     let mut lines = vec![RolloutLine {
         timestamp: "2026-07-16T00:00:00.000Z".to_string(),
         ordinal: Some(initial_ordinal),
-        item: RolloutItem::SessionMeta(SessionMetaLine {
+        item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -1560,7 +1704,7 @@ fn write_rollout_with_end(
                 ..SessionMeta::default()
             },
             git: None,
-        }),
+        })),
     }];
     for offset in 1..next_ordinal {
         let ordinal = initial_ordinal
@@ -1712,6 +1856,7 @@ fn item_params(
     sort_direction: SortDirection,
 ) -> ListItemsParams {
     ListItemsParams {
+        item_ids: None,
         thread_id,
         turn_id: turn_id.map(str::to_owned),
         include_archived: false,
@@ -1720,6 +1865,7 @@ fn item_params(
         sort_direction,
         sort_key: ItemSortKey::CreatedAtOrdinal,
         after_updated_at_ordinal: None,
+        before_updated_at_ordinal: None,
     }
 }
 
@@ -1732,6 +1878,19 @@ fn updated_item_params(thread_id: ThreadId, after_updated_at_ordinal: u64) -> Li
             /*turn_id*/ None,
             /*cursor*/ None,
             /*page_size*/ 2,
+            SortDirection::Asc,
+        )
+    }
+}
+
+fn item_lookup_params(thread_id: ThreadId, turn_id: &str, item_ids: &[&str]) -> ListItemsParams {
+    ListItemsParams {
+        item_ids: Some(item_ids.iter().map(ToString::to_string).collect()),
+        ..item_params(
+            thread_id,
+            Some(turn_id),
+            /*cursor*/ None,
+            item_ids.len(),
             SortDirection::Asc,
         )
     }

@@ -51,7 +51,7 @@ pub(super) async fn lookup(
     name: &str,
     collections: &[SessionCollection],
     source_kind_filters: &[Vec<ThreadSourceKind>],
-    model_provider: Option<&str>,
+    model_providers: Option<Vec<String>>,
 ) -> Result<Option<Thread>> {
     if name.trim().is_empty() {
         return Ok(None);
@@ -64,14 +64,16 @@ pub(super) async fn lookup(
             loop {
                 let response = app_server
                     .thread_list(ThreadListParams {
+                        current_account_only: false,
                         excluded_thread_ids: None,
+                        attached_to_thread_id: None,
                         originators: None,
                         cursor,
                         limit: Some(100),
                         // Activity must not move an unread thread ahead of the cursor.
                         sort_key: Some(ThreadSortKey::CreatedAt),
                         sort_direction: None,
-                        model_providers: model_provider.map(|provider| vec![provider.to_string()]),
+                        model_providers: model_providers.clone(),
                         source_kinds: Some(source_kinds.clone()),
                         archived: Some(matches!(collection, SessionCollection::Archived)),
                         section_id: None,
@@ -119,12 +121,8 @@ pub(super) async fn lookup(
                             else {
                                 return Err(err);
                             };
-                            if source.message == format!("thread not loaded: {thread_id}") {
-                                if app_server.uses_embedded_app_server() {
-                                    continue;
-                                }
-                                thread.clone()
-                            } else if (source.message.starts_with("failed to read thread: thread-store internal error: session metadata ")
+                            if source.message == format!("thread not loaded: {thread_id}")
+                                || (source.message.starts_with("failed to read thread: thread-store internal error: session metadata ")
                                 && source.message.contains(" belongs to thread ")
                                 && source.message.ends_with(&format!(", expected {thread_id}")))
                                 || thread.path.as_ref().is_some_and(|path| {
@@ -135,9 +133,8 @@ pub(super) async fn lookup(
                                 })
                             {
                                 continue;
-                            } else {
-                                return Err(err);
                             }
+                            return Err(err);
                         }
                     };
                     if current.id != thread.id || display_label(&current) != name {

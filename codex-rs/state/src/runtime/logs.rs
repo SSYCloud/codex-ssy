@@ -52,6 +52,8 @@ impl StateRuntime {
     ///
     /// This runs inside the same transaction as the insert so callers never
     /// observe "inserted but not yet pruned" rows.
+    /// The cumulative byte and row limits use the same window frame so SQLite can
+    /// compute both in one pass. The unique id breaks ties in timestamp order.
     async fn prune_logs_after_insert(
         &self,
         entries: &[LogEntry],
@@ -105,6 +107,7 @@ WHERE id IN (
             ) OVER (
                 PARTITION BY thread_id
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
+                ROWS UNBOUNDED PRECEDING
             ) AS cumulative_bytes,
             ROW_NUMBER() OVER (
                 PARTITION BY thread_id
@@ -187,6 +190,7 @@ WHERE id IN (
             ) OVER (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
+                ROWS UNBOUNDED PRECEDING
             ) AS cumulative_bytes,
             ROW_NUMBER() OVER (
                 PARTITION BY process_uuid
@@ -253,6 +257,7 @@ WHERE id IN (
             ) OVER (
                 PARTITION BY process_uuid
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
+                ROWS UNBOUNDED PRECEDING
             ) AS cumulative_bytes,
             ROW_NUMBER() OVER (
                 PARTITION BY process_uuid
@@ -303,6 +308,33 @@ WHERE id IN (
     /// Query feedback logs for a set of threads, capped to the SQLite retention budget.
     pub async fn query_feedback_logs_for_threads(
         &self,
+        thread_ids: &[&str],
+    ) -> anyhow::Result<Vec<u8>> {
+        Self::query_feedback_logs_from_pool(self.logs_pool.as_ref(), thread_ids).await
+    }
+
+    /// Read logs from the previous directory without creating or migrating its database.
+    pub async fn query_legacy_feedback_logs_for_threads(
+        &self,
+        thread_ids: &[&str],
+    ) -> anyhow::Result<Vec<u8>> {
+        let Some(path) = self.sqlite.legacy_logs_db_path() else {
+            return Ok(Vec::new());
+        };
+        if thread_ids.is_empty() || !tokio::fs::try_exists(&path).await? {
+            return Ok(Vec::new());
+        }
+        let pool = self
+            .sqlite
+            .open_read_only_pool(&path, /*busy_timeout*/ None)
+            .await?;
+        let result = Self::query_feedback_logs_from_pool(&pool, thread_ids).await;
+        pool.close().await;
+        result
+    }
+
+    async fn query_feedback_logs_from_pool(
+        pool: &SqlitePool,
         thread_ids: &[&str],
     ) -> anyhow::Result<Vec<u8>> {
         if thread_ids.is_empty() {
@@ -376,7 +408,7 @@ WHERE cumulative_estimated_bytes <=
         builder.push(" ORDER BY ts DESC, ts_nanos DESC, id DESC");
         let rows = builder
             .build_query_as::<FeedbackLogRow>()
-            .fetch_all(self.logs_pool.as_ref())
+            .fetch_all(pool)
             .await?;
 
         let mut lines = Vec::new();

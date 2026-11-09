@@ -114,7 +114,7 @@ impl RequestPluginInstallHandler {
             }
         };
 
-        if turn.session_source.is_non_root_agent() {
+        if turn.root_capabilities_restricted {
             return Err(FunctionCallError::RespondToModel(
                 "request_plugin_install can only be used by the root thread".to_string(),
             ));
@@ -191,7 +191,10 @@ impl RequestPluginInstallHandler {
             let auth = session.services.auth_manager.auth().await;
             let plugins_config = turn.config.plugins_config_input();
             match codex_core_plugins::hydrate_selected_recommended_plugin_install_metadata(
-                &plugins_config,
+                &session
+                    .services
+                    .plugins_manager
+                    .remote_plugin_service_config(&plugins_config),
                 auth.as_ref(),
                 tool,
             )

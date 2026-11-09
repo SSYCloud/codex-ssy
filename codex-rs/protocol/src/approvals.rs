@@ -186,8 +186,20 @@ pub struct NetworkPolicyAmendment {
 }
 
 /// Why this approval needs a fresh Guardian assessment.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    TS,
+    strum_macros::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum GuardianReviewReason {
     Policy,
     FreshRequired,
@@ -263,6 +275,8 @@ pub struct GuardianAssessmentEvent {
 pub enum ExecApprovalKind {
     #[default]
     Command,
+    /// Requires a fresh human decision; automated and reusable approvals are invalid.
+    HumanCommand,
     WriteStdin,
 }
 

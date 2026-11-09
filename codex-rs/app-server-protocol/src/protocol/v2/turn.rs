@@ -9,6 +9,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::AudioReference as CoreAudioReference;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference as CoreImageReference;
@@ -116,6 +117,9 @@ pub enum AdditionalContextKind {
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
+    /// Optional name for untrusted context, used to label its tool output.
+    #[ts(optional = nullable)]
+    pub name: Option<String>,
 }
 
 /// Requested cyber treatment for an OpenAI model turn.
@@ -157,6 +161,9 @@ pub struct TurnToolOutput {
     pub name: String,
     pub namespace: Option<String>,
     pub output: FunctionCallOutputBody,
+    /// Requests retention of this output in the thread's model history.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain: bool,
 }
 
 #[derive(
@@ -195,6 +202,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub tool_output: Option<Box<TurnToolOutput>>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -204,6 +212,11 @@ pub struct TurnStartParams {
     #[experimental("turn/start.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/start.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/start.additionalContext")]
     #[ts(optional = nullable)]
@@ -311,6 +324,7 @@ pub struct TurnSteerParams {
     pub client_user_message_id: Option<String>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -320,6 +334,11 @@ pub struct TurnSteerParams {
     #[experimental("turn/steer.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/steer.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/steer.additionalContext")]
     #[ts(optional = nullable)]
@@ -434,6 +453,21 @@ pub enum ImageReference {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(untagged)]
+#[ts(export_to = "v2/")]
+pub enum AudioReference {
+    Inline {
+        url: String,
+    },
+    File {
+        #[serde(rename = "fileId")]
+        #[ts(rename = "fileId")]
+        file_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -458,7 +492,8 @@ pub enum UserInput {
         path: PathBuf,
     },
     Audio {
-        url: String,
+        #[serde(flatten)]
+        audio: AudioReference,
     },
     LocalAudio {
         path: PathBuf,
@@ -491,7 +526,12 @@ impl UserInput {
                 detail,
             },
             UserInput::LocalImage { path, detail } => CoreUserInput::LocalImage { path, detail },
-            UserInput::Audio { url } => CoreUserInput::Audio { audio_url: url },
+            UserInput::Audio { audio } => CoreUserInput::Audio {
+                audio: match audio {
+                    AudioReference::Inline { url } => CoreAudioReference::Inline { audio_url: url },
+                    AudioReference::File { file_id } => CoreAudioReference::File { file_id },
+                },
+            },
             UserInput::LocalAudio { path } => CoreUserInput::LocalAudio { path },
             UserInput::Skill { name, path } => CoreUserInput::Skill { name, path },
             UserInput::Mention { name, path } => CoreUserInput::Mention { name, path },
@@ -519,7 +559,14 @@ impl From<CoreUserInput> for UserInput {
                 detail,
             },
             CoreUserInput::LocalImage { path, detail } => UserInput::LocalImage { path, detail },
-            CoreUserInput::Audio { audio_url } => UserInput::Audio { url: audio_url },
+            CoreUserInput::Audio { audio } => UserInput::Audio {
+                audio: match audio {
+                    CoreAudioReference::Inline { audio_url } => {
+                        AudioReference::Inline { url: audio_url }
+                    }
+                    CoreAudioReference::File { file_id } => AudioReference::File { file_id },
+                },
+            },
             CoreUserInput::LocalAudio { path } => UserInput::LocalAudio { path },
             CoreUserInput::Skill { name, path } => UserInput::Skill { name, path },
             CoreUserInput::Mention { name, path } => UserInput::Mention { name, path },

@@ -72,6 +72,60 @@ async fn refresh_honors_fresh_managed_denial(scope: RuntimeConfigRefresh) {
 }
 
 #[tokio::test]
+async fn plugin_refresh_resolves_only_the_final_layer_combination() {
+    let (_home, base) = base_config().await;
+    let snapshot = |user: &str, project: &str| {
+        let mut config = base.clone();
+        config.config_layer_stack = codex_config::ConfigLayerStack::new(
+            vec![
+                codex_config::ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: base.codex_home.join(CONFIG_TOML_FILE),
+                        profile: None,
+                    },
+                    toml::from_str(user).unwrap(),
+                ),
+                codex_config::ConfigLayerEntry::new(
+                    ConfigLayerSource::Project {
+                        dot_codex_folder: base.codex_home.join(".codex"),
+                    },
+                    toml::from_str(project).unwrap(),
+                ),
+            ],
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        config.plugins = config
+            .config_layer_stack
+            .effective_config()
+            .try_into::<codex_config::config_toml::ConfigToml>()
+            .unwrap()
+            .plugins;
+        config
+    };
+    let current = snapshot("[plugins._default]\nenabled = false", "");
+    let incoming = snapshot(
+        "[plugins._default]\nenabled = false\n[plugins.\"example@marketplace\"]\nenabled = 'invalid'",
+        "[plugins.\"example@marketplace\"]\nenabled = false",
+    );
+    for (current, incoming, scope) in [
+        (&current, &incoming, RuntimeConfigRefresh::User),
+        (&current, &incoming, RuntimeConfigRefresh::UserFiles),
+        (&incoming, &current, RuntimeConfigRefresh::Mcp),
+    ] {
+        assert!(current.resolve_runtime_refresh(incoming, scope).is_err());
+        assert!(!current.plugins.allows_plugin("example@marketplace"));
+    }
+    let corrected = snapshot("[plugins._default]\nenabled = true", "");
+    let refreshed = current
+        .resolve_runtime_refresh(&corrected, RuntimeConfigRefresh::User)
+        .unwrap();
+    assert_eq!(refreshed.plugins, corrected.plugins);
+    assert!(refreshed.plugins.allows_plugin("example@marketplace"));
+}
+
+#[tokio::test]
 async fn refresh_honors_disabled_enterprise_host_load_result() {
     let (_home, base) = base_config().await;
     let current = layered_config(
@@ -235,4 +289,55 @@ async fn mcp_refresh_preserves_apps_until_new_session() {
         .unwrap();
     assert!(reloaded.features.enabled(Feature::Apps));
     assert!(!next.features.enabled(Feature::Apps));
+}
+
+/// Explicit plugin updates replace only their session override, retaining other thread settings.
+#[tokio::test]
+async fn plugin_override_refresh_preserves_session_and_restores_inheritance() {
+    let (_home, base) = base_config().await;
+    let mut current = layered_config(
+        &base,
+        "[plugins.browser]\nenabled = false",
+        "",
+        "",
+        "[apps.calendar]\nenabled = false\n[plugins.browser]\nenabled = true",
+    )
+    .await;
+    let incoming = layered_config(
+        &base,
+        "[plugins.browser]\nenabled = false",
+        "",
+        "",
+        "[apps.calendar]\nenabled = true",
+    )
+    .await;
+    let original_apps = current.config_layer_stack.effective_config()["apps"].clone();
+    let layer_count = current.config_layer_stack.all_layers_low_to_high().count();
+    let unchanged = current
+        .resolve_runtime_refresh(&incoming, RuntimeConfigRefresh::Mcp)
+        .unwrap();
+    assert_eq!(unchanged.plugins, current.plugins);
+    for (override_text, expected) in [
+        ("[browser]\nenabled = false", false),
+        ("[browser]\nenabled = true", true),
+        ("", false),
+    ] {
+        let mut incoming = incoming.clone();
+        incoming.config_layer_stack = incoming
+            .config_layer_stack
+            .with_session_plugins(toml::from_str(override_text).unwrap())
+            .unwrap();
+        current = current
+            .resolve_runtime_refresh(&incoming, RuntimeConfigRefresh::Mcp)
+            .unwrap();
+        assert_eq!(current.plugins.plugins["browser"].enabled, Some(expected));
+        assert_eq!(
+            current.config_layer_stack.effective_config()["apps"],
+            original_apps
+        );
+        assert_eq!(
+            current.config_layer_stack.all_layers_low_to_high().count(),
+            layer_count
+        );
+    }
 }

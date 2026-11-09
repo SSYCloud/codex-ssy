@@ -4,9 +4,78 @@
 //! a timeout or disconnect can leave Resume admitted. Attach delivers live events only;
 //! dropping its stream detaches without interrupting the thread or answering approvals.
 
+mod activation;
+mod activation_wire;
+mod discovery;
+mod history;
+mod history_wire;
+mod item_wire;
+mod items;
+mod prewarm;
+mod transcript;
+mod transcript_wire;
+mod turns;
+mod turns_wire;
 mod types;
 mod wire;
 
+pub use activation::ActivePermissionProfile;
+pub use activation::ApprovalPolicy;
+pub use activation::ApprovalsReviewer;
+pub use activation::CollaborationMode;
+pub use activation::CollaborationSettings;
+pub use activation::GitInfo;
+pub use activation::NetworkAccess;
+pub use activation::SandboxPolicy;
+pub use activation::SessionSource;
+pub use activation::SubAgentSource;
+pub use activation::ThreadActivation;
+pub use activation::ThreadActiveFlag;
+pub use activation::ThreadEnvironment;
+pub use activation::ThreadHistoryMode;
+pub use activation::ThreadSnapshot;
+pub use activation::ThreadStatus;
+pub use discovery::ThreadListQuery;
+pub use discovery::ThreadPage;
+pub use discovery::ThreadReadState;
+pub use discovery::ThreadSortDirection;
+pub use discovery::ThreadSortKey;
+pub use discovery::ThreadUnreadPosition;
+pub use history::HistoryAccess;
+pub use history::HistoryItem;
+pub use history::HistoryOrder;
+pub use history::HistoryPage;
+pub use history::HistoryQuery;
+pub use history::HistoryTurn;
+pub use history::ListItemsRequest;
+pub use history::ListTurnsRequest;
+pub use items::AgentQuestion;
+pub use items::CommandAction;
+pub use items::CommandExecutionSource;
+pub use items::CommandSummary;
+pub use items::ItemLifecycle;
+pub use items::ItemStatus;
+pub use items::ItemSummary;
+pub use prewarm::ProjectEnvironment;
+pub use transcript::FileUpdate;
+pub use transcript::ItemDelta;
+pub use transcript::PatchKind;
+pub use transcript::PatchUpdate;
+pub use transcript::TranscriptEvent;
+pub use transcript::TranscriptUpdate;
+pub use transcript::TurnFailure;
+pub use transcript::TurnStatus;
+pub use transcript::TurnSummary;
+pub use turns::AddUserMessageRequest;
+pub use turns::Admission;
+pub use turns::AdmissionOutcome;
+pub use turns::ImageDetail;
+pub use turns::ImageReference;
+pub use turns::InterruptTurnRequest;
+pub use turns::MutationError;
+pub use turns::SubmissionMode;
+pub use turns::UserMessageInput;
+pub use turns::UserMessageTextElement;
 pub use types::Credentials;
 pub use types::Error;
 pub use types::Event;
@@ -41,6 +110,29 @@ pub struct Client {
 }
 
 impl Client {
+    async fn raw_unary<T: prost::Message + Send + 'static>(
+        &self,
+        value: T,
+        path: &'static str,
+    ) -> Result<bytes::Bytes, Error> {
+        let mut grpc = self.grpc.clone();
+        let mut request = tonic::Request::new(value);
+        *request.metadata_mut() =
+            tonic::metadata::MetadataMap::from_headers(self.credentials.headers.clone());
+        let response = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            grpc.unary(
+                request,
+                http::uri::PathAndQuery::from_static(path),
+                wire::RawResponseCodec::<T>(std::marker::PhantomData),
+            ),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::from)?;
+        Ok(response.into_inner())
+    }
+
     pub fn new(
         factory: &HttpClientFactory,
         endpoint: &str,
@@ -160,10 +252,16 @@ impl Client {
         .map_err(|_| Error::Timeout)?
         .map_err(Error::from)?;
         let mut stream = response.into_inner();
+        let thread_id = thread_id.to_owned();
         Ok(async_stream::try_stream! {
             while let Some(message) = stream.message().await.map_err(Error::from)? {
                 yield match message.event.ok_or(Error::InvalidResponse)? {
-                    wire::Payload::Notification(bytes) => Event::Notification(bytes),
+                    wire::Payload::Notification(bytes) => {
+                        match TranscriptEvent::decode(&thread_id, &bytes)? {
+                            Some(event) => Event::Transcript(Box::new(event)),
+                            None => Event::Notification(bytes),
+                        }
+                    },
                     wire::Payload::ServerRequest(bytes) => Event::ServerRequest(bytes),
                 };
             }

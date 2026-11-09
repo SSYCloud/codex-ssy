@@ -12,6 +12,7 @@ use pretty_assertions::assert_eq;
 
 use super::super::super::chat_composer_history::HistoryEntry;
 use super::super::ChatComposer;
+use super::super::ComposerDraftSnapshot;
 use super::super::InputResult;
 use super::super::LARGE_PASTE_CHAR_THRESHOLD;
 use super::super::PasteBurst;
@@ -590,7 +591,13 @@ fn undo_and_redo_restore_deleted_image_attachment() {
     ctrl_r(&mut composer);
     escape(&mut composer);
     let _ = composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
-    assert_eq!(composer.draft_snapshot(), before);
+    assert_eq!(
+        composer.draft_snapshot(),
+        ComposerDraftSnapshot {
+            vim_normal_mode: false,
+            ..before.clone()
+        }
+    );
     escape(&mut composer);
     composer.draft.textarea.set_cursor("alpha ".len());
     keys(&mut composer, "x");
@@ -601,6 +608,25 @@ fn undo_and_redo_restore_deleted_image_attachment() {
     ctrl_r(&mut composer);
     assert_eq!(composer.current_text(), "alpha ");
     assert!(composer.local_image_paths().is_empty());
+}
+
+#[test]
+fn vim_replace_yank_preserves_existing_image_and_recovers_atomically() {
+    let mut composer = vim_composer("");
+    keys(&mut composer, "i");
+    composer.attach_image(PathBuf::from("killed.png"));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    composer.attach_image(PathBuf::from("existing.png"));
+    keys(&mut composer, "abcdefghij");
+    let before = (composer.current_text(), composer.local_image_paths());
+    escape(&mut composer);
+    keys(&mut composer, "0R");
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    composer.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+    assert_eq!(
+        (composer.current_text(), composer.local_image_paths()),
+        before
+    );
 }
 
 #[test]
@@ -681,6 +707,17 @@ fn vim_replace_backspace_restores_characters_in_new_slash_element() {
                 );
             }
         },
+    );
+}
+
+#[test]
+fn vim_replace_delete_backward_restores_characters_hidden_by_prompt_prefixes() {
+    let mut composer = vim_composer("ébc");
+    keys(&mut composer, "R!");
+    let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        (composer.current_text(), composer.current_cursor()),
+        ("ébc".to_owned(), 0)
     );
 }
 
@@ -772,4 +809,67 @@ fn external_editor_import_preserves_replace_backspace_recovery() {
         (textarea.text(), textarea.vim_mode_label()),
         ("bc", Some("Replace"))
     );
+}
+
+#[test]
+fn repeated_deletion_leaves_exposed_bang_literal() {
+    let mut composer = vim_composer("Yes! I agree.");
+    keys(&mut composer, "x..");
+    let literal = composer.snapshot_draft();
+    keys(&mut composer, "u");
+    ctrl_r(&mut composer);
+    assert_eq!(composer.snapshot_draft(), literal);
+    assert_eq!(composer.current_text(), "! I agree.");
+    assert!(!composer.draft.is_bash_mode);
+    keys(&mut composer, "x");
+    assert_eq!(composer.current_text(), " I agree.");
+}
+
+#[test]
+fn cancelled_history_search_preserves_literal_bang_draft() {
+    let mut composer = vim_composer("x!echo hello");
+    composer.set_vim_enabled(/*enabled*/ false);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    let literal = composer.snapshot_draft();
+    ctrl_r(&mut composer);
+    escape(&mut composer);
+    assert_eq!(composer.snapshot_draft(), literal);
+    assert_eq!(
+        composer
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .0,
+        InputResult::Queued {
+            text: "!echo hello".to_owned(),
+            text_elements: Vec::new(),
+            action: super::super::QueuedInputAction::Literal,
+            pending_pastes: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn editor_actions_insert_shell_prefixes() {
+    let mut composer = vim_composer("x!echo hi");
+    composer.set_vim_enabled(/*enabled*/ false);
+    for (code, modifiers) in [
+        (KeyCode::Right, KeyModifiers::NONE),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL),
+        (KeyCode::Backspace, KeyModifiers::NONE),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL),
+    ] {
+        composer.handle_key_event(KeyEvent::new(code, modifiers));
+    }
+    assert_eq!(
+        (composer.current_text(), composer.draft.is_bash_mode),
+        ("!echo hi".to_owned(), true)
+    );
+
+    for (commands, expected) in [("r!", "!xecho hi"), ("lr!0.", "!!echo hi")] {
+        let mut composer = vim_composer("xxecho hi");
+        keys(&mut composer, commands);
+        assert_eq!(
+            (composer.current_text(), composer.draft.is_bash_mode),
+            (expected.to_owned(), true)
+        );
+    }
 }

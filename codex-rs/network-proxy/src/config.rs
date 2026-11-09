@@ -1,3 +1,7 @@
+mod standalone;
+
+pub use standalone::StaticNetworkProxyConfig;
+
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -146,6 +150,10 @@ pub struct NetworkProxyConfig {
     pub mode: NetworkMode,
     #[serde(default)]
     pub domains: Option<NetworkDomainPermissions>,
+    /// Managed host selectors routed through the existing approval flow before ordinary allows.
+    /// Direct proxy configuration cannot change these requirements-only selectors.
+    #[serde(skip)]
+    pub review_domains: Vec<String>,
     #[serde(default)]
     pub unix_sockets: Option<NetworkUnixSocketPermissions>,
     /// Omission is resolved for the selected sandbox; ordinary proxy execution defaults to false.
@@ -187,6 +195,7 @@ impl Default for NetworkProxyConfig {
             dangerously_allow_all_unix_sockets: None,
             mode: NetworkMode::default(),
             domains: None,
+            review_domains: Vec::new(),
             unix_sockets: None,
             allow_local_binding: None,
             mitm: false,
@@ -312,6 +321,30 @@ impl NetworkProxyConfig {
 
     pub fn set_denied_domains(&mut self, denied_domains: Vec<String>) {
         self.set_domain_entries(denied_domains, NetworkDomainPermission::Deny);
+    }
+
+    /// Applies valid saved denials even when a malformed batch invalidates its grants.
+    pub fn apply_saved_domain_rules(&mut self, allowed: Vec<String>, denied: &[String]) {
+        let valid_denials = crate::policy::compile_denylist(denied).is_ok();
+        if valid_denials && crate::policy::compile_allowlist(&allowed).is_ok() {
+            for host in allowed {
+                self.upsert_domain_permission(host, NetworkDomainPermission::Allow, normalize_host);
+            }
+        }
+        for host in denied {
+            if !valid_denials
+                && crate::policy::compile_denylist(std::slice::from_ref(host)).is_err()
+            {
+                continue;
+            }
+            // Managed constraints compare raw selectors case-insensitively. Preserve other aliases;
+            // the native and MCP domain matchers give this denial precedence over all of them.
+            self.upsert_domain_permission(
+                host.clone(),
+                NetworkDomainPermission::Deny,
+                str::to_ascii_lowercase,
+            );
+        }
     }
 
     pub fn upsert_domain_permission(
@@ -727,6 +760,7 @@ mod tests {
                 dangerously_allow_all_unix_sockets: None,
                 mode: NetworkMode::Full,
                 domains: None,
+                review_domains: Vec::new(),
                 unix_sockets: None,
                 allow_local_binding: None,
                 mitm: false,

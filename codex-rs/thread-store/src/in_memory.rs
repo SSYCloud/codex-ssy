@@ -64,6 +64,7 @@ mod tests {
     use crate::StoredTurnItemsView;
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
+    use codex_protocol::ContextWindowId;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::protocol::SessionSource;
 
@@ -128,6 +129,7 @@ mod tests {
 
         let items_err = store
             .list_items(ListItemsParams {
+                item_ids: None,
                 thread_id,
                 turn_id: None,
                 include_archived: true,
@@ -136,6 +138,7 @@ mod tests {
                 sort_direction: SortDirection::Asc,
                 sort_key: ItemSortKey::CreatedAtOrdinal,
                 after_updated_at_ordinal: None,
+                before_updated_at_ordinal: None,
             })
             .await
             .expect_err("default list_items should be unsupported");
@@ -165,6 +168,7 @@ mod tests {
         ] {
             store
                 .create_thread(CreateThreadParams {
+                    attached_thread: false,
                     creator_user_id: None,
                     creator_account_id: None,
                     session_id: thread_id.into(),
@@ -182,7 +186,7 @@ mod tests {
                     history_mode: ThreadHistoryMode::Legacy,
                     history_base: None,
                     subagent_history_start_ordinal: None,
-                    initial_window_id: uuid::Uuid::now_v7().to_string(),
+                    initial_window_id: ContextWindowId::new_uuid_v7().to_string(),
                     runtime_workspace_roots: None,
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
@@ -441,6 +445,7 @@ mod tests {
         history_mode: ThreadHistoryMode,
     ) -> CreateThreadParams {
         CreateThreadParams {
+            attached_thread: false,
             creator_user_id: None,
             creator_account_id: None,
             session_id: thread_id.into(),
@@ -458,7 +463,7 @@ mod tests {
             history_mode,
             history_base: None,
             subagent_history_start_ordinal: None,
-            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            initial_window_id: ContextWindowId::new_uuid_v7().to_string(),
             runtime_workspace_roots: None,
             metadata: thread_metadata(),
         }
@@ -582,6 +587,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
         let session_meta = SessionMeta {
+            attached_thread: params.attached_thread,
             session_id: params.session_id,
             id: params.thread_id,
             forked_from_id: params.forked_from_id,
@@ -616,10 +622,10 @@ impl InMemoryThreadStore {
             .histories
             .entry(params.thread_id)
             .or_default()
-            .push(RolloutItem::SessionMeta(SessionMetaLine {
+            .push(RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: session_meta,
                 git: None,
-            }));
+            })));
         state.created_threads.insert(params.thread_id, params);
         Ok(())
     }
@@ -1001,6 +1007,11 @@ impl ThreadStore for InMemoryThreadStore {
                     page.items
                         .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
                 }
+                Some(ThreadRelationFilter::AttachedThreadsOf(_)) => {
+                    return Err(ThreadStoreError::Unsupported {
+                        operation: "attached threads",
+                    });
+                }
                 Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
                     let mut subtree = HashSet::from([ancestor_thread_id]);
                     loop {
@@ -1106,6 +1117,14 @@ fn stored_thread_from_state(
         });
 
     Ok(StoredThread {
+        creator_user_id: created
+            .creator_user_id
+            .clone()
+            .or_else(|| metadata.and_then(|metadata| metadata.creator_user_id.clone())),
+        creator_account_id: created
+            .creator_account_id
+            .clone()
+            .or_else(|| metadata.and_then(|metadata| metadata.creator_account_id.clone())),
         originator: (!created.originator.is_empty()).then(|| created.originator.clone()),
         thread_id,
         extra_config: created.extra_config.clone(),

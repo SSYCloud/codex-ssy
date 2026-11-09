@@ -4,10 +4,14 @@ common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
 common --xcode_version_config=//:disable_xcode
 
 common --disk_cache=~/.cache/bazel-disk-cache
+common --experimental_disk_cache_gc_max_age=7d
 common --repo_contents_cache=~/.cache/bazel-repo-contents-cache
+common --repo_contents_cache_gc_max_age=7d
 common --repository_cache=~/.cache/bazel-repo-cache
 common --remote_cache_compression
 startup --experimental_remote_repo_contents_cache
+# rules_python 2.x requires symlink support for Windows Python launchers.
+startup --windows_enable_symlinks
 
 common --experimental_platform_in_output_dir
 
@@ -43,6 +47,8 @@ common:macos --strategy=CcConfigureMakeRule=remote,sandboxed,local
 common:windows --test_env=SYSTEMROOT
 common:windows --test_env=COMSPEC
 common:windows --test_env=WINDIR
+common:windows --test_env=SystemDrive
+common:windows --test_env=LOCALAPPDATA
 # Rust's libtest harness runs test bodies on std-spawned threads. The default
 # 2 MiB stack can be too small for large async test futures on Windows CI; see
 # https://github.com/openai/codex/pull/19067 for the motivating failure.
@@ -105,6 +111,8 @@ common:remote --jobs=800
 common:ci --remote_download_minimal
 common:ci --keep_going
 common:ci --verbose_failures
+# A failed snapshot assertion should print its diff without leaving a .snap.new after a passing retry.
+test:ci --test_env=INSTA_UPDATE=no
 common:ci --build_metadata=REPO_URL=https://github.com/openai/codex.git
 common:ci --build_metadata=ROLE=CI
 common:ci --build_metadata=VISIBILITY=PUBLIC
@@ -214,28 +222,12 @@ common:ci-v8 --config=ci
 common:ci-v8 --build_metadata=TAG_workflow=v8
 common:ci-v8 --build_metadata=TAG_os=linux
 
-# Source-built Bazel V8 artifacts use the in-process sandbox by default. This
-# does not affect Cargo's default prebuilt rusty_v8 path.
-common --@v8//:v8_enable_pointer_compression=True
-common --@v8//:v8_enable_sandbox=True
-
-# Keep currently published rusty_v8 release artifacts non-sandboxed until the
-# artifact migration ships matching Rust feature selection for Cargo consumers.
-common:v8-release-compat --@v8//:v8_enable_pointer_compression=False
-common:v8-release-compat --@v8//:v8_enable_sandbox=False
-common:v8-target-x64 --@v8//bazel/config:v8_target_cpu=x64
-common:v8-target-arm64 --@v8//bazel/config:v8_target_cpu=arm64
-
-# Match rusty_v8's upstream GN release contract for published artifacts: every
-# target object uses Chromium's custom libc++ headers and the archive folds in
-# the matching runtime objects.
-common:rusty-v8-upstream-libcxx --@v8//:v8_use_rusty_v8_custom_libcxx=True
-
-# Native Windows archive builds inherit the runner's MSVC SDK environment.
+# Native Windows MSVC builds inherit the runner's MSVC SDK environment.
 # Client environment capture and repository discovery happen before target
 # transitions, so these runner settings cannot live in runtime_package.bzl.
-# The archive target selects its own MSVC host platform and native toolchains.
+# Hermetic LLVM targets the GNU ABI on Windows even on an MSVC platform.
 build:ci-windows-msvc --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
+build:ci-windows-msvc --extra_toolchains=@local_config_cc//:cc-toolchain-x64_windows,@local_config_cc//:cc-toolchain-arm64_windows
 build:ci-windows-msvc --action_env=PATH
 build:ci-windows-msvc --host_action_env=PATH
 build:ci-windows-msvc --action_env=INCLUDE

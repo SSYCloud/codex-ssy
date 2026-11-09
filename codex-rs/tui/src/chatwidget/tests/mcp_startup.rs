@@ -269,9 +269,13 @@ async fn inline_review_submits_during_mcp_startup() {
 }
 
 #[tokio::test]
-async fn review_during_mcp_startup_preserves_draft_when_foreground_work_is_pending() {
+async fn review_and_fork_during_mcp_startup_preserve_drafts_when_foreground_work_is_pending() {
     for activity in ["turn", "review", "pending", "queued", "images"] {
-        for draft in ["/review", "/review check regressions"] {
+        for draft in ["/review", "/review changes", "/fork", "/fork named"] {
+            let command = draft.split_whitespace().next().unwrap();
+            if activity == "queued" && command == "/fork" {
+                continue;
+            }
             let (mut chat, mut rx, mut op_rx) =
                 make_chatwidget_manual(/*model_override*/ None).await;
             chat.set_mcp_startup_expected_servers(["slow".to_string()]);
@@ -309,7 +313,9 @@ async fn review_during_mcp_startup_preserves_draft_when_foreground_work_is_pendi
                 .collect::<Vec<_>>();
             assert_eq!(
                 errors,
-                vec!["■ '/review' is disabled while a task is in progress.\n".to_string()]
+                vec![format!(
+                    "■ '{command}' is disabled while a task is in progress.\n"
+                )]
             );
             assert!(
                 !std::iter::from_fn(|| op_rx.try_recv().ok())
@@ -340,7 +346,7 @@ async fn pending_mcp_startup_does_not_block_queued_follow_up() {
         }
     ]);
 
-    chat.finish_mcp_startup(Vec::new(), Vec::new());
+    chat.finish_mcp_startup();
 
     assert!(chat.input_queue.user_turn_pending_start);
 }
@@ -429,6 +435,17 @@ async fn pending_mcp_startup_does_not_unblock_external_review() {
     notify_mcp_status(&mut chat, "slow", McpServerStartupState::Starting);
     chat.thread_id = Some(ThreadId::new());
 
+    chat.set_local_worktree_operations(/*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text("/fork".into(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::ForkCurrentSession { name: None }))
+    );
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+
     handle_entered_review_mode(&mut chat, "current changes");
     assert!(chat.bottom_pane.status_indicator_visible());
     chat.queue_user_message("queued follow-up".into());
@@ -440,9 +457,12 @@ async fn pending_mcp_startup_does_not_unblock_external_review() {
 
     while rx.try_recv().is_ok() {}
     chat.dispatch_command(crate::slash_command::SlashCommand::Fork);
-    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    insta::assert_snapshot!(
+        lines_to_single_string(&drain_insert_history(&mut rx).concat()),
+        @"■ '/fork' is disabled while a task is in progress."
+    );
 
-    chat.finish_mcp_startup(Vec::new(), Vec::new());
+    chat.finish_mcp_startup();
     assert!(chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_indicator_visible());
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
@@ -469,7 +489,7 @@ async fn pending_mcp_startup_does_not_unblock_foreground_shell() {
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     assert_no_submit_op(&mut op_rx);
 
-    chat.finish_mcp_startup(Vec::new(), Vec::new());
+    chat.finish_mcp_startup();
     assert!(chat.bottom_pane.is_task_running());
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     assert_no_submit_op(&mut op_rx);
@@ -789,6 +809,20 @@ async fn app_server_mcp_startup_reports_failure_after_lag() {
 }
 
 #[tokio::test]
+async fn reported_mcp_startup_rechecks_an_identical_failure_after_lag() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.track_reported_mcp_startup_servers();
+    notify_mcp_status_error(&mut chat, "alpha", "handshake failed");
+    let first = drain_insert_history(&mut rx);
+    assert!(!first.is_empty());
+
+    chat.finish_mcp_startup_after_lag();
+    notify_mcp_status_error(&mut chat, "alpha", "handshake failed");
+    assert_eq!(drain_insert_history(&mut rx), first);
+    assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
 async fn app_server_mcp_startup_reports_cancellation_after_lag() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
@@ -968,7 +1002,7 @@ async fn app_server_mcp_startup_next_round_with_empty_expected_servers_reactivat
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
     chat.set_mcp_startup_expected_servers(std::iter::empty::<String>());
-    chat.finish_mcp_startup(Vec::new(), Vec::new());
+    chat.finish_mcp_startup();
 
     notify_mcp_status(&mut chat, "runtime", McpServerStartupState::Starting);
     assert!(drain_insert_history(&mut rx).is_empty());

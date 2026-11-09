@@ -29,8 +29,6 @@ use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PrewarmInput {
@@ -286,6 +284,7 @@ impl Session {
         ));
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn consume_startup_prewarm_for_regular_turn(
         &self,
         cancellation_token: &CancellationToken,
@@ -341,12 +340,15 @@ async fn schedule_startup_prewarm_inner(
     let preconnect_model_info = Arc::clone(startup_turn_context.model_info());
     // Spawned subagents inherit the root's selection, with the same feature and model filtering
     // that capture applies to the actual request.
-    let preconnect_service_tier = if matches!(
-        startup_turn_context.session_source,
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-    ) {
+    let inherits_root_service_tier =
+        session.inherits_root_service_tier(&startup_turn_context.session_source);
+    let preconnect_service_tier = if inherits_root_service_tier {
         crate::session::get_service_tier(
-            session.services.agent_control.service_tier(),
+            crate::agent::host::service_tier(
+                &session,
+                startup_turn_context.initial_settings.service_tier.clone(),
+            )
+            .await,
             &session.features(),
             &preconnect_model_info,
         )
@@ -403,7 +405,11 @@ async fn schedule_startup_prewarm_inner(
             let mut history = session
                 .clone_history()
                 .await
-                .for_prompt(&step_context.settings.model_info.input_modalities);
+                .for_prompt(
+                    &step_context.settings.model_info.input_modalities,
+                    session.services.image_store.as_ref(),
+                )
+                .await;
             session
                 .services
                 .executed_tool_calls

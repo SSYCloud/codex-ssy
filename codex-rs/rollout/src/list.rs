@@ -2,6 +2,7 @@
 
 use codex_utils_path as path_utils;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -121,6 +122,7 @@ pub type ConversationsPage = ThreadsPage;
 struct HeadTailSummary {
     originator: Option<String>,
     saw_session_meta: bool,
+    attached_to_parent: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
     preview: Option<String>,
@@ -179,10 +181,6 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub(crate) fn new(ts: OffsetDateTime) -> Self {
-        Self { ts, id: None }
-    }
-
     pub(crate) fn with_thread_id(ts: OffsetDateTime, id: ThreadId) -> Self {
         Self { ts, id: Some(id) }
     }
@@ -196,12 +194,11 @@ impl Cursor {
     }
 }
 
-/// Keeps track of where a paginated listing left off. As the file scan goes newest -> oldest,
-/// it ignores everything until it passes the last seen timestamp from the previous page, then
-/// starts returning results after that. This makes paging stable even if new files show up during
-/// pagination.
+/// Resume the descending file scan after the previous row. A legacy cursor
+/// without a thread ID skips every file at its timestamp.
 struct AnchorState {
     ts: OffsetDateTime,
+    id: Option<Uuid>,
     passed: bool,
 }
 
@@ -210,20 +207,24 @@ impl AnchorState {
         match anchor {
             Some(cursor) => Self {
                 ts: cursor.ts,
+                id: cursor
+                    .id
+                    .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
                 passed: false,
             },
             None => Self {
                 ts: OffsetDateTime::UNIX_EPOCH,
+                id: None,
                 passed: true,
             },
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool {
+    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
         if self.passed {
             return false;
         }
-        if ts < self.ts {
+        if ts < self.ts || (ts == self.ts && self.id.is_some_and(|anchor| id < anchor)) {
             self.passed = true;
             false
         } else {
@@ -289,6 +290,7 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
             self.cwd_filters,
             updated_at,
             PreviewFilter::RequirePreview,
+            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -526,7 +528,9 @@ async fn traverse_directories_for_paths_created(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::CreatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::CreatedAt))
     } else {
         None
     };
@@ -575,7 +579,7 @@ async fn traverse_directories_for_paths_updated(
             break;
         }
 
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
+        let updated_at_fallback = format_rfc3339(ts);
         if let Some(item) = build_thread_item(
             candidate.path,
             allowed_sources,
@@ -583,6 +587,7 @@ async fn traverse_directories_for_paths_updated(
             cwd_filters,
             updated_at_fallback,
             PreviewFilter::RequirePreview,
+            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -596,7 +601,9 @@ async fn traverse_directories_for_paths_updated(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::UpdatedAt))
     } else {
         None
     };
@@ -641,6 +648,7 @@ async fn traverse_flat_paths_created(
             cwd_filters,
             updated_at,
             PreviewFilter::IncludeEmpty,
+            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -654,7 +662,9 @@ async fn traverse_flat_paths_created(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::CreatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::CreatedAt))
     } else {
         None
     };
@@ -695,7 +705,7 @@ async fn traverse_flat_paths_updated(
             break;
         }
 
-        let updated_at_fallback = candidate.updated_at.and_then(format_rfc3339);
+        let updated_at_fallback = format_rfc3339(ts);
         if let Some(item) = build_thread_item(
             candidate.path,
             allowed_sources,
@@ -703,6 +713,7 @@ async fn traverse_flat_paths_updated(
             cwd_filters,
             updated_at_fallback,
             PreviewFilter::IncludeEmpty,
+            /*include_attached_threads*/ false,
         )
         .await
         {
@@ -716,7 +727,9 @@ async fn traverse_flat_paths_updated(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items, ThreadSortKey::UpdatedAt)
+        items
+            .last()
+            .and_then(|item| item.filesystem_cursor(ThreadSortKey::UpdatedAt))
     } else {
         None
     };
@@ -748,27 +761,38 @@ pub fn parse_cursor(token: &str) -> Option<Cursor> {
     Some(Cursor { ts, id })
 }
 
-fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cursor> {
-    let last = items.last()?;
-    let file_name = last.path.file_name()?.to_string_lossy();
-    let (created_ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
-    let ts = match sort_key {
-        ThreadSortKey::CreatedAt => created_ts,
-        ThreadSortKey::UpdatedAt => {
-            let updated_at = last.updated_at.as_deref()?;
-            OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
-        }
-        ThreadSortKey::RecencyAt => {
-            let recency_at = last.recency_at.as_deref().or(last.updated_at.as_deref())?;
-            OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
-        }
-    };
-    match sort_key {
-        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
-            ts,
-            ThreadId::from_string(&id.to_string()).ok()?,
-        )),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
+impl ThreadItem {
+    pub(crate) fn filesystem_sort_key(
+        &self,
+        sort_key: ThreadSortKey,
+    ) -> Option<(OffsetDateTime, Uuid)> {
+        let (created_at, id) =
+            parse_timestamp_uuid_from_filename(self.path.file_name()?.to_str()?)?;
+        let timestamp = match sort_key {
+            ThreadSortKey::CreatedAt => created_at,
+            ThreadSortKey::UpdatedAt => {
+                let updated_at = self.updated_at.as_deref().or(self.created_at.as_deref())?;
+                OffsetDateTime::parse(updated_at, &Rfc3339).ok()?
+            }
+            ThreadSortKey::RecencyAt => {
+                let recency_at = self
+                    .recency_at
+                    .as_deref()
+                    .or(self.updated_at.as_deref())
+                    .or(self.created_at.as_deref())?;
+                OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
+            }
+        };
+        Some((timestamp, id))
+    }
+
+    /// Cursor for this row in a filesystem listing, where creation order uses the rollout filename.
+    pub fn filesystem_cursor(&self, sort_key: ThreadSortKey) -> Option<Cursor> {
+        let (timestamp, id) = self.filesystem_sort_key(sort_key)?;
+        Some(Cursor::with_thread_id(
+            timestamp,
+            ThreadId::from_u128(id.as_u128()),
+        ))
     }
 }
 
@@ -784,12 +808,16 @@ async fn build_thread_item(
     cwd_filters: Option<&[PathBuf]>,
     updated_at: Option<String>,
     preview_filter: PreviewFilter,
+    include_attached_threads: bool,
 ) -> Option<ThreadItem> {
     // Read head and detect preview-bearing events; goal previews can appear before
     // the first normal user message.
     let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
         .await
         .unwrap_or_default();
+    if summary.attached_to_parent && !include_attached_threads {
+        return None;
+    }
     if !allowed_sources.is_empty()
         && !summary
             .source
@@ -881,6 +909,7 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
         /*cwd_filters*/ None,
         /*updated_at*/ None,
         PreviewFilter::RequirePreview,
+        /*include_attached_threads*/ true,
     )
     .await
 }
@@ -1003,6 +1032,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.originator = (!session_meta_line.meta.originator.is_empty())
                         .then(|| session_meta_line.meta.originator.clone());
                     summary.source = Some(session_meta_line.meta.source.clone());
+                    summary.attached_to_parent = session_meta_line.meta.attached_thread;
                     summary.history_mode = session_meta_line.meta.history_mode;
                     summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
                     summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
@@ -1047,6 +1077,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
             RolloutItem::RetainedContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::SecurityRiskScore(_) => {
                 // Not included in `head`; skip.
             }
@@ -1126,6 +1157,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::RetainedContext(_)
+                | RolloutItem::DynamicToolsUpdated { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {}
             }
@@ -1203,7 +1235,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             continue;
         };
         match rollout_line.item {
-            RolloutItem::SessionMeta(session_meta_line) => return Ok(session_meta_line),
+            RolloutItem::SessionMeta(session_meta_line) => return Ok(*session_meta_line),
             RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
                 return Err(io::Error::other(MetadataReadError {
                     reason: "response_before_metadata",
@@ -1220,6 +1252,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }
@@ -1417,31 +1450,35 @@ async fn find_thread_path_by_id_from_filenames(
         return Ok(None);
     };
     let mut newest = None;
-    visit_rollout_filenames::<()>(root, |file_name, path| {
-        if file_name.thread_id() != target {
-            return ControlFlow::Continue(());
-        }
-        let rollout_id = Uuid::parse_str(&file_name.rollout_id().to_string()).ok();
-        let Some(rollout_id) = rollout_id else {
-            return ControlFlow::Continue(());
-        };
-        // Rollout filenames only encode timestamps to second precision, so use the UUIDv7
-        // rollout ID as a deterministic tie-breaker when multiple files are created in the same
-        // second.
-        let candidate = (file_name.timestamp(), rollout_id, path);
-        if newest.as_ref().is_none_or(|(timestamp, id, _)| {
-            candidate.0 > *timestamp || (candidate.0 == *timestamp && candidate.1 > *id)
-        }) {
-            newest = Some(candidate);
-        }
-        ControlFlow::Continue(())
-    })
+    visit_rollout_filenames::<()>(
+        root,
+        /*excluded_path*/ None,
+        |file_name| file_name.thread_id() == target,
+        |file_name, path| {
+            let rollout_id = Uuid::parse_str(&file_name.rollout_id().to_string()).ok();
+            let Some(rollout_id) = rollout_id else {
+                return ControlFlow::Continue(());
+            };
+            // Rollout filenames only encode timestamps to second precision, so use the UUIDv7
+            // rollout ID as a deterministic tie-breaker when multiple files are created in the same
+            // second.
+            let candidate = (file_name.timestamp(), rollout_id, path);
+            if newest.as_ref().is_none_or(|(timestamp, id, _)| {
+                candidate.0 > *timestamp || (candidate.0 == *timestamp && candidate.1 > *id)
+            }) {
+                newest = Some(candidate);
+            }
+            ControlFlow::Continue(())
+        },
+    )
     .await?;
     Ok(newest.map(|(_timestamp, _id, path)| path))
 }
 
 async fn visit_rollout_filenames<T>(
     root: &Path,
+    excluded_path: Option<&Path>,
+    matches: impl Fn(&RolloutFileName) -> bool,
     mut visitor: impl FnMut(RolloutFileName, PathBuf) -> ControlFlow<T>,
 ) -> io::Result<Option<T>> {
     let mut stack = vec![root.to_path_buf()];
@@ -1461,13 +1498,31 @@ async fn visit_rollout_filenames<T>(
             if !file_type.is_file() {
                 continue;
             }
+            // Check filename matches before RolloutFile::from_path(), which calls
+            // Path::exists() to check for a compressed rollout's plain sibling.
+            let Some(file_name) = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(RolloutFileName::parse)
+            else {
+                continue;
+            };
+            if !matches(&file_name) {
+                continue;
+            }
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            let Some(file_name) = RolloutFileName::parse(rollout_file.plain_file_name()) else {
+            let path = rollout_file.into_path();
+            if let Some(excluded) = excluded_path
+                && (path == excluded
+                    || !tokio::fs::canonicalize(&path)
+                        .await
+                        .is_ok_and(|path| path != excluded))
+            {
                 continue;
-            };
-            if let ControlFlow::Break(found) = visitor(file_name, rollout_file.into_path()) {
+            }
+            if let ControlFlow::Break(found) = visitor(file_name, path) {
                 return Ok(Some(found));
             }
         }
@@ -1478,14 +1533,14 @@ async fn visit_rollout_filenames<T>(
 async fn find_rollout_path_by_rollout_id_from_filenames(
     root: &Path,
     rollout_id: RolloutId,
+    excluded_canonical_path: Option<&Path>,
 ) -> io::Result<Option<PathBuf>> {
-    visit_rollout_filenames(root, |file_name, path| {
-        if file_name.rollout_id() == rollout_id {
-            ControlFlow::Break(path)
-        } else {
-            ControlFlow::Continue(())
-        }
-    })
+    visit_rollout_filenames(
+        root,
+        excluded_canonical_path,
+        |file_name| file_name.rollout_id() == rollout_id,
+        |_file_name, path| ControlFlow::Break(path),
+    )
     .await
 }
 
@@ -1524,10 +1579,23 @@ pub async fn find_rollout_path_by_rollout_id(
     codex_home: &Path,
     rollout_id: RolloutId,
 ) -> io::Result<Option<PathBuf>> {
+    find_rollout_path_by_rollout_id_excluding(
+        codex_home, rollout_id, /*excluded_canonical_path*/ None,
+    )
+    .await
+}
+
+/// Find an immutable rollout, skipping the canonical path of a rejected copy when supplied.
+pub async fn find_rollout_path_by_rollout_id_excluding(
+    codex_home: &Path,
+    rollout_id: RolloutId,
+    excluded_canonical_path: Option<&Path>,
+) -> io::Result<Option<PathBuf>> {
     for subdir in [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR] {
         let path = find_rollout_path_by_rollout_id_from_filenames(
             codex_home.join(subdir).as_path(),
             rollout_id,
+            excluded_canonical_path,
         )
         .await?;
         if path.is_some() {
@@ -1535,6 +1603,103 @@ pub async fn find_rollout_path_by_rollout_id(
         }
     }
     Ok(None)
+}
+
+/// Locate a page's rollout IDs with one filename traversal per storage root.
+///
+/// Keeps the first match, searching active storage before archives. On a read error, stops
+/// scanning and retains earlier matches, just as individual lookups would have found them.
+pub async fn find_rollout_paths_by_rollout_ids(
+    codex_home: &Path,
+    rollout_ids: &[RolloutId],
+) -> HashMap<RolloutId, PathBuf> {
+    let ids: std::collections::HashSet<_> = rollout_ids.iter().copied().collect();
+    let mut paths = HashMap::new();
+    for subdir in [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR] {
+        if paths.len() == ids.len() {
+            break;
+        }
+        if visit_rollout_filenames(
+            &codex_home.join(subdir),
+            /*excluded_path*/ None,
+            |file_name| ids.contains(&file_name.rollout_id()),
+            |file_name, path| {
+                paths.entry(file_name.rollout_id()).or_insert(path);
+                if paths.len() == ids.len() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+    }
+    paths
+}
+
+/// Prefetch a bounded set of active rollout paths for a history page.
+///
+/// The sibling directory supplies candidate IDs. They are resolved in the same traversal order as
+/// [`find_rollout_path_by_rollout_id`] to preserve duplicate-ID selection; missing or stale paths
+/// still require the normal lookup.
+pub async fn prefetch_sibling_rollout_paths(
+    codex_home: &Path,
+    child_path: &Path,
+    first_ancestor_id: RolloutId,
+) -> io::Result<HashMap<RolloutId, PathBuf>> {
+    let Some(child_name) = child_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(RolloutFileName::parse)
+    else {
+        return Ok(HashMap::new());
+    };
+    // A thread's original rollout ends the chain of same-thread ancestors.
+    if child_name.thread_id() == child_name.rollout_id()
+        || first_ancestor_id == child_name.thread_id()
+    {
+        return Ok(HashMap::new());
+    }
+    let active_root = codex_home.join(SESSIONS_SUBDIR);
+    let canonical_root = tokio::fs::canonicalize(&active_root).await?;
+    let canonical_child = tokio::fs::canonicalize(child_path).await?;
+    let Some(directory) = canonical_child
+        .parent()
+        .filter(|directory| directory.starts_with(&canonical_root))
+    else {
+        return Ok(HashMap::new());
+    };
+    let ids = files::collect_sibling_rollout_ids(
+        directory,
+        child_name.thread_id(),
+        child_name.rollout_id(),
+        first_ancestor_id,
+    )
+    .await?;
+    if ids.len() < 2 || !ids.contains(&first_ancestor_id) {
+        return Ok(HashMap::new());
+    }
+
+    let mut paths = HashMap::new();
+    visit_rollout_filenames(
+        &active_root,
+        /*excluded_path*/ None,
+        |file_name| ids.contains(&file_name.rollout_id()),
+        |file_name, path| {
+            paths.entry(file_name.rollout_id()).or_insert(path);
+            if paths.len() == ids.len() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    )
+    .await?;
+    Ok(paths)
 }
 
 /// Extract the `YYYY/MM/DD` directory components from a rollout filename.

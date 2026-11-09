@@ -61,6 +61,13 @@ impl Overlay {
         Self::Transcript(overlay)
     }
 
+    pub(crate) fn with_copy_on_select_clear_selection(mut self, enabled: bool) -> Self {
+        if let Self::Transcript(overlay) = &mut self {
+            overlay.view.copy_on_select_clear_selection = enabled;
+        }
+        self
+    }
+
     pub(crate) fn new_static_with_lines(
         lines: Vec<Line<'static>>,
         title: String,
@@ -78,19 +85,18 @@ impl Overlay {
     }
 
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        let input = match self {
-            Overlay::Transcript(_) => tui::OverlayInput::Transcript,
-            Overlay::Static(_) => tui::OverlayInput::StaticPager,
-            Overlay::Analytics(_) => tui::OverlayInput::Usage,
+        let mouse_capture = match self {
+            Overlay::Transcript(_) | Overlay::Analytics(_) => tui::MouseCapture::Enabled,
+            Overlay::Static(_) => tui::MouseCapture::Disabled,
         };
-        tui.set_overlay_input(input)?;
+        tui.set_mouse_capture(mouse_capture)?;
         let result = match self {
-            Overlay::Transcript(o) => o.handle_event(tui, event),
+            Overlay::Transcript(o) => o.handle_event(tui, event).map(drop),
             Overlay::Static(o) => o.handle_event(tui, event),
             Overlay::Analytics(o) => o.handle_event(tui, event),
         };
         if result.is_err() || self.is_done() {
-            let restore = tui.set_overlay_input(tui::OverlayInput::Default);
+            let restore = tui.set_mouse_capture(tui::MouseCapture::Inherit);
             return result.and(restore);
         }
         result
@@ -405,7 +411,14 @@ impl TranscriptHistoryState {
     }
 }
 
+pub(crate) struct PagerAction {
+    pub(crate) key: KeyBinding,
+    pub(crate) label: &'static str,
+    pub(crate) run: Box<dyn FnOnce() + Send>,
+}
+
 pub(crate) struct StaticOverlay {
+    pub(crate) action: Option<PagerAction>,
     view: PagerView,
     is_done: bool,
 }
@@ -434,6 +447,7 @@ impl StaticOverlay {
         Self {
             view: PagerView::new(renderables, title, /*scroll_offset*/ 0, keymap),
             is_done: false,
+            action: None,
         }
     }
 
@@ -441,10 +455,13 @@ impl StaticOverlay {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
         render_navigation_hints(line1, buf, &self.view.keymap);
-        let pairs: Vec<(Vec<ShortcutHint>, &str)> = vec![(
+        let mut pairs = vec![(
             first_or_empty(&self.view.keymap, "close", &self.view.keymap.close),
             "close",
         )];
+        if let Some(action) = &self.action {
+            pairs.push((vec![action.key.into()], action.label));
+        }
         render_key_hints(line2, buf, &pairs);
     }
 
@@ -460,13 +477,19 @@ impl StaticOverlay {
 impl StaticOverlay {
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         match event {
-            TuiEvent::Key(key_event) => match key_event {
-                e if self.view.keymap.close.is_pressed(e) => {
+            TuiEvent::Key(key) => {
+                if self.view.keymap.close.is_pressed(key) {
                     self.is_done = true;
-                    Ok(())
+                } else if key.kind == crossterm::event::KeyEventKind::Press
+                    && let Some(action) = self.action.take_if(|action| action.key.is_press(key))
+                {
+                    self.is_done = true;
+                    (action.run)();
+                } else {
+                    return self.view.handle_key_event(tui, key);
                 }
-                other => self.view.handle_key_event(tui, other),
-            },
+                Ok(())
+            }
             TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);

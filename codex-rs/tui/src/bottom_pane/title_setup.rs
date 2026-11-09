@@ -81,7 +81,7 @@ pub(crate) enum TerminalTitleItem {
     /// Full thread UUID.
     #[strum(to_string = "thread-id", serialize = "session-id")]
     SessionId,
-    /// Whether Fast mode is currently active.
+    /// Effective processing tier for the current model.
     FastMode,
     /// Whether Daybreak is enabled for this thread.
     Daybreak,
@@ -136,7 +136,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::SessionId => {
                 "Current thread identifier (omitted until thread starts)"
             }
-            TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
+            TerminalTitleItem::FastMode => "Effective processing tier for the current model",
             TerminalTitleItem::Daybreak => "Whether Daybreak is enabled for this thread",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
@@ -369,6 +369,10 @@ impl TerminalTitleSetupView {
 impl BottomPaneView for TerminalTitleSetupView {
     fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
+    fn accepts_input_when_disconnected(&self) -> bool {
+        true
     }
 
     fn handle_key_event(&mut self, key_event: crossterm::event::KeyEvent) {

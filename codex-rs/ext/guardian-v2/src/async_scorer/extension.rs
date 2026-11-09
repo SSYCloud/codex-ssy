@@ -24,7 +24,6 @@ use codex_extension_api::ToolStartInput;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::openai_models::AsyncClassifierMode;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::has_full_access;
 
@@ -64,21 +63,13 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     return;
                 }
             };
-            let mut policy = guardian_config.policy_for_model(model.as_deref());
-            if let Some(model) = model.as_ref() {
-                input
-                    .config
-                    .config_layer_stack
-                    .requirements()
-                    .constrain_guardian_policy(&mut policy, &model.slug);
-            }
+            let policy = guardian_config.policy_for_model(
+                model.as_deref(),
+                input.config.config_layer_stack.requirements(),
+            );
             let scoring_enabled = policy.scoring_enabled();
-            let sampler_config = super::startup::sampler_config(
-                &input,
-                Arc::clone(&self.auth_manager),
-                self.thread_manager.upgrade(),
-            )
-            .await;
+            let sampler_config =
+                super::startup::sampler_config(&input, self.thread_manager.upgrade()).await;
 
             if scoring_enabled && guardian_config.transcript.include_images {
                 input
@@ -86,22 +77,14 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     .get_or_init(NodeReplReviewEvidence::default)
                     .enable_image_capture();
             }
-            let mode = guardian_config.classifier_mode(
-                model
-                    .as_ref()
-                    .and_then(|model| model.model_messages.as_ref())
-                    .and_then(|messages| messages.guardian_v2.as_ref()),
-            );
             input.thread_store.remove::<ConversationBackend>();
             input.thread_store.remove::<LunaSampler>();
             let sampler = input
                 .thread_store
                 .get_or_init(|| LunaSampler::new(sampler_config));
-            if mode == AsyncClassifierMode::Conversation {
-                input
-                    .thread_store
-                    .insert(ConversationBackend::new(Arc::clone(&sampler)));
-            }
+            input
+                .thread_store
+                .insert(ConversationBackend::new(Arc::clone(&sampler)));
             input
                 .thread_store
                 .remove::<super::decisions::DecisionsSampler>();
@@ -109,7 +92,8 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 .config
                 .features
                 .enabled(Feature::GuardianV2DecisionsComparison)
-                && let Some(decisions_sampler) = super::startup::decisions_sampler(&input)
+                && let Some(decisions_sampler) =
+                    super::startup::decisions_sampler(&input, &self.auth_manager)
             {
                 input.thread_store.insert(decisions_sampler);
             }

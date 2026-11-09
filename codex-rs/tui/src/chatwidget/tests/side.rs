@@ -91,6 +91,15 @@ async fn slash_commands_without_side_flag_are_rejected_for_side_threads() {
     }
     assert!(rx.try_recv().is_err(), "expected no follow-up events");
     assert!(op_rx.try_recv().is_err(), "expected no review op");
+
+    chat.bottom_pane
+        .set_composer_text("/fork".into(), Vec::new(), Vec::new());
+    let images = vec!["https://example.com/image.png".to_string()];
+    chat.bottom_pane.set_remote_image_urls(images.clone());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(chat.bottom_pane.composer_text(), "/fork");
+    assert_eq!(chat.bottom_pane.remote_image_urls(), images);
 }
 
 #[tokio::test]
@@ -218,6 +227,7 @@ async fn side_aliases_without_args_start_empty_side_conversations() {
             Ok(AppEvent::StartSide {
                 parent_thread_id: emitted_parent_thread_id,
                 user_message: None,
+                mode: crate::app_event::SideStartMode::Reuse,
             }) if emitted_parent_thread_id == parent_thread_id
         );
         assert!(
@@ -249,6 +259,7 @@ async fn side_aliases_request_forked_questions_while_task_running() {
             Ok(AppEvent::StartSide {
                 parent_thread_id: emitted_parent_thread_id,
                 user_message: Some(user_message),
+                mode: crate::app_event::SideStartMode::New,
             }) if emitted_parent_thread_id == parent_thread_id
                 && user_message
                     == UserMessage {

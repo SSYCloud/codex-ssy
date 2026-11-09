@@ -1,3 +1,38 @@
+# Managed human command checkpoints (experimental)
+
+A matching managed `requirements.toml` prefix rule with `decision = "prompt-user"`
+requires a fresh human decision, including when the thread uses automatic review.
+Prefix matching, exact-path precedence, and executable mappings stay unchanged. Clients
+supporting this workflow must initialize with `experimentalApi: true` and
+`requiredHumanApproval: true`.
+
+The server sends `item/commandExecution/requestApproval` with `kind: "humanCommand"`,
+a unique `approvalId`, and the command to display. Only `accept`, `decline`, and
+`cancel` are valid responses. Session and persistent approvals cannot satisfy the
+checkpoint. Only capable clients receive or answer these requests. Pending prompts
+use the normal approval replay flow when a capable client reconnects. With no capable
+connection when approval is requested, the command is rejected. The prompt itself
+does not start an execution item; normal command execution events report execution
+after approval.
+
+# Thread memory summary (experimental)
+
+`thread/memory/read` takes `{threadId}` for a loaded thread and returns
+`{summary}`. Start or resume the thread first. The summary uses that thread's
+resolved memory version, including thread-specific configuration overrides.
+It is `null` when memory use is disabled or the selected summary is missing,
+unreadable, or blank. It never falls back to the other memory version.
+
+# Local history by account
+
+Pass `currentAccountOnly: true` on `thread/list` or `thread/search` to scope local
+discovery to the current ChatGPT login. Newly created threads record that discovery
+is account-scoped, and each recorded creator user or account ID must match.
+Threads created before this change and threads without creator IDs stay visible
+across account switches. Resume and revert preserve that distinction; forks are new threads.
+Scoped requests skip candidates whose rollout header cannot be read. API-key
+logins see all local history. Direct access by thread ID remains available.
+
 # Thread list exclusions
 
 `thread/list` accepts `excludedThreadIds`, an optional array of up to 100
@@ -19,6 +54,62 @@ These errors are not evidence that history is exhausted; callers can retry.
 A successful response with `nextCursor: null` still indicates exhaustion.
 Default scan-and-repair requests retain their filesystem fallback.
 
+# Thread section moves
+
+After a successful `thread/section/move`, the app-server broadcasts
+`thread/section/changed` to its connected clients. The notification carries
+`threadId` and the destination `sectionId`, which is null for a removal.
+Moves within a section also emit this event so clients can refresh its order.
+
+# Shutdown admission errors
+
+When graceful shutdown rejects new work, app-server returns JSON-RPC error
+`-32600` with `data: {"reason":"serverShuttingDown"}`. Clients can use the
+reason to distinguish shutdown from other invalid requests.
+
+# Thread read state (experimental)
+
+Local durable ordinary user threads expose a `readState` on the
+`thread/read` response. `thread/list` returns `readStates`, a map from eligible
+thread IDs on the returned page to their receipts. Null (or absent on older servers)
+means durable read state is unavailable; a missing map entry means that row is
+ineligible. Ephemeral, not-yet-persisted, service and product-owned threads are
+ineligible. Shared `Thread` objects, including search and lifecycle responses,
+carry no receipts. After start, resume or fork, use `thread/read` to obtain the
+current receipt.
+Each local thread has one receipt, with the same storage ownership as the thread.
+
+A read state is `{firstUnread, revision}`. `firstUnread` is null when read,
+`{type:"threadStart"}` for an explicit unread mark (even for an empty thread),
+or `{type:"turn", turnId}` for the earliest eligible completed result.
+`revision` is an opaque string, scoped to this thread.
+
+Only newly delivered, durable, visible terminal results advance read state,
+before `turn/completed`. Every new result changes the revision, even when an
+older turn remains the first unread position. Reverting a paginated thread
+clears a removed position; explicit thread-start marks survive. Loading snapshots
+never acknowledges activity; empty threads start read and forked history does
+not publish inherited turns as new results.
+
+Enabling `initialize.capabilities.experimentalApi` permits updating read state and
+receiving its notifications.
+
+`thread/readState/update` takes `{threadId, expectedRevision, operation}`,
+where operation is `{type:"read"}` or `{type:"unread"}`.
+Use the revision of the row or transcript actually seen. An unread edit
+starts at `threadStart`; a read edit clears the position. Both require an
+exact revision match, and both conflicts return `-32600` with
+`{reason:"readStateConflict", readState:<current>}` as error data.
+Do not blindly retry: the original action may precede an unseen result or
+another window's mark. Unavailable threads fail; writes never change recency.
+
+Started, resumed or forked threads send `thread/readState/changed` alongside
+ordinary thread events; thread/unsubscribe or disconnect stops delivery.
+Clients can filter this method with the existing notification opt-out setting.
+Revisions are equality tokens, not clocks: never compare or merge them across
+threads or hosts. When concurrent responses disagree, refresh with `thread/read`.
+Offscreen threads converge on page refresh.
+
 # Guardian circuit-breaker errors
 
 Set `auto_review.circuit_break_action = "strict"` to include `TooManyDenials` in
@@ -30,12 +121,18 @@ denial limit, and interrupted status; neither emits a separate `Error` event.
 
 # Model catalog provider requirements
 
-`model/list` and periodic model catalog refreshes check the startup provider against
-current managed provider requirements before using the catalog. If that provider no longer
+`model/list` accepts an optional `modelProvider` to list models for a configured provider
+other than the startup default. For example, `{"modelProvider": "my_gateway"}` returns that
+provider's models after the user's default changes. Omit it to retain the startup provider
+and caching behavior. Explicit selections use the provider definitions loaded at startup. Restart the server
+to pick up edits to those definitions. An unknown selector returns JSON-RPC error
+`-32600` with `data.type = "modelProviderNotConfigured"` and the requested `modelProvider`.
+
+`model/list` checks its selected provider, and periodic model catalog refreshes check the
+startup provider, against current managed provider requirements. If that provider no longer
 complies, `model/list` returns JSON-RPC error `-32600` asking the client to restart Codex,
 and background refreshes skip the old endpoint. Requirement load failures also block these
-operations. Checks apply even when the catalog is cached. Existing startup provider selection
-and caching behavior remain in effect while the provider satisfies current requirements.
+operations. Checks apply even when the catalog is cached.
 
 # MCP App UI
 
@@ -49,6 +146,14 @@ render without waiting for the full MCP catalog.
 The field is null for older history and tools that declare widgets only in
 result metadata; clients retain catalog discovery for those calls. Existing
 resource URI fields remain available for older clients.
+
+Clients can pass an optional `_meta` object on `mcpServer/resource/read`.
+The app server forwards its entries to MCP `resources/read`, including reads
+bound to an originating tool call. The keys `x-codex-turn-metadata`, `threadId`,
+and `codex/connectionLease` are reserved for host context on every MCP server. Reads to `codex_apps`
+additionally reserve `connector_id`, `link_id`, and the nested
+`_codex_apps.resource_uri` field for hosted app routing. A request that includes
+a reserved field in `_meta` is rejected before the MCP read is sent.
 
 # Initial Daybreak choice (experimental)
 
@@ -122,6 +227,14 @@ discovery finds no project-root marker, Git checkout, or project-local `.codex`
 directory. Starting a task there does not preapprove project configuration added
 later. Existing trust decisions and permission checks for projects are unchanged.
 
+# Review delivery
+
+`review/start` runs the review on the supplied thread and returns that same
+`reviewThreadId`. Clients can omit `delivery`, send `null`, or specify `"inline"`.
+Clients that used `"detached"` should call `thread/start` and pass the new thread id
+to `review/start`. To keep the original conversation history with custom review
+instructions, use `thread/fork` followed by `turn/start`.
+
 # Thread removal
 
 `thread/archive` and `thread/delete` reject attempts to remove a live internal
@@ -165,13 +278,13 @@ Local UI clients use five methods. They require the existing
 `unavailable/providerUnavailable` on unsupported platforms or without the required
 ChatGPT account identity.
 
-| Method | Params | Result |
-| --- | --- | --- |
-| `userVerification/status` | `{}` | `{credentialId, unavailableReason, unavailableMessage}` |
-| `userVerification/enroll` | `{}` | `{credentialId, algorithm?, publicKey?}` |
-| `userVerification/delete` | `{}` | `{}` |
-| `userVerification/verify` | `{challenge, title, description}` | `{proof: {credentialId, signature}}` |
-| `userVerification/cancel` | `{requestId}` | `{}` |
+| Method                    | Params                            | Result                                                  |
+| ------------------------- | --------------------------------- | ------------------------------------------------------- |
+| `userVerification/status` | `{}`                              | `{credentialId, unavailableReason, unavailableMessage}` |
+| `userVerification/enroll` | `{}`                              | `{credentialId, algorithm?, publicKey?}`                |
+| `userVerification/delete` | `{}`                              | `{}`                                                    |
+| `userVerification/verify` | `{challenge, title, description}` | `{proof: {credentialId, signature}}`                    |
+| `userVerification/cancel` | `{requestId}`                     | `{}`                                                    |
 
 Status reads local readiness without prompting or contacting a backend. A null
 `unavailableReason` means local checks passed, not that registration is valid.
@@ -230,7 +343,7 @@ any files were compressed; failures are reported through existing logs and metri
 There are no progress notifications or cancellation API. Clients sharing this
 Codex home must support compressed rollout files, including shared histories.
 
-## Managed model provider requirements
+## Model provider admission
 
 `configRequirements/read` reports `supportsIndependentSpeedModes: true` when
 `features.fast_mode` and `features.ultrafast_mode` independently control Fast and
@@ -242,8 +355,46 @@ Existing threads retain their provider configuration. Input RPCs reject requests
 `model_provider` or `model_providers` requirements no longer match that configuration, or cannot
 be loaded. This covers turn start/steer, review, compaction, manual queue start, and active goal
 updates. Realtime connections use separate routing configuration and are not checked here.
-Interrupt, realtime stop, and goal pause/clear remain available. User and project
-configuration changes alone do not invalidate existing threads.
+Interrupt, realtime stop, and goal pause/clear remain available.
+
+Resume and input use the thread's saved provider even when a different provider is the default.
+A cold resume resolves the saved provider from configuration. A loaded thread uses its retained
+provider configuration and checks current managed policy before accepting input. The JSON-RPC
+error's `data` contains `modelProviderNotConfigured` for a missing provider or
+`modelProviderPolicyConflict` for a mandatory-policy conflict. Clients can use `thread/read`
+to display history when input is blocked. A resume request that explicitly selects a
+different provider cannot change the thread's saved provider.
+
+## Managed network requirements
+
+In `requirements.toml`, put shared network constraints directly in `[permissions.network]`,
+alongside `[permissions.filesystem]`:
+
+```toml
+[permissions.network]
+enabled = true
+```
+
+`[network_proxy]` and its compatibility alias `[experimental_network]` still work.
+Do not mix either with `[permissions.network]`, even across requirements layers. A single
+layer cannot use both top-level names; across layers the top-level names merge with normal
+precedence. `configRequirements/read` returns the result in `requirements.network`.
+
+In `config.toml`, `[features.network_proxy]` configures the proxy, while
+`[permissions.<profile>.network]` configures a profile's network settings. Managed requirements
+remain separate and override conflicting profile settings. They can start the proxy without
+enabling the feature; feature settings apply only when the feature is enabled.
+
+In `requirements.toml`, `network` is reserved, like `filesystem`. Rename any managed profile
+named `network` and update its references before upgrading. An empty `[permissions.network]`
+is rejected because it is indistinguishable from an old empty profile. Omit the table when
+there are no shared network settings. A profile named `network` is still allowed in `config.toml`.
+
+Policy publishers must continue using `[experimental_network]` until every client and policy
+validation layer supports the chosen new spelling. Older clients or intermediaries may ignore or
+strip constraints in `[network_proxy]` or `[permissions.network]`; intermediaries may also skip
+host-local validation. This reader change does not migrate or
+version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
@@ -277,6 +428,7 @@ the entire network configuration.
 - `thread/attachmentOwner/list` — find stored threads with an exact attachment type and identity key, with cursor pagination and an optional archive filter.
 - `thread/attachment/remove` — remove an attachment by its thread, attachment type, and identity key; returns `{}`.
 - `thread/attachment/updated` — notification broadcast after an attachment is created or removed; contains the thread, attachment identity, attachment id, and operation.
+
 ### Example: Manage stored thread attachments
 
 Attachments record the resources currently associated with a thread, independently of conversation history. Clients can add, remove, and list attachments for one stored thread at a time without resuming those threads. Adding or removing an attachment does not create or delete the underlying resource or rewrite history. An attachment is idempotently identified by its thread, `attachmentType`, and `identityKey`. For pull requests, clients should reuse the canonical application identity `JSON.stringify([canonicalHostname, lowercaseOwner, lowercaseRepository, pullRequestNumber])` so addition and removal agree across surfaces.
@@ -339,6 +491,18 @@ A non-ephemeral fork copies the source thread's current attachments, even when f
 Attachment creation and deletion requests using the same thread ID are serialized across connections. The requesting client receives its response before the compact update is broadcast, and duplicate creates or absent deletes do not emit updates. Deleting the owning thread removes its attachments under the same lifecycle exclusion; queued attachment mutations then report that the thread was not found.
 
 # Thread plugin settings
+
+Plugin summaries returned by `plugin/list`, `plugin/installed`, `plugin/read`,
+and `plugin/share/list` report effective `enabled` state. When
+`plugins._default.enabled` is configured, an explicit
+`plugins."<plugin-name>@<marketplace-name>".enabled` overrides that default;
+a plugin disabled at its source remains disabled. Omitting the default preserves
+existing source and account enablement. Other plugin settings, including remembered
+tool approvals, inherit the activation default unless `enabled` is explicitly set.
+`plugin/search` retains its discovery behavior: results report `enabled: false`
+while preserving their installation state.
+Remote `plugin/install` still installs a policy-disabled package, but skips MCP and
+Apps authentication setup without writing an `enabled` override.
 
 `thread/settings/update` and `turn/start` accept `disabledPluginIds`, a list of
 `PluginSummary.id` values from `plugin/list`, in the
@@ -412,7 +576,18 @@ cancels the previous attempt and waits for its callback listener to close. Use
 `account/login/cancel` to cancel explicitly. Start a fresh session after success to
 use the saved grant.
 
+# Account identity
+
+`account/read` returns a nullable `userId` alongside `account`. For ChatGPT and
+personal access token sessions, this is the canonical ChatGPT user ID from the
+authenticated account metadata, when available. API-only and signed-out sessions
+return `null`. The ID belongs to the same account snapshot as the rest of the
+response. Clients should also accept an absent field from older app servers.
+PAT sessions continue to return no bearer token from `getAuthStatus`.
+
 # Selected workspace routing
+
+`account/securitySetup/read` returns an optional backend-owned security reminder for the saved ChatGPT login. A returned notice includes its account and user IDs; clients must discard it after an account change and validate its copy and action URL before rendering. Ineligible, unavailable, and timed-out reads return `notice: null`. Older app-servers may not support this optional read.
 
 The experimental `account/read.workspaceRouting` response field returns the selected ChatGPT workspace's `chatgptAccountId`, resolved HTTPS `backendOrigin`, and backend-provided `accountRoutingOverride`. The routing value is `us`, `us_cr`, or the explicit `NO_CONSTRAINT` value. API-only and signed-out accounts return `null` and do not need `accounts/check`.
 
@@ -446,8 +621,8 @@ process control and custom output caps do not apply to MXC.
 
 ### Gateway OAuth sign-in
 
-Providers configured with `gateway_oauth` require a secondary OAuth credential in
-addition to their primary authentication. Clients with a gateway sign-in UI set
+A provider can obtain its gateway token through browser OAuth or a credential
+export command. Clients with a gateway sign-in UI set
 `initialize.capabilities.explicitGatewayOauth: true`, complete initialization, and
 successfully call `account/gatewayOAuth/read` before sending authenticated requests,
 including startup `model/list` and inference requests. Repeat this probe on each
@@ -466,16 +641,29 @@ With explicit login enabled, app-server refreshes existing credentials, but only
 `account/gatewayOAuth/login` RPC starts browser authorization. Requests needing
 sign-in fail promptly so the client can offer that flow.
 
+Configure `[model_providers.<id>.gateway_oauth.credential_export]` to obtain the
+gateway access token from a command on first use. Set `command`, optional `args`,
+and optional `timeout_ms` (default 30000). The command prints one access token to
+stdout. Codex caches it in memory and applies the configured gateway header or
+cookie. Choose either `credential_export` or OAuth settings such as
+`authorization_url`, `token_url`, and `client_id`. If the command fails,
+the request returns the export error. Use direct
+inference and catalog URLs because command credentials require same-origin catalog
+access and reject HTTP redirects. After an inference HTTP 401 or a rejected
+WebSocket upgrade with status 401, Codex clears the cached export and reruns
+the command once for the retry.
+
 Clients that omit the capability or set it to `false`, including the TUI, retain
 automatic browser authorization after initialization. Startup credential reads
 cannot open a browser before initialization. Explicit opt-in is shared by gateway
 managers using the same home and network configuration within the process and
 cannot be undone by a later connection that omits the capability.
 
-- `account/gatewayOAuth/read` returns the current effective `providerId`,
+- `account/gatewayOAuth/read` returns the selected `providerId`,
   `providerName`, `required`, `status`, and `error`. `required` indicates that this
-  provider uses gateway OAuth, including when already signed in. This operation
-  does not refresh tokens or open a browser; `status` is null for other providers.
+  provider uses gateway OAuth, including when already signed in. With a credential
+  exporter, `required` is false and `status` is null. This read does not refresh
+  tokens or open a browser.
   `notReady` means credentials are not ready. `succeeded` means saved credentials
   are locally usable, not that a gateway request has been verified. Reads observe
   usable replacement credentials saved by another process sharing the same home.
@@ -491,20 +679,27 @@ cannot be undone by a later connection that omits the capability.
   start another login. Closing that connection also cancels its login and releases
   the callback listener. Cancellation makes the pending login request fail.
 - `account/gatewayOAuth/changed` reports `notReady`, `started`, `succeeded`, or
-  `failed`, with an optional `error`. Notifications apply to the current effective
-  gateway configuration. Clients can read readiness when connecting and after
+  `failed`, with an optional `error`. Notifications identify each configured
+  provider sharing the changed gateway credential, even when it is not the current
+  default. Clients can read readiness when connecting and after
   changing configuration. Notifications follow the standard per-connection
   `optOutNotificationMethods` setting.
   These payloads never contain credentials.
 
-Read, login, and cancel take no params. Read and login use the app's current
-provider, reloading configuration and returning an error if it cannot be loaded.
+Read and login accept an optional `modelProvider`, for example
+`{"modelProvider": "my_gateway"}`. Omitted params, null params, and an omitted or
+null selector use the current provider. An explicit selector uses the provider definitions
+loaded at startup and is checked against current managed provider policy before
+credentials are read. Unknown or forbidden providers return an error instead of
+falling back to the current provider. Login keeps the selected provider for the
+entire attempt, even if the default changes. Cancel takes no params and cancels
+the calling connection's active login, regardless of its provider.
 Status notifications include `providerId`. During browser sign-in, inference
 requests fail promptly and can be retried when sign-in succeeds.
 
 `model/list` also checks gateway authentication before returning cached models.
-If authentication fails after the provider configuration changes, it asks the client
-to restart Codex so the retained catalog and gateway sign-in use the same provider.
+If authentication fails and the catalog's provider differs from the current configuration,
+it asks the client to restart Codex so the catalog and gateway sign-in use the same provider.
 
 ## Application network policy
 
@@ -541,6 +736,11 @@ execution and sandbox policies.
 
 # Item history anchors
 
+Live notifications and turn history return the same `ThreadItem`. Each item has
+`startedAtMs` and `completedAtMs` beside `type` and `id`. Each timestamp is in
+Unix milliseconds, or `null` when the producer has not recorded it. Clients
+reading older servers may also encounter items that omit these fields.
+
 `thread/items/list` accepts an optional nullable `cursor`: either an opaque string
 from a previous response or an item anchor such as
 `{"type":"item","itemId":"item-123"}`. An item anchor resumes exclusively after
@@ -554,3 +754,182 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+
+Experimental clients can set `"deferOutput": {"commandExecution": true}`
+with a `turnId`. Omitted or false options keep the full output. Unknown fields in
+`deferOutput` are ignored.
+For a completed command with a recorded completion time, exit code zero, and
+nonempty saved output, the entry returns `outputDeferred: true` and
+`item.aggregatedOutput: null`. Use `thread/items/read` with that turn and item ID
+to retrieve the full output. All other entries retain their recorded output.
+
+## Workspace switching (experimental)
+
+For a managed ChatGPT login, `accountSession/list` returns an opaque
+`sessionId` for that login and its selected workspace. Set
+`refreshWorkspaceMetadata` to fetch the user's memberships.
+
+Call `accountSession/switch` with that `sessionId` and the target workspace's
+`accountId`. Core checks the membership, stops loaded threads, exchanges the
+session token and validates the new workspace's routing. Clients receive
+`thread/closed` for unloaded threads and `account/updated` after a successful
+switch. Selecting the current workspace leaves its threads running.
+
+The server remembers the selected workspace on refresh. If routing validation
+fails, Core attempts to restore the previous workspace while the same credentials
+are still current.
+
+Clients that can open a browser may pass `allowBrowserLogin: true`. If the
+workspace requires SSO, the response contains `loginId` and `authUrl`. Open
+that URL and wait for `account/login/completed`. The browser can reuse an
+existing SSO session. Core accepts the callback only for the requesting login
+and target workspace. Cancel through `account/login/cancel` to keep the current
+workspace. Government workspaces require a separate sign-in.
+
+# Model provider configuration
+
+Use `modelProvider/list` with `{}` to list OpenAI and providers explicitly defined
+under `[model_providers.<id>]` in the effective configuration, including requirements.
+Clients can filter the complete list by `settings.type === "customGateway"`.
+`defaultProviderId` reports the selected default even if it has no provider table.
+`canChangeDefault` accounts for required selection and higher-precedence overrides.
+
+Every entry contains `id`, `name`, `canEdit`, `baseUrl`, and `settings`.
+The shared `baseUrl` includes a configured endpoint override, including for
+Bedrock and GCP. It is null if unset or unsuitable for display.
+The `settings.type` field selects the provider-specific fields.
+
+- `openai` has no additional settings.
+- `bedrock` contains `profile` and `region` for either Bedrock provider.
+- `gcp` contains `projectId`, `location`, and `credentialFile`. The last field
+  is a path on the server host.
+- `customGateway` contains an `auth` object. Mode `none` has no other fields.
+  Mode `environmentVariable` includes the variable name in `envKey`. Mode
+  `externallyConfigured` includes a nullable `envKey` and indicates that the
+  gateway form cannot fully represent the authentication. Preserve this
+  authentication when editing other fields.
+
+Settings include inherited values and use null for unset nullable fields.
+Credential values are never resolved.
+
+`canEdit` indicates that at least one supported configuration field can be changed
+in the active user layer. Supported built-in fields are AWS profile/region for
+Bedrock and project/location/credential file for GCP. Custom providers support
+name, URL, and environment-variable authentication where applicable. Individual
+writes still require validation. Lower-precedence definitions can be overridden;
+required definitions are read-only. Both capabilities are false when user
+configuration is ignored. The flag does not establish credential validity or
+whether a setup flow that also selects a default provider will succeed.
+`account/bedrock/setup` targets `amazon-bedrock`; edits to `amazon-bedrock-runtime`
+must use that provider's configuration paths instead.
+
+Use `modelProvider/config/write` with a tagged `settings` patch. To create a
+custom gateway, send `type: "customGateway"`, `name`, and `baseUrl`. Omit
+`providerId` or pass null to allocate an ID. To edit an existing gateway,
+include its ID inside `settings`.
+
+```json
+{
+  "settings": {
+    "type": "customGateway",
+    "providerId": "team",
+    "name": "New name",
+    "envKey": null
+  }
+}
+```
+
+The Bedrock branch requires `amazon-bedrock` or `amazon-bedrock-runtime` and
+accepts `profile` and `region`. This patch changes only the runtime region.
+
+```json
+{
+  "settings": {
+    "type": "bedrock",
+    "providerId": "amazon-bedrock-runtime",
+    "region": "us-east-1"
+  }
+}
+```
+
+The GCP branch requires `gcp` and accepts `projectId`, `location`, and
+`credentialFile`. This patch clears the credential-file override.
+
+```json
+{ "settings": { "type": "gcp", "providerId": "gcp", "credentialFile": null } }
+```
+
+Omitted patch fields preserve their values. Setting a nullable field such as
+`region` to `null` removes its user-level override, so any inherited value takes effect.
+A supplied name must be a string. A supported built-in can receive its first
+override even when absent from the list. Custom gateways can share a display
+name with a built-in, except for names that select built-in behavior
+(`OpenAI`, `Amazon Bedrock`, `Amazon Bedrock Runtime`, and `Google Cloud Vertex AI`).
+Built-in provider IDs remain reserved.
+
+Send only edited configuration fields. A null `baseUrl` in a summary can mean
+that the endpoint was redacted. When `settings.auth.mode` is `externallyConfigured`,
+including for an endpoint with embedded credentials, writes to `envKey` are rejected. Other edits preserve unexposed authentication,
+headers, query parameters, and commands, including when changing the endpoint.
+Each supplied field must be writable. A new user-layer custom override retains the
+inherited name because custom provider tables require a name.
+
+The response is `{ "provider": ModelProviderSummary }`, using the same safe summary
+as list. There are no public version tokens. Provider, value, and batch writes in
+one app-server share the config queue: the last write to a field wins while omitted
+siblings are preserved. Patches apply without an expected-version check. The
+response summarizes the saved configuration.
+
+Saving does not select a default, authenticate, or contact the provider. Use setup
+RPCs for authentication and selection. Saving the provider used by `model/list`
+invalidates its catalog for the next access. Existing threads keep their configuration.
+
+# GCP provider account
+
+The experimental `account/gcp/setup` method configures the built-in Vertex AI provider.
+
+- `projectId` (required) — Google Cloud project ID.
+- `location` (optional) — Defaults to `global`.
+- `credentialFile` (optional) — Absolute path to a credential file on the app-server
+  host. Omit it or pass `null` to clear the saved path in the active user
+  configuration and use Application Default Credentials (ADC), including
+  `GOOGLE_APPLICATION_CREDENTIALS`.
+
+If the active profile inherits `model_providers.gcp.credential_file` from the base
+`config.toml`, clearing the profile’s own setting would expose the base path again.
+Setup returns an error without saving changes. To use ADC, remove the inherited
+setting from the file named in the error and retry.
+
+Setup rejects a GCP `base_url` override or higher-priority settings that conflict
+with the request. It fetches an access token before saving the settings and
+selecting GCP, then returns `{}`. The next `model/list` reloads the catalog.
+`account/read` reports `{ "account": { "type": "gcp" }, "requiresOpenaiAuth": false }`.
+Use a model request to verify Vertex model access.
+
+Credential failures include `error.data.reason`.
+
+- `gcloudNotInstalled` — The app-server could not find `gcloud` on its PATH.
+- `credentialFileInvalid` — The path is invalid or the file is unreadable. For
+  default `gcloud` auth, setup also checks for a JSON object with a nonempty string `type`.
+- `authCommandFailed` — The token command failed, including when ADC is missing
+  or a token refresh fails.
+
+For personal sign-in, users can run `gcloud auth application-default login` on
+the app-server host and retry setup.
+
+## Managed OpenTelemetry configuration
+
+`configRequirements/read` exposes managed `otel` settings. `config/read` applies
+those settings to the effective configuration and omits ordinary origins for
+managed fields. Configuration writes that overlap managed settings are rejected.
+
+Exporter header values are redacted in effective config, source layers, managed
+requirements, and write-override metadata. Runtime exporters retain the original values.
+
+Managed span attributes and tracestate metadata are included in effective config
+and requirements reads. Unmanaged metadata remains writable.
+
+Tracestate requirements merge individual fields within each member. For example,
+requiring `otel.tracestate.vendor.tenant` preserves an ordinary `vendor.region`.
+Only required fields and edits to their ancestors are protected; sibling fields
+retain their origins and remain writable.

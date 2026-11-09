@@ -1,5 +1,6 @@
-//! Storage-neutral attachment persistence interfaces.
+//! Storage-neutral attachment persistence and availability checks.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -20,6 +21,9 @@ pub type UploadFuture<'a> =
 pub type ResolveFuture<'a> =
     Pin<Box<dyn Future<Output = AttachmentStoreResult<AttachmentMetadata>> + Send + 'a>>;
 
+/// Future returned by [`AttachmentStore::is_resolvable`].
+pub type IsResolvableFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
 /// Uploads attachments and resolves metadata for stored files.
 ///
 /// Implementations choose whether uploaded attachments remain inline or become file references.
@@ -31,6 +35,15 @@ pub trait AttachmentStore: Send + Sync {
 
     /// Resolves metadata and, when requested, a fresh URL for a stored attachment.
     fn resolve<'a>(&'a self, request: ResolveRequest<'a>) -> ResolveFuture<'a>;
+
+    /// Checks whether a file reference should be retained in a model request.
+    ///
+    /// The default retains all references, including provider-owned IDs this store cannot
+    /// resolve. Authoritative stores may opt in to checking and return `false` only when the
+    /// file is confirmed missing. Backend and access errors must retain the reference.
+    fn is_resolvable<'a>(&'a self, _file_id: &'a str) -> IsResolvableFuture<'a> {
+        Box::pin(async { true })
+    }
 }
 
 /// Attachment data supplied to [`AttachmentStore::upload`].
@@ -42,6 +55,8 @@ pub struct UploadRequest {
     pub ephemeral: bool,
     /// Optional name associated with the attachment.
     pub file_name: Option<String>,
+    /// Caller-supplied tags used by storage backends for policy decisions.
+    pub tags: HashMap<String, String>,
     /// Attachment bytes to persist.
     pub data: Vec<u8>,
 }
@@ -53,16 +68,19 @@ impl fmt::Debug for UploadRequest {
             .field("thread_id", &self.thread_id)
             .field("ephemeral", &self.ephemeral)
             .field("file_name", &self.file_name)
+            .field("tags", &self.tags)
             .field("data", &"<redacted>")
             .finish()
     }
 }
 
 /// Parameters supplied to [`AttachmentStore::resolve`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveRequest<'a> {
     /// Identifier assigned by the attachment store.
     pub file_id: &'a str,
+    /// Caller-supplied tags used by storage backends for policy decisions.
+    pub tags: HashMap<String, String>,
     /// Minimum remaining lifetime required for the returned file URL.
     ///
     /// When absent, implementations must omit the file URL and may return cached metadata. When
@@ -117,6 +135,8 @@ impl fmt::Debug for AttachmentMetadata {
 pub enum FormatSpecificMetadata {
     /// Metadata for an image attachment.
     Image(ImageMetadata),
+    /// Metadata for an audio attachment.
+    Audio(AudioMetadata),
 }
 
 /// Metadata specific to an image attachment.
@@ -128,6 +148,14 @@ pub struct ImageMetadata {
     /// Image height in pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+}
+
+/// Metadata specific to an audio attachment.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AudioMetadata {
+    /// Measured audio duration in milliseconds, when known by the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// Representation callers should retain after uploading an attachment.

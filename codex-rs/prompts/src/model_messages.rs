@@ -15,12 +15,18 @@ use permissions::ResolvedPermissionMessages;
 
 mod collaboration;
 mod guardian;
+mod incremental_tools;
 mod multi_agent;
 pub(crate) mod permissions;
+mod plugins;
 
 pub use collaboration::ResolvedCollaborationModeMessages;
 pub use guardian::ResolvedAutoReviewMessages;
+pub use incremental_tools::ResolvedIncrementalToolMessages;
 pub use multi_agent::ResolvedMultiAgentMessages;
+pub use plugins::ResolvedGenericPluginMessages;
+pub use plugins::ResolvedPluginRecommendationMessages;
+pub use plugins::ResolvedSelectedPluginMessages;
 
 /// Text together with whether it was supplied by the catalog, even when it equals the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +148,27 @@ impl<'a> ResolvedModelMessages<'a> {
             })
     }
 
+    /// Selects native history definitions; missing fields delegate to the tool owner.
+    pub fn history(self) -> Option<&'a codex_protocol::openai_models::HistoryToolMessages> {
+        self.catalog_messages?.tools.as_ref()?.history.as_ref()
+    }
+
+    /// Selects native notes definitions; missing fields delegate to the tool owner.
+    pub fn notes(self) -> Option<&'a codex_protocol::openai_models::NotesToolMessages> {
+        self.catalog_messages?.tools.as_ref()?.notes.as_ref()
+    }
+
+    /// Selects context-window control definitions independently of runtime tool names.
+    pub fn context_management(
+        self,
+    ) -> Option<&'a codex_protocol::openai_models::ContextManagementToolMessages> {
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .context_management
+            .as_ref()
+    }
+
     /// Resolves optional confirmation policies, leaving missing values to actor defaults.
     pub fn confirmation_policies(&self) -> Option<&'a ConfirmationPolicies> {
         self.catalog_messages
@@ -204,6 +231,26 @@ impl<'a> ResolvedModelMessages<'a> {
             .as_ref()
     }
 
+    /// Selects per-function guidance restricted to the default `functions` namespace.
+    pub fn functions_namespace_functions_description_prefixes(
+        &self,
+    ) -> Option<&'a std::collections::BTreeMap<String, String>> {
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .functions_namespace_functions_description_prefixes
+            .as_ref()
+    }
+
+    /// Resolves bounded incremental catalog wording for an owned world-state section.
+    pub fn incremental_tools(&self) -> ResolvedIncrementalToolMessages {
+        ResolvedIncrementalToolMessages::new(
+            self.catalog_messages
+                .and_then(|messages| messages.tools.as_ref())
+                .and_then(|tools| tools.incremental_tools.as_ref()),
+        )
+    }
+
     /// Selects Code Mode messages; bundled text and runtime composition belong to the tool owner.
     pub fn code_mode(&self) -> Option<&'a CodeModeToolMessages> {
         self.catalog_messages?.tools.as_ref()?.code_mode.as_ref()
@@ -236,3 +283,7 @@ impl<'a> ResolvedModelMessages<'a> {
             .unwrap_or(CONTENT_FILTER_GUIDANCE)
     }
 }
+
+#[cfg(test)]
+#[path = "model_messages/plugins_tests.rs"]
+mod plugins_tests;

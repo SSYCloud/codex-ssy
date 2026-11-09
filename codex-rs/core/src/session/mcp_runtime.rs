@@ -39,6 +39,7 @@ impl Session {
         next: &SessionConfiguration,
     ) -> bool {
         current.cwd() != next.cwd()
+            || current.runtime_workspace_roots != next.runtime_workspace_roots
             || current.step_settings.approval_policy.value()
                 != next.step_settings.approval_policy.value()
             || current.step_settings.approvals_reviewer != next.step_settings.approvals_reviewer
@@ -59,7 +60,7 @@ impl Session {
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
         advertised_tool: &ToolInfo,
-    ) -> Option<PreparedMcpCall> {
+    ) -> anyhow::Result<PreparedMcpCall> {
         self.refresh_mcp_if_dirty().await;
         self.services
             .mcp_runtime
@@ -79,19 +80,9 @@ impl Session {
                 state.active_disabled_plugin_ids.clone(),
             )
         };
-        let cwd = environments
-            .primary()
-            .and_then(|environment| environment.cwd().to_abs_path().ok())
-            .unwrap_or_else(|| session_configuration.cwd().clone());
-        let config = self.build_per_turn_config(
-            &session_configuration,
-            cwd,
-            environments.primary_workspace_roots(),
-        );
-        let local_process_cwd = environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let config =
+            self.build_per_turn_config(&session_configuration, environments.local_selection());
+        let local_process_cwd = config.cwd.to_path_buf();
 
         McpDesiredState {
             config: Arc::new(config),
@@ -111,19 +102,12 @@ impl Session {
         auth: Option<CodexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
-        mcp_runtime_cwd: PathBuf,
     ) -> anyhow::Result<()> {
-        let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
-            .unwrap_or_else(|_| session_configuration.cwd().clone());
         let config = self.build_per_turn_config(
             session_configuration,
-            cwd,
-            resolved_environments.primary_workspace_roots(),
+            resolved_environments.local_selection(),
         );
-        let local_process_cwd = resolved_environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let local_process_cwd = config.cwd.to_path_buf();
         let desired = McpDesiredState {
             config: Arc::new(config),
             auth,
@@ -157,14 +141,20 @@ impl Session {
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if self.isolation == codex_extension_api::SessionIsolation::Isolated {
+            if self.isolation == codex_extension_api::SessionIsolation::Isolated
+                || self
+                    .services
+                    .mcp_thread_init
+                    .get::<crate::mcp::McpServersDisabled>()
+                    .is_some()
+            {
                 return projection;
             }
 
             let mut catalog = None;
             let mut registered = HashSet::new();
             for selected in environments.turn_environments() {
-                let environment = &selected.environment;
+                let environment = selected.environment();
                 if !environment.is_remote() {
                     continue;
                 }
@@ -323,6 +313,7 @@ impl Session {
         } = mcp_projection;
         config.approval_policy = desired.config.permissions.approval_policy.clone();
         config.permission_profile = desired.config.permissions.effective_permission_profile();
+        config.host_cwd = desired.config.cwd.clone();
         config.approvals_reviewer = desired.config.approvals_reviewer;
         config.environment_cwds = desired
             .environments
@@ -358,27 +349,43 @@ impl Session {
                         == SandboxType::WindowsMxc,
             );
         let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
-        config.set_server_permission_profiles(
+        config.set_server_permissions(
             &mcp_servers,
             desired.environments.turn_environments().map(|environment| {
+                // Freeze the executor paths used to interpret this profile with the MCP call.
+                let mut sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+                sandbox.permissions = sandbox
+                    .permissions
+                    .materialize_project_roots_with_path_uris(&sandbox.workspace_roots);
                 (
                     environment.selection.environment_id.clone(),
-                    environment.permission_profile_with_workspace_roots(),
+                    Arc::new(sandbox),
                 )
             }),
         );
         let mcp_config = Arc::new(config);
-        let runtime_context = McpRuntimeContext::new(
-            self.services.turn_environments.environment_manager(),
-            desired.local_process_cwd.clone(),
-        )
-        .with_selected_environments(
-            desired.environments.all_selections().into(),
-            desired.environments.ready_environment_handles(),
-        );
+        let runtime_context =
+            self.mcp_runtime_context(&desired.environments, &desired.local_process_cwd);
         McpRuntimeInput {
+            network_policy_metadata: None,
+            runtime_auth: desired
+                .config
+                .features
+                .enabled(Feature::RuntimeAgentInstances)
+                .then(|| {
+                    (
+                        Arc::clone(&self.services.runtime_auth),
+                        desired.config.runtime_auth_mode,
+                    )
+                }),
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
-                McpStartupPolicy::LazyWhenCached
+                McpStartupPolicy::DeferCachedServers
+            } else if desired
+                .config
+                .features
+                .enabled(Feature::McpLazyStdioStartup)
+            {
+                McpStartupPolicy::DeferCachedStdio
             } else {
                 McpStartupPolicy::Eager
             },

@@ -115,26 +115,18 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     )
     actual = {
         "working_directory": lines[0],
-        "fmt_comment": next(line for line in reversed(lines[:fmt_index]) if line.startswith("#")),
         "fmt_commands": [
             line.strip()
             for line in lines[fmt_index + 1 : fmt_check_index]
             if line.strip() and not line.startswith("#")
         ],
-        "fmt_check_comment": next(
-            line for line in reversed(lines[:fmt_check_index]) if line.startswith("#")
-        ),
         "fmt_check_commands": [
             line.strip() for line in lines[fmt_check_index + 1 : next_recipe_index] if line.strip()
         ],
     }
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
-        "fmt_comment": (
-            "# Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts."
-        ),
         "fmt_commands": ["@{{ python }} ../scripts/format.py"],
-        "fmt_check_comment": "# Check formatting without modifying files.",
         "fmt_check_commands": ["@{{ python }} ../scripts/format.py --check"],
     }
 
@@ -508,13 +500,12 @@ def test_python_codegen_schema_annotation_adds_stable_variant_titles() -> None:
         "GranularAskForApproval",
     ]
 
-    reasoning_summary_titles = [
-        variant.get("title") for variant in definitions["ReasoningSummary"]["oneOf"]
-    ]
-    assert reasoning_summary_titles == [
-        "ReasoningSummaryValue",
-        "NoneReasoningSummary",
-    ]
+    from openai_codex.generated.v2_all import ReasoningSummary
+
+    reasoning_values, disabled = definitions["ReasoningSummary"]["oneOf"]
+    assert reasoning_values["title"] == "ReasoningSummaryValue"
+    assert disabled["enum"] == ["none"]
+    assert ReasoningSummary.model_validate("none").root == "none"
 
 
 def test_generate_v2_all_uses_titles_for_generated_names() -> None:
@@ -562,6 +553,52 @@ def test_generated_inline_image_class_names_remain_stable() -> None:
         InputImageFunctionCallOutputContentItem.__name__
         == "InputImageFunctionCallOutputContentItem"
     )
+
+
+def test_generated_audio_inputs_preserve_inline_and_file_shapes() -> None:
+    """Existing audio imports still work, and file references round-trip through the unions."""
+    from openai_codex.generated.v2_all import (
+        AudioUserInput,
+        ContentItem,
+        FileIdUserInput1,
+        InputAudioContentItem,
+        UserInput,
+    )
+
+    audio_url = "data:audio/wav;base64,YXVkaW8="
+    for model, wire in [
+        (AudioUserInput, {"type": "audio", "url": audio_url}),
+        (InputAudioContentItem, {"type": "input_audio", "audio_url": audio_url}),
+        (UserInput, {"type": "audio", "fileId": "file_audio"}),
+        (FileIdUserInput1, {"type": "audio", "fileId": "file_audio"}),
+        (ContentItem, {"type": "input_audio", "file_id": "file_audio"}),
+    ]:
+        audio = model.model_validate(wire)
+        assert audio.model_dump(by_alias=True, exclude_unset=True, mode="json") == wire
+
+
+def test_generated_image_generation_thread_item_alias_remains_available() -> None:
+    """Existing SDK callers can still construct and validate inline image-generation items."""
+    from openai_codex.generated.v2_all import (
+        ImageGenerationThreadItem,
+        ResultThreadItem,
+    )
+
+    item = ImageGenerationThreadItem.model_validate(
+        {
+            "failure": None,
+            "id": "image_1",
+            "result": "aW1hZ2U=",
+            "revisedPrompt": None,
+            "savedPath": None,
+            "status": "completed",
+            "transparentBackground": None,
+            "type": "imageGeneration",
+        }
+    )
+
+    assert ImageGenerationThreadItem is ResultThreadItem
+    assert isinstance(item, ResultThreadItem)
 
 
 def test_runtime_package_template_has_no_checked_in_binaries() -> None:

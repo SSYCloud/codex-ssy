@@ -76,6 +76,8 @@ use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 use tokio_tungstenite::tungstenite::handshake::server::Response;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use uuid::Uuid;
 use wiremock::Match;
 use wiremock::Mock;
@@ -332,6 +334,7 @@ async fn conversation_start_audio_text_close_round_trip() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -514,6 +517,7 @@ async fn conversation_records_history_without_an_event_observer(
                 realtime_end_instructions: None,
                 prompt: Some(Some("fixture".to_string())),
                 realtime_session_id: Some("voice-1".to_string()),
+                voice_session_id: None,
                 transport: None,
                 version: None,
                 voice: None,
@@ -625,6 +629,7 @@ async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()> 
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -720,6 +725,7 @@ async fn conversation_websocket_transports_send_codex_headers_without_creating_a
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(transport.clone()),
             version: Some(RealtimeConversationVersion::V3),
             voice: None,
@@ -870,6 +876,7 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
     let codex = &conversation.thread;
     assert_eq!(codex.config_snapshot().await.thread_source, thread_source);
     let requested_realtime_session_id = Uuid::new_v4().to_string();
+    let voice_session_id = "voice-session-test".to_string();
 
     codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -893,6 +900,7 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: Some(requested_realtime_session_id.clone()),
+            voice_session_id: Some(voice_session_id.clone()),
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -937,6 +945,10 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
                 .and_then(|value| value.to_str().ok()),
             request
                 .headers
+                .get("voice-session-id")
+                .and_then(|value| value.to_str().ok()),
+            request
+                .headers
                 .get("authorization")
                 .and_then(|value| value.to_str().ok()),
         ),
@@ -947,6 +959,7 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
             Some(expected_session_id.as_str()),
             Some(expected_thread_id.as_str()),
             Some(requested_realtime_session_id.as_str()),
+            Some(voice_session_id.as_str()),
             Some("Bearer Access Token"),
         )
     );
@@ -1052,6 +1065,7 @@ async fn conversation_webrtc_start_posts_generated_session() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -1421,6 +1435,7 @@ async fn conversation_webrtc_live_reconnects_sideband_after_unclean_disconnect(
                 Some(Some("backend prompt".to_string()))
             },
             realtime_session_id: attaches_existing_call.then(|| "sess_client_owned".to_string()),
+            voice_session_id: None,
             transport: Some(transport),
             version: Some(RealtimeConversationVersion::V3),
             voice: None,
@@ -1573,6 +1588,7 @@ async fn conversation_webrtc_start_uses_avas_query() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -1679,6 +1695,7 @@ async fn conversation_webrtc_default_v1_ignores_configured_v2_voice() -> Result<
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -1747,6 +1764,7 @@ async fn conversation_webrtc_default_v1_rejects_explicit_v2_voice() -> Result<()
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -1825,6 +1843,7 @@ async fn conversation_webrtc_start_uses_configured_call_base_url_for_avas() -> R
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -1873,6 +1892,80 @@ async fn conversation_webrtc_start_uses_configured_call_base_url_for_avas() -> R
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
     realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[test_case(RealtimeConversationVersion::V1; "preview")]
+#[test_case(RealtimeConversationVersion::V3; "frameless")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_existing_call_stop_closes_only_observer_transport(
+    version: RealtimeConversationVersion,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let realtime_ws_base_url = format!("ws://{}", listener.local_addr()?);
+    let observer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut websocket = tokio_tungstenite::accept_async(stream).await?;
+        // The first frame must be the transport close, never session initialization or SessionClose.
+        let frame = websocket.next().await.context("observer frame")??;
+        Ok::<_, anyhow::Error>(frame)
+    });
+    let mut builder = test_codex().with_config(move |config| {
+        config.experimental_realtime_ws_base_url = Some(realtime_ws_base_url);
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            delegation_ack_filler: None,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode:
+                codex_protocol::protocol::CodexResponseHandoffMode::Thinking,
+            backend_reasoning_status: false,
+            codex_response_handoff_channel_prefixes: None,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: false,
+            initial_items: Vec::new(),
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            prompt: None,
+            realtime_session_id: None,
+            voice_session_id: None,
+            transport: Some(ConversationStartTransport::ExistingCall {
+                call_id: "rtc_frontend_owned".to_string(),
+                sideband_base_url: None,
+            }),
+            version: Some(version),
+            voice: None,
+        }))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationStarted(_))
+    })
+    .await;
+    test.codex.submit(Op::RealtimeConversationClose).await?;
+    let closed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(closed.reason.as_deref(), Some("requested"));
+    assert_eq!(
+        timeout(Duration::from_secs(5), observer)
+            .await
+            .context("observer close timed out")???,
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into()
+        }))
+    );
+    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 
@@ -1940,6 +2033,7 @@ async fn conversation_webrtc_close_while_sideband_connecting_drops_pending_join(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -2048,6 +2142,7 @@ async fn conversation_webrtc_sideband_connect_failure_closes_with_error() -> Res
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -2156,6 +2251,7 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2258,6 +2354,7 @@ async fn assert_transport_close_tail_flush(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2392,6 +2489,7 @@ async fn conversation_start_preflight_failure_emits_realtime_error_only() -> Res
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2451,6 +2549,7 @@ async fn conversation_start_connect_failure_emits_realtime_error_only() -> Resul
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2564,6 +2663,7 @@ async fn conversation_second_start_replaces_runtime() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("old".to_string())),
             realtime_session_id: Some("conv_old".to_string()),
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2602,6 +2702,7 @@ async fn conversation_second_start_replaces_runtime() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("new".to_string())),
             realtime_session_id: Some("conv_new".to_string()),
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2712,6 +2813,7 @@ async fn conversation_uses_experimental_realtime_ws_base_url_override() -> Resul
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2792,6 +2894,7 @@ async fn conversation_uses_default_realtime_backend_prompt() -> Result<()> {
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2883,6 +2986,7 @@ async fn conversation_uses_empty_instructions_for_null_or_empty_prompt() -> Resu
                 realtime_end_instructions: None,
                 prompt,
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: None,
                 version: None,
                 voice: None,
@@ -2967,6 +3071,7 @@ async fn conversation_uses_explicit_start_voice() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: Some(RealtimeVoice::Breeze),
@@ -3041,6 +3146,7 @@ async fn conversation_uses_configured_realtime_voice() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3100,6 +3206,7 @@ async fn conversation_rejects_voice_for_wrong_realtime_version() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: Some(RealtimeVoice::Cove),
@@ -3162,6 +3269,7 @@ async fn conversation_uses_experimental_realtime_ws_backend_prompt_override() ->
             realtime_end_instructions: None,
             prompt: Some(Some("prompt from op".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3248,6 +3356,7 @@ async fn conversation_uses_experimental_realtime_ws_startup_context_override() -
             realtime_end_instructions: None,
             prompt: Some(Some("prompt from op".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3327,6 +3436,7 @@ async fn conversation_disables_realtime_startup_context_with_empty_override() ->
             realtime_end_instructions: None,
             prompt: Some(Some("prompt from op".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3399,6 +3509,7 @@ async fn conversation_start_injects_startup_context_from_thread_history() -> Res
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3476,6 +3587,8 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             let assistant_turn = format!("assistant turn {turn_number}");
             [
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText { text: user_turn }],
@@ -3483,9 +3596,13 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: assistant_turn,
                     }],
                     phase: None,
@@ -3527,6 +3644,7 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3647,6 +3765,7 @@ async fn conversation_startup_context_falls_back_to_workspace_map() -> Result<()
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3719,6 +3838,7 @@ async fn conversation_startup_context_is_truncated_and_sent_once_per_start() -> 
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3824,6 +3944,7 @@ async fn conversation_user_text_turn_is_not_sent_to_realtime(ephemeral: bool) ->
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -3892,7 +4013,7 @@ async fn conversation_user_text_turn_is_not_sent_to_realtime(ephemeral: bool) ->
                 ThreadTimelineEntry::Realtime { item, .. }
                     if matches!(&item.content, ThreadRealtimeItemContent::TranscriptSegment { text, .. } if text == "spoken before typed input") => Some("speech"),
                 ThreadTimelineEntry::Item { item, .. }
-                    if matches!(item.as_ref(), codex_app_server_protocol::ThreadItem::UserMessage { .. }) => Some("typed input"),
+                    if matches!(&item.payload, codex_app_server_protocol::ThreadItemPayload::UserMessage { .. }) => Some("typed input"),
                 _ => None,
             }).collect::<Vec<_>>(),
             vec!["speech", "typed input"]
@@ -3965,6 +4086,7 @@ async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_respon
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4083,6 +4205,7 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4217,6 +4340,7 @@ async fn conversation_relays_only_public_reasoning_as_quiet_status(enabled: bool
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4409,6 +4533,7 @@ async fn conversation_routes_assistant_messages_for_v3_handoff(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4603,6 +4728,7 @@ async fn conversation_handoff_persists_across_item_done_until_turn_complete(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4769,6 +4895,7 @@ async fn inbound_handoff_request_starts_turn_and_promotes_its_artifact() -> Resu
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -4934,6 +5061,7 @@ async fn inbound_handoff_request_uses_active_transcript() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5049,6 +5177,7 @@ async fn inbound_handoff_request_sends_transcript_delta_after_each_handoff() -> 
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5188,6 +5317,7 @@ async fn conversation_close_routes_only_remaining_transcript_tail_once() -> Resu
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5294,6 +5424,7 @@ async fn inbound_conversation_item_does_not_start_turn_and_still_forwards_audio(
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5429,6 +5560,7 @@ async fn delegated_turn_user_role_echo_does_not_redelegate_and_still_forwards_au
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5594,6 +5726,7 @@ async fn inbound_handoff_request_does_not_block_realtime_event_forwarding() -> R
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -5779,6 +5912,7 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn(
             realtime_end_instructions: Some("Return to normal text updates.".to_string()),
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -6020,6 +6154,7 @@ async fn inbound_handoff_request_starts_turn_and_does_not_block_realtime_audio()
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,

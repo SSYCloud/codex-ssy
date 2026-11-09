@@ -83,6 +83,8 @@ impl PreviousReviews {
             .map(|review| review.id.clone())
             .collect();
         let item = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_owned(),
             content: std::iter::once(ContentItem::InputText {
@@ -164,6 +166,7 @@ pub fn render_review_evidence(review: ReviewEvidence<'_>) -> RenderedReviewEvide
         let text = truncate_entry(&text, token_cap);
         if original_bytes > text.len() {
             truncations.push(TruncationObservation {
+                source: None,
                 component,
                 original_bytes,
                 retained_bytes: text.len(),

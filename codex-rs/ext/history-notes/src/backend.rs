@@ -53,14 +53,16 @@ impl HistoryNotesBackend {
             }),
         );
 
-        let provider = self.provider.api_provider().await.map_err(|_| {
-            format!("{OPERATION_ERROR_PREFIX} Could not resolve the backend provider.")
-        })?;
-        let auth = self.provider.api_auth().await.map_err(|_| {
-            format!("{OPERATION_ERROR_PREFIX} Could not resolve backend authentication.")
-        })?;
+        let setup = codex_model_provider::resolve_request(
+            self.provider.as_ref(),
+            /*scope*/ None,
+            /*routing*/ None,
+            self.http_client_factory.clone(),
+        )
+        .await
+        .map_err(|_| format!("{OPERATION_ERROR_PREFIX} Could not prepare the backend request."))?;
 
-        let mut request = provider.build_request(Method::POST, path);
+        let mut request = setup.api_provider.build_request(Method::POST, path);
         let encoded_truncation_policy =
             serde_json::to_string(&truncation_policy).map_err(|_| {
                 format!("{OPERATION_ERROR_PREFIX} Could not encode the output truncation policy.")
@@ -87,12 +89,13 @@ impl HistoryNotesBackend {
         }
         request.body = Some(RequestBody::Json(arguments));
         request.timeout = Some(HISTORY_NOTES_BACKEND_TIMEOUT);
-        let request = auth.apply_auth(request).await.map_err(|_| {
+        let request = setup.api_auth.apply_auth(request).await.map_err(|_| {
             format!("{OPERATION_ERROR_PREFIX} Could not apply backend authentication.")
         })?;
         let transport = create_transport_for_routes_async(
-            self.http_client_factory.clone(),
+            setup.http_client_factory,
             ClientRouteClass::Api,
+            setup.redirect_policy,
         )
         .await
         .map_err(|_| format!("{OPERATION_ERROR_PREFIX} The backend request failed."))?;
