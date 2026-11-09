@@ -391,3 +391,49 @@ fn write_permissions_for_windows_paths_uses_executor_uris() {
         )]),
     );
 }
+
+const SAMPLE_PATCH: &str = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+
+#[test]
+fn extract_patch_text_accepts_custom_payload() {
+    let payload = ToolPayload::Custom {
+        input: SAMPLE_PATCH.to_string(),
+    };
+    assert_eq!(extract_patch_text(&payload).ok().as_deref(), Some(SAMPLE_PATCH));
+}
+
+#[test]
+fn extract_patch_text_accepts_function_argument_shapes() {
+    let shapes = [
+        json!({ "input": SAMPLE_PATCH }),
+        json!({ "command": SAMPLE_PATCH }),
+        json!({ "command": ["apply_patch", SAMPLE_PATCH] }),
+        json!({ "command": json!(["apply_patch", SAMPLE_PATCH]).to_string() }),
+    ];
+    for shape in shapes {
+        let payload = ToolPayload::Function {
+            arguments: shape.to_string(),
+        };
+        assert_eq!(
+            extract_patch_text(&payload).ok().as_deref(),
+            Some(SAMPLE_PATCH),
+            "shape: {shape}"
+        );
+    }
+}
+
+#[test]
+fn extract_patch_text_accepts_raw_non_json_function_arguments() {
+    let payload = ToolPayload::Function {
+        arguments: SAMPLE_PATCH.to_string(),
+    };
+    assert_eq!(extract_patch_text(&payload).ok().as_deref(), Some(SAMPLE_PATCH));
+}
+
+#[test]
+fn extract_patch_text_rejects_function_arguments_without_patch() {
+    let payload = ToolPayload::Function {
+        arguments: json!({ "cmd": "ls" }).to_string(),
+    };
+    assert!(extract_patch_text(&payload).is_err());
+}

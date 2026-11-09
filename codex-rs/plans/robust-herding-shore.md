@@ -114,7 +114,7 @@ renamed). Update every `AuthDotJson { .. }` construction site that currently set
 - In `run_login_server()`, branch on `opts.login_kind` when building `auth_url`/`redirect_uri`:
   - `Chatgpt`: unchanged existing logic.
   - `ShengSuanYun`: `callback_url = format!("http://localhost:{actual_port}/auth")`, then
-    `auth_url = format!("https://router.shengsuanyun.com/auth?from=codex-ssy&callback_url={}",
+    `auth_url = format!("https://www.shengsuanyun.com/auth?from=codex-ssy&callback_url={}",
     urlencoding::encode(&callback_url))`. Do **not** open-browser/PKCE-generate anything
     OAuth-specific for this branch.
 - In `process_request()`, add a new `"/auth"` match arm (distinct path from `"/auth/callback"`,
@@ -207,7 +207,7 @@ attributes), `app-server/src/auth_mode.rs`, `tui/src/onboarding/auth.rs` /
 2. `cargo test -p codex-login -p codex-app-server -p codex-cli` — existing ChatGPT/Bedrock auth
    tests must still pass unmodified (regression guard for requirement #1).
 3. Manual end-to-end: run the TUI (`cargo run -p codex-tui`), select ShengSuanYun sign-in,
-   confirm the opened browser URL is `https://router.shengsuanyun.com/auth?from=codex-ssy&callback_url=http%3A%2F%2Flocalhost%3A1455%2Fauth`,
+   confirm the opened browser URL is `https://www.shengsuanyun.com/auth?from=codex-ssy&callback_url=http%3A%2F%2Flocalhost%3A1455%2Fauth`,
    then hit `http://localhost:1455/auth?code=<test-code>` manually (or via the real flow) and
    confirm: the local server responds, `auth.json` gets a `shengsuanyun_access_keys` entry with
    `api_key`/`jwt_token`, and `codex login status` / the TUI status card show the ShengSuanYun

@@ -275,11 +275,70 @@ fn write_permissions_for_paths(
 
 /// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
 fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
+    extract_patch_text(payload).ok()
+}
+
+/// Returns the patch text for a freeform (`Custom`) call, or for a plain function call
+/// from providers that cannot emit freeform tool calls. Function arguments may carry the
+/// patch as `{"input": "<patch>"}`, `{"command": "<patch>"}`, `{"command": ["apply_patch",
+/// "<patch>"]}`, or `{"command": "[\"apply_patch\", \"<patch>\"]"}`.
+fn extract_patch_text(payload: &ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
-        ToolPayload::Custom { input } => Some(input.clone()),
+        ToolPayload::Custom { input } => Ok(input.clone()),
+        ToolPayload::Function { arguments } => patch_text_from_function_arguments(arguments)
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "apply_patch arguments must contain the patch text in `input` or `command`"
+                        .to_string(),
+                )
+            }),
+        _ => Err(FunctionCallError::RespondToModel(
+            "apply_patch handler received unsupported payload".to_string(),
+        )),
+    }
+}
+
+fn patch_text_from_function_arguments(arguments: &str) -> Option<String> {
+    let value = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) => value,
+        Err(_) => return patch_text_from_value(&serde_json::Value::String(arguments.to_string())),
+    };
+    match &value {
+        serde_json::Value::Object(map) => ["input", "command", "patch"]
+            .iter()
+            .find_map(|key| map.get(*key))
+            .and_then(patch_text_from_value),
+        other => patch_text_from_value(other),
+    }
+}
+
+fn patch_text_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with('[')
+                && let Ok(inner) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && inner.is_array()
+            {
+                return patch_text_from_value(&inner);
+            }
+            Some(text.clone())
+        }
+        serde_json::Value::Array(items) => {
+            let strings: Vec<&str> = items.iter().filter_map(serde_json::Value::as_str).collect();
+            match strings.as_slice() {
+                [] => None,
+                [only] => Some((*only).to_string()),
+                [first, rest @ ..] if matches!(*first, "apply_patch" | "applypatch") => {
+                    rest.last().map(|patch| (*patch).to_string())
+                }
+                [.., last] => Some((*last).to_string()),
+            }
+        }
         _ => None,
     }
 }
+
 
 impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
     fn tool_name(&self) -> ToolName {
@@ -314,11 +373,7 @@ impl ApplyPatchHandler {
             ..
         } = invocation;
 
-        let ToolPayload::Custom { input: patch_input } = payload else {
-            return Err(FunctionCallError::RespondToModel(
-                "apply_patch handler received unsupported payload".to_string(),
-            ));
-        };
+        let patch_input = extract_patch_text(&payload)?;
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
             Err(parse_error) => {
@@ -385,7 +440,10 @@ impl ApplyPatchHandler {
 
 impl CoreToolRuntime for ApplyPatchHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Custom { .. })
+        matches!(
+            payload,
+            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
+        )
     }
 
     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
@@ -408,6 +466,9 @@ impl CoreToolRuntime for ApplyPatchHandler {
         invocation.payload = match invocation.payload {
             ToolPayload::Custom { .. } => ToolPayload::Custom {
                 input: patch.to_string(),
+            },
+            ToolPayload::Function { .. } => ToolPayload::Function {
+                arguments: serde_json::json!({ "input": patch }).to_string(),
             },
             payload => payload,
         };

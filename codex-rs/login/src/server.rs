@@ -217,7 +217,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
             opts.forced_chatgpt_workspace_id.as_deref(),
         )?,
         LoginKind::ShengSuanYun => format!(
-            "https://router.shengsuanyun.com/auth?from=codex-ssy&callback_url={}",
+            "https://www.shengsuanyun.com/auth?from=codex-ssy&callback_url={}",
             urlencoding::encode(&redirect_uri)
         ),
     };
