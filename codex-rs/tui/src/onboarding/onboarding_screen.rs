@@ -176,7 +176,7 @@ impl OnboardingScreen {
                 if auth_config.is_login_method_allowed(ForcedLoginMethod::ShengSuanYun) {
                     SignInOption::ShengSuanYun
                 } else {
-                    SignInOption::OtherMethods
+                    SignInOption::ApiKey
                 };
             if let Some(app_server_request_handle) = app_server_request_handle {
                 steps.push(Step::Auth(AuthModeWidget {
@@ -240,7 +240,11 @@ impl OnboardingScreen {
 
     fn current_steps_mut(&mut self) -> Vec<&mut Step> {
         let mut out: Vec<&mut Step> = Vec::new();
+        let auth_in_progress = self.is_auth_in_progress();
         for step in self.steps.iter_mut() {
+            if auth_in_progress && matches!(step, Step::Welcome(_)) {
+                continue;
+            }
             match step.get_step_state() {
                 StepState::Hidden => continue,
                 StepState::Complete => out.push(step),
@@ -255,7 +259,13 @@ impl OnboardingScreen {
 
     fn current_steps(&self) -> Vec<&Step> {
         let mut out: Vec<&Step> = Vec::new();
+        // The sign-in picker draws its own welcome header, so the standalone
+        // Welcome step must not stack above it.
+        let auth_in_progress = self.is_auth_in_progress();
         for step in self.steps.iter() {
+            if auth_in_progress && matches!(step, Step::Welcome(_)) {
+                continue;
+            }
             match step.get_step_state() {
                 StepState::Hidden => continue,
                 StepState::Complete => out.push(step),

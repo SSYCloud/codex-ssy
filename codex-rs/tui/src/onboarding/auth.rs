@@ -121,8 +121,9 @@ pub(crate) enum SignInOption {
 }
 
 impl SignInOption {
+    /// Options that live in the "Sign in another way" submenu.
     fn is_alternative(self) -> bool {
-        !matches!(self, Self::ChatGpt | Self::DeviceCode | Self::OtherMethods)
+        matches!(self, Self::Gcp | Self::Gateway)
     }
 }
 
@@ -251,6 +252,14 @@ impl KeyboardHandler for AuthModeWidget {
         }
         if keys::SELECT_FOURTH.is_pressed(key_event) {
             self.select_option_by_index(/*index*/ 3, key_event);
+            return;
+        }
+        if keys::SELECT_FIFTH.is_pressed(key_event) {
+            self.select_option_by_index(/*index*/ 4, key_event);
+            return;
+        }
+        if keys::SELECT_SIXTH.is_pressed(key_event) {
+            self.select_option_by_index(/*index*/ 5, key_event);
             return;
         }
         if keys::CONFIRM.is_pressed(key_event) {
@@ -428,10 +437,7 @@ impl AuthModeWidget {
 
     fn displayed_sign_in_options(&self) -> Vec<SignInOption> {
         if self.highlighted_mode.is_alternative() {
-            let mut options = vec![SignInOption::ApiKey];
-            if self.bedrock_setup_enabled {
-                options.push(SignInOption::Bedrock);
-            }
+            let mut options = vec![];
             if self.gcp_setup_enabled {
                 options.push(SignInOption::Gcp);
             }
@@ -449,7 +455,13 @@ impl AuthModeWidget {
             options.push(SignInOption::DeviceCode);
         }
         if self.is_api_login_allowed() {
-            options.push(SignInOption::OtherMethods);
+            options.push(SignInOption::ApiKey);
+            if self.bedrock_setup_enabled {
+                options.push(SignInOption::Bedrock);
+            }
+            if self.gcp_setup_enabled || self.gateway_setup_enabled {
+                options.push(SignInOption::OtherMethods);
+            }
         }
         options
     }
@@ -490,7 +502,7 @@ impl AuthModeWidget {
 
     fn activate_highlighted_mode(&mut self, key_event: KeyEvent) {
         let option = self.highlighted_mode;
-        if option == SignInOption::OtherMethods || option.is_alternative() {
+        if !matches!(option, SignInOption::ChatGpt | SignInOption::DeviceCode) {
             self.guard_activation(key_event);
         }
         self.handle_sign_in_option(option);
@@ -513,7 +525,11 @@ impl AuthModeWidget {
                 }
             }
             SignInOption::OtherMethods => {
-                self.highlighted_mode = SignInOption::ApiKey;
+                self.highlighted_mode = if self.gcp_setup_enabled {
+                    SignInOption::Gcp
+                } else {
+                    SignInOption::Gateway
+                };
                 self.set_error(/*message*/ None);
             }
             SignInOption::ChatGpt => {
@@ -576,11 +592,9 @@ impl AuthModeWidget {
             vec![
                 Line::from(vec![
                     "  ".into(),
-                    "Sign in with ChatGPT to use Codex as part of your paid plan".into(),
-                ]),
-                Line::from(vec![
-                    "  ".into(),
-                    "or connect an API key for usage-based billing".into(),
+                    "Welcome to ".into(),
+                    "Codex".bold(),
+                    ", OpenAI's command-line coding agent".into(),
                 ]),
                 "".into(),
             ]
@@ -640,14 +654,7 @@ impl AuthModeWidget {
                         idx,
                         option,
                         "Sign in another way",
-                        if self.bedrock_setup_enabled
-                            || self.gcp_setup_enabled
-                            || self.gateway_setup_enabled
-                        {
-                            "Use an API key or another provider"
-                        } else {
-                            "Use an OpenAI API key"
-                        }
+                        "Use Google Cloud Vertex AI or a custom provider",
                     ));
                 }
                 SignInOption::ChatGpt => {
@@ -1624,7 +1631,6 @@ mod tests {
         auth_config.forced_login_method = Some(ForcedLoginMethod::ShengSuanYun);
         let widget = AuthModeWidget {
             request_frame: FrameRequester::test_dummy(),
-            highlighted_mode: SignInOption::ShengSuanYun,
             highlighted_mode: SignInOption::ChatGpt,
             activation_key_guard: None,
             error: Arc::new(RwLock::new(None)),
@@ -1692,7 +1698,7 @@ mod tests {
                 SignInOption::ShengSuanYun,
                 SignInOption::ChatGpt,
                 SignInOption::DeviceCode,
-                SignInOption::OtherMethods,
+                SignInOption::ApiKey,
             ]
         );
 
@@ -1713,12 +1719,16 @@ mod tests {
             &widget.app_server_target,
             Feature::BedrockSetupWizard,
         );
-        widget.handle_key_event(KeyCode::Char('3').into());
         assert_eq!(
             widget.displayed_sign_in_options(),
-            vec![SignInOption::ApiKey, SignInOption::Bedrock, SignInOption::ShengSuanYun]
+            vec![
+                SignInOption::ShengSuanYun,
+                SignInOption::ChatGpt,
+                SignInOption::DeviceCode,
+                SignInOption::ApiKey,
+                SignInOption::Bedrock,
+            ]
         );
-        widget.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         widget.move_highlight(/*delta*/ 1);
 
         let area = Rect::new(0, 0, 76, 19);
@@ -1739,14 +1749,20 @@ mod tests {
         insta::assert_snapshot!(rows.join("\n"), @r###"
           Choose how you want to use Codex.
 
-        > 1. Sign in with ChatGPT
+          1. 登录胜算云
+             注册胜算云，新用户赠送10元额度。
+
+        > 2. Sign in with ChatGPT
              Usage included with Plus, Pro, Business, and Enterprise plans
 
-          2. Sign in with Device Code
+          3. Sign in with Device Code
              Sign in from another device with a one-time code
 
-          3. Sign in another way
-             Use an API key or another provider
+          4. Use an OpenAI API key
+             Pay for what you use
+
+          5. Use Amazon Bedrock
+             Connect using your AWS credentials
 
           Press enter to continue
         "###);

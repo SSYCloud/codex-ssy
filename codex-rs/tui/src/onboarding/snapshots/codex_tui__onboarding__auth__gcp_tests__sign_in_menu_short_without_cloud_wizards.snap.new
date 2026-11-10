@@ -1,0 +1,12 @@
+---
+source: tui/src/onboarding/gcp_tests.rs
+assertion_line: 34
+expression: terminal.backend().to_string()
+---
+  Welcome to Codex, OpenAI's command-line coding agent
+
+  1. 登录胜算云
+> 2. Sign in with ChatGPT
+  3. Sign in with Device Code
+  4. Use an OpenAI API key
+  Press enter to continue

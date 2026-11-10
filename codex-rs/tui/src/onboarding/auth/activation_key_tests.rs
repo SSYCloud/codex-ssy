@@ -11,19 +11,16 @@ async fn held_enter_requires_a_fresh_confirmation_to_save_a_prefilled_api_key() 
     widget.auth_config.forced_login_method = None;
     let enter = |kind| KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind);
 
-    widget.handle_key_event(KeyCode::Up.into());
-    widget.handle_key_event(enter(KeyEventKind::Press));
-    widget.handle_key_event(enter(KeyEventKind::Repeat));
-    widget.handle_key_event(enter(KeyEventKind::Press));
+    // ChatGPT -> Device Code -> API key on the main menu.
     widget.handle_key_event(KeyCode::Down.into());
-    widget.handle_key_event(enter(KeyEventKind::Repeat));
+    widget.handle_key_event(KeyCode::Down.into());
     assert_eq!(widget.highlighted_mode, SignInOption::ApiKey);
     assert!(matches!(
         *widget.sign_in_state.read().unwrap(),
         SignInState::PickMode
     ));
 
-    widget.handle_key_event(enter(KeyEventKind::Release));
+    // Enter the API key flow with a held Enter: the press starts entry, repeats must not save.
     widget.handle_key_event(enter(KeyEventKind::Press));
     {
         let mut state = widget.sign_in_state.write().unwrap();
@@ -35,7 +32,6 @@ async fn held_enter_requires_a_fresh_confirmation_to_save_a_prefilled_api_key() 
     }
     let (request_frame, mut frames) = FrameRequester::test_channel();
     widget.request_frame = request_frame;
-    widget.handle_key_event(enter(KeyEventKind::Press));
     widget.handle_key_event(enter(KeyEventKind::Repeat));
     widget.handle_key_event(KeyCode::Left.into());
     widget.handle_key_event(enter(KeyEventKind::Repeat));

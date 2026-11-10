@@ -37,16 +37,16 @@ async fn select_a_saved_gateway_during_sign_in() -> color_eyre::Result<()> {
     widget.gcp_setup_enabled = true;
     widget.gateway_setup_enabled = true;
 
-    widget.handle_key_event(KeyCode::Char('3').into());
+    widget.handle_key_event(KeyCode::Char('6').into());
     insta::assert_snapshot!("gateway_sign_in_menu", screen(&widget, /*height*/ 8));
-    widget.handle_key_event(KeyCode::Char('4').into());
+    widget.handle_key_event(KeyCode::Char('2').into());
     widget.advance_gateway_request().await;
     insta::assert_snapshot!("gateway_empty_picker", screen(&widget, /*height*/ 8));
     widget.handle_key_event(KeyCode::Esc.into());
 
     let managed = home.path().join("managed_config.toml");
     std::fs::write(&managed, "model_provider = 'openai'")?;
-    widget.handle_key_event(KeyCode::Char('4').into());
+    widget.handle_key_event(KeyCode::Char('2').into());
     widget.advance_gateway_request().await;
     let error = screen(&widget, /*height*/ 8);
     assert!(error.contains("configuration policy"));
@@ -62,7 +62,7 @@ base_url = "https://office.example.test/v1"
 wire_api = "responses"
 "#,
     )?;
-    widget.handle_key_event(KeyCode::Char('4').into());
+    widget.handle_key_event(KeyCode::Char('2').into());
     widget.advance_gateway_request().await;
     insta::assert_snapshot!("gateway_saved_picker", screen(&widget, /*height*/ 8));
     widget.handle_key_event(KeyCode::Enter.into());
@@ -94,8 +94,8 @@ async fn create_highlights_the_saved_gateway_until_explicitly_selected() -> colo
     )
     .await
     .map_err(color_eyre::Report::msg)?;
-    widget.handle_key_event(KeyCode::Char('3').into());
-    widget.handle_key_event(KeyCode::Char('4').into());
+    widget.handle_key_event(KeyCode::Char('6').into());
+    widget.handle_key_event(KeyCode::Char('2').into());
     widget.advance_gateway_request().await;
     widget.handle_key_event(KeyCode::Down.into());
     widget.handle_key_event(KeyCode::Enter.into());
